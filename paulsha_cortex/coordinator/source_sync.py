@@ -19,6 +19,7 @@ _GITHUB_REMOTE = re.compile(
 _SAFE_BRANCH = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._/-]*$")
 _OBJECT_ID = re.compile(r"[0-9a-fA-F]{40}$")
 _DEFAULT_REF = "refs/cortex/source-sync/default"
+GIT_COMMAND_TIMEOUT_SECONDS = 30.0
 
 
 class SourceSyncError(RuntimeError):
@@ -29,7 +30,13 @@ CommandRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 
 
 def _subprocess_runner(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(list(argv), check=False, capture_output=True, text=True)
+    return subprocess.run(
+        list(argv),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=GIT_COMMAND_TIMEOUT_SECONDS,
+    )
 
 
 def sync_source_checkout(
@@ -49,6 +56,10 @@ def sync_source_checkout(
         argv = ("git", "--no-optional-locks", "-C", str(root), *args)
         try:
             result = run(argv)
+        except subprocess.TimeoutExpired as exc:
+            raise SourceSyncError(
+                f"git {args[0]} timed out after {GIT_COMMAND_TIMEOUT_SECONDS:g}s"
+            ) from exc
         except OSError as exc:
             raise SourceSyncError(f"git {args[0]} failed: {type(exc).__name__}") from exc
         if result.returncode not in ok:

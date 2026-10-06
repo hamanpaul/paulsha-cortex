@@ -7,7 +7,7 @@ work_item: system-deploy-ops-defects
 
 ### Requirement: System Monitor reads a Manager-synchronized source checkout
 
-The system Monitor MUST access the Manager-owned source checkout read-only. The Manager MUST fetch the advertised GitHub default branch without writing `FETCH_HEAD`, and MUST fast-forward only when the tracked checkout is clean and the update is a fast-forward. Unsafe or unavailable updates MUST leave the checkout unchanged.
+The system Monitor MUST access the Manager-owned source checkout read-only. The Manager MUST fetch the advertised GitHub default branch without writing `FETCH_HEAD`, and MUST fast-forward only when the tracked checkout is clean and the update is a fast-forward. Each Manager git command MUST have a finite timeout. Unsafe or unavailable updates MUST leave the checkout unchanged, and a timeout MUST NOT prevent Manager from running its periodic tick.
 
 #### Scenario: Read-only Monitor sees newly synchronized work
 
@@ -18,6 +18,11 @@ The system Monitor MUST access the Manager-owned source checkout read-only. The 
 
 - **WHEN** the Manager checkout has tracked local changes or cannot fast-forward to the advertised default branch
 - **THEN** synchronization leaves it unchanged and reports the condition
+
+#### Scenario: Source sync command times out
+
+- **WHEN** a Manager git command exceeds its timeout while synchronizing the source checkout
+- **THEN** synchronization reports the timeout, leaves the checkout unchanged, and Manager continues with the periodic tick
 
 ### Requirement: Provider freshness and refresh intervals share one bound
 

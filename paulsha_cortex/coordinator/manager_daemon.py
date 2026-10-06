@@ -493,6 +493,9 @@ def _resolve_launcher_compat(*args, **kwargs):
 
 #: path 字串 -> (content_sha256, 已解析的 QuotaPoolsConfig 或 None, 解析錯誤或 None)
 _QUOTA_POOLS_CONFIG_CACHE: dict[str, tuple[str, Any, Exception | None]] = {}
+# Keep only the latest generated default. The digest is the key so a roster
+# update produces a new quota config without allowing old versions to accrue.
+_SYSTEM_DEFAULT_SHADOW_QUOTA_CONFIG_CACHE: dict[str, Any] = {}
 
 
 def _load_quota_pools_config_cached(path: Path):
@@ -581,10 +584,26 @@ def _quota_admission_context_for(environment: dict[str, str] | None = None):
 
 
 def _system_default_shadow_quota_config():
-    """Build an unknown-capacity shadow map for every installed model identity."""
+    """Build/cache an unknown-capacity shadow map for installed identities."""
     from . import quota_admission, quota_observation as schema
 
     identity_registry = load_model_identities()
+    identity_rows = sorted(
+        (identity.to_dict() for identity in identity_registry.identities),
+        key=lambda row: (str(row["executor"]), str(row["model_id"])),
+    )
+    identity_digest = hashlib.sha256(
+        json.dumps(
+            identity_rows,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    cached = _SYSTEM_DEFAULT_SHADOW_QUOTA_CONFIG_CACHE.get(identity_digest)
+    if cached is not None:
+        return cached
+
     identities = sorted(
         {(item.executor, item.model_id) for item in identity_registry.identities}
     )
@@ -644,7 +663,7 @@ def _system_default_shadow_quota_config():
                 "coverage": {"state": "complete", "gaps": []},
             }
         )
-    return quota_admission.parse_quota_pools_config(
+    config = quota_admission.parse_quota_pools_config(
         {
             "schema": quota_admission.QUOTA_POOLS_CONFIG_SCHEMA,
             "config_revision": "system-shadow-default-v1",
@@ -653,6 +672,9 @@ def _system_default_shadow_quota_config():
             "bindings": bindings,
         }
     )
+    _SYSTEM_DEFAULT_SHADOW_QUOTA_CONFIG_CACHE.clear()
+    _SYSTEM_DEFAULT_SHADOW_QUOTA_CONFIG_CACHE[identity_digest] = config
+    return config
 
 
 def _held_reasons(

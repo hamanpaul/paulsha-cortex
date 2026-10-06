@@ -1187,6 +1187,8 @@ origin's advertised default branch, fetches it into a private ref without writin
 `.git/FETCH_HEAD`, and fast-forwards only when the tracked worktree is clean and
 the update is a fast-forward. Dirty, ahead, diverged, or unreachable checkouts are
 left in place and reported through the `system-repo-source-sync` diagnostic.
+Each git command has a 30-second timeout; a timeout is reported and does not
+prevent Manager from running the periodic tick.
 New `.cortex/work-items.yaml` and workstream files become visible to the next
 Monitor scan after a successful advance.
 

@@ -296,6 +296,116 @@ def test_system_deploy_installs_default_quota_shadow_context(
     ).content
 
 
+def test_system_shadow_quota_config_cache_tracks_identity_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from paulsha_cortex.coordinator import quota_admission
+    from paulsha_cortex.coordinator.model_identities import IdentityRegistry
+
+    monkeypatch.setattr(manager_daemon, "_SYSTEM_DEFAULT_SHADOW_QUOTA_CONFIG_CACHE", {})
+    registries = [
+        IdentityRegistry.from_rows(
+            [
+                {
+                    "executor": "codex",
+                    "model_id": "gpt-6-luna",
+                    "independence_domain": "openai",
+                }
+            ]
+        )
+    ]
+    monkeypatch.setattr(manager_daemon, "load_model_identities", lambda: registries[0])
+    parse = quota_admission.parse_quota_pools_config
+    parse_calls = 0
+
+    def recording_parse(payload):
+        nonlocal parse_calls
+        parse_calls += 1
+        return parse(payload)
+
+    monkeypatch.setattr(quota_admission, "parse_quota_pools_config", recording_parse)
+
+    first = manager_daemon._system_default_shadow_quota_config()
+    assert manager_daemon._system_default_shadow_quota_config() is first
+    assert parse_calls == 1
+
+    registries[0] = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "codex",
+                "model_id": "gpt-6-luna",
+                "independence_domain": "openai",
+            },
+            {
+                "executor": "agy",
+                "model_id": "gemini-3.8-flash-high",
+                "independence_domain": "google",
+            },
+        ]
+    )
+    updated = manager_daemon._system_default_shadow_quota_config()
+
+    assert updated is not first
+    assert parse_calls == 2
+    assert {
+        binding.to_dict()["subject"]["model_id"] for binding in updated.bindings
+    } == {"gpt-6-luna", "gemini-3.8-flash-high"}
+    assert len(manager_daemon._SYSTEM_DEFAULT_SHADOW_QUOTA_CONFIG_CACHE) == 1
+
+
+def test_source_sync_runner_uses_a_finite_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(kwargs)
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(source_sync.subprocess, "run", fake_run)
+
+    source_sync._subprocess_runner(("git", "version"))
+
+    assert calls[0]["timeout"] == source_sync.GIT_COMMAND_TIMEOUT_SECONDS
+
+
+def test_manager_continues_periodic_tick_after_source_sync_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path / "control"))
+    monkeypatch.setenv("PSC_MANAGER_REPO_SOURCE_SYNC", "1")
+    monkeypatch.setattr(manager_daemon.paths, "repo_root", lambda: tmp_path / "source")
+    monkeypatch.setattr(manager_daemon, "_run_trust_root_selfcheck", lambda: None)
+    monkeypatch.setattr(manager_daemon, "_LAST_REPORTED_REPO_SOURCE_SYNC_RESULT", None)
+    timeout_calls = 0
+
+    def timed_out_git(argv, **kwargs):
+        nonlocal timeout_calls
+        timeout_calls += 1
+        raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs["timeout"])
+
+    monkeypatch.setattr(source_sync.subprocess, "run", timed_out_git)
+    ticks: list[bool] = []
+
+    started = manager_daemon.run_loop(
+        request_executor=lambda _request: {},
+        status_provider=lambda: {"ready": [], "in_flight": [], "recent_done": []},
+        periodic_tick_runner=lambda: ticks.append(True) or {"dispatch_skipped": False},
+        poll_interval=0.0,
+        tick_interval=0.0,
+        now_fn=lambda: "2026-10-06T12:00:00+00:00",
+        monotonic_fn=lambda: 0.0,
+        sleep_fn=lambda _seconds: None,
+        pid=1,
+        max_rounds=1,
+    )
+
+    assert started is True
+    assert ticks == [True]
+    assert timeout_calls >= 2
+    assert "system-repo-source-sync" in capsys.readouterr().err
+
+
 def test_manager_syncs_default_branch_for_read_only_monitor(
     git_origin,
 ) -> None:
