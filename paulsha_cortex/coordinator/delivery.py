@@ -229,10 +229,19 @@ class ReviewLoop:
         if submitted_at < requested_at or submitted_at > observed_at:
             return ReviewDecision(self, "needs_human", "copilot-review-outside-request-epoch")
         if adopted_at is not None:
-            elapsed = observed_at - adopted_at
+            # #1271：採信的 review 在採信當下就已存在；期限只約束「提交時間不晚於採信後
+            # 15 分鐘」（與 remote final gate 的 review_deadline 同一判式）。等 check 跑完
+            # 的後續 tick 觀測得再晚，也不得把已採信的 review 轉成 copilot-review-timeout；
+            # 觀測早於採信仍視為時鐘異常；採信早於 request epoch（= 被採信 review 的
+            # 提交時間）不可能由採信路徑產生，fail-closed。
+            if adopted_at < requested_at:
+                return ReviewDecision(self, "needs_human", "copilot-review-outside-request-epoch")
+            if observed_at < adopted_at:
+                return ReviewDecision(self, "needs_human", "copilot-review-timeout")
+            elapsed = submitted_at - adopted_at
         else:
             elapsed = submitted_at - requested_at
-        if elapsed < 0 or elapsed > REVIEW_TIMEOUT_SECONDS:
+        if elapsed > REVIEW_TIMEOUT_SECONDS:
             return ReviewDecision(self, "needs_human", "copilot-review-timeout")
         if error:
             return ReviewDecision(self, "needs_human", "copilot-error-review")
@@ -577,13 +586,18 @@ class ShipOrchestrator:
                 raise RuntimeError("Copilot review epoch has not passed")
             if submitted_at_epoch < requested_at_epoch:
                 raise RuntimeError("Copilot review epoch has not passed")
-            if adopted_at is not None and observed_at_epoch < adopted_at:
+            if adopted_at is not None and (
+                observed_at_epoch < adopted_at or adopted_at < requested_at_epoch
+            ):
                 raise RuntimeError("Copilot review epoch has not passed")
+            # #1271：與 ReviewLoop.record_review 同一判式——期限只看提交時間（採信路徑
+            # 相對 adopted_at、request 路徑相對 requested_at），merge 當下的時鐘不再把
+            # 已就緒的 review 判成逾時。
             if adopted_at is not None:
-                elapsed = float(now_epoch) - adopted_at
+                elapsed = submitted_at_epoch - adopted_at
             else:
                 elapsed = submitted_at_epoch - requested_at_epoch
-            if elapsed < 0 or elapsed > REVIEW_TIMEOUT_SECONDS:
+            if elapsed > REVIEW_TIMEOUT_SECONDS:
                 raise RuntimeError("Copilot review epoch has not passed")
             review_kind = "copilot"
         else:
