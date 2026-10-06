@@ -1721,3 +1721,11 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/workstreams/monitor-frontmatter-isolation/todo.md'
     excludes: []
+  tick-background-preflight:
+    title: 'tick-background-preflight'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1320'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/tick-background-preflight/todo.md'
+    excludes: []
