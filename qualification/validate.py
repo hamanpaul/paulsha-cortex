@@ -257,6 +257,23 @@ def _validate_one_command_upgrade(
         "one-command upgrade drill",
         {"result", "failed_step", "restore_safe", "receipt_id", "parent_receipt_id"},
     )
+    upgraded = _required_fields(
+        status.get("upgrade"),
+        "one-command upgrade result",
+        {"result", "receipt_id", "parent_receipt_id", "plan_sha256", "inherited_credentials"},
+    )
+    # A null id would match a null expected/loaded id, and a non-string one
+    # cannot be compared safely (#1270).
+    if any(
+        not isinstance(value, str) or not value
+        for value in (
+            prior_receipt_id,
+            drill_receipt_id,
+            drill["receipt_id"],
+            upgraded["receipt_id"],
+        )
+    ):
+        _fail("one-command upgrade receipt ids must be non-empty strings")
     if (
         drill["result"] != "rolled-back"
         or drill["failed_step"] != "credentials"
@@ -265,11 +282,6 @@ def _validate_one_command_upgrade(
         or drill["receipt_id"] != drill_receipt_id
     ):
         _fail("one-command upgrade drill did not return to the qualified prior receipt")
-    upgraded = _required_fields(
-        status.get("upgrade"),
-        "one-command upgrade result",
-        {"result", "receipt_id", "parent_receipt_id", "plan_sha256", "inherited_credentials"},
-    )
     if (
         upgraded["result"] != "upgraded"
         or upgraded["parent_receipt_id"] != prior_receipt_id

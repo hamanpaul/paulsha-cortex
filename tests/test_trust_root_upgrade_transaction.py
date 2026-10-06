@@ -7,6 +7,8 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -15,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 
 import upgrade_fixtures as fx
+from paulsha_cortex.trust_root.install import backend as install_backend
 from paulsha_cortex.trust_root.install import cli as install_cli
 from paulsha_cortex.trust_root.install import core as install_core
 from paulsha_cortex.trust_root.install import upgrade
@@ -455,6 +458,494 @@ def test_sighup_inside_the_maintenance_window_rolls_back(
     assert report["error"] == "interrupted by SIGHUP"
     assert report["result"] == "rolled-back"
     assert "rollback" in harness.cli.commands()
+    assert harness.systemd.active == set(fx.SERVICES)
+
+
+def test_candidate_children_run_in_their_own_session_without_the_callers_stdin(
+    harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #1270: the terminal's INT/HUP reach only the coordinator, which decides
+    # how the running installer step ends; the child never reads root's stdin.
+    seen: list[tuple[tuple[str, ...], dict[str, object]]] = []
+
+    def run(argv, **kwargs):
+        seen.append((tuple(argv)[1:3], kwargs))
+        return harness.cli(argv, **kwargs)
+
+    monkeypatch.setattr(upgrade, "_run", run)
+
+    code, _report = _run_transaction(harness)
+
+    assert code == 0
+    candidate = [kwargs for head, kwargs in seen if head == ("install", "trust-root")]
+    assert len(candidate) == 4
+    for kwargs in candidate:
+        assert kwargs["start_new_session"] is True
+        assert kwargs["stdin"] == subprocess.DEVNULL
+
+
+_SIGNAL_PARENT = (
+    "import os, signal, subprocess, sys, time\n"
+    "marker, plan, linger, grandchild = sys.argv[1:5]\n"
+    "if grandchild != '-':\n"
+    "    subprocess.Popen(['sh', '-c', 'sleep 1.5; touch ' + grandchild])\n"
+    "for step in plan.split(','):\n"
+    "    name, gap = step.split(':')\n"
+    "    os.kill(os.getppid(), getattr(signal, 'SIG' + name))\n"
+    "    time.sleep(float(gap))\n"
+    "time.sleep(float(linger))\n"
+    "open(marker, 'w').write('finished')\n"
+)
+
+
+def _apply_child_signals_the_coordinator(
+    harness,
+    monkeypatch: pytest.MonkeyPatch,
+    marker: Path,
+    *,
+    plan: str,
+    linger: float,
+    grandchild: Path | None = None,
+) -> None:
+    """Run a real child for `apply` that signals the coordinator mid-step.
+
+    ``plan`` is ``NAME:gap[,NAME:gap...]``: each signal is sent to the
+    coordinator, then the child sleeps ``gap`` seconds.
+    """
+
+    candidate = harness.cli
+
+    def run(argv, **kwargs):
+        if tuple(argv)[3:4] == ("apply",):
+            install_backend._run(
+                (
+                    sys.executable,
+                    "-c",
+                    _SIGNAL_PARENT,
+                    str(marker),
+                    plan,
+                    str(linger),
+                    str(grandchild) if grandchild is not None else "-",
+                ),
+                **kwargs,
+            )
+        return candidate(argv, **kwargs)
+
+    monkeypatch.setattr(upgrade, "_run", run)
+
+
+@contextmanager
+def _recording_handlers(*signums: int) -> Iterator[list[int]]:
+    received: list[int] = []
+    previous = {
+        signum: signal.signal(signum, lambda number, _frame: received.append(number))
+        for signum in signums
+    }
+    try:
+        yield received
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
+def test_a_real_sigterm_lets_the_running_installer_step_finish_then_rolls_back(
+    harness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    # #1270: a signal while a root child mutates the host must not SIGKILL that
+    # child; the coordinator waits for the step to end, then rolls back.
+    marker = tmp_path / "apply-child"
+    _apply_child_signals_the_coordinator(harness, monkeypatch, marker, plan="TERM:0", linger=0.5)
+
+    with _recording_handler(signal.SIGTERM) as received:
+        code, report = _run_transaction(harness)
+
+    assert marker.read_text() == "finished"
+    assert received == []
+    assert code == 1
+    assert report["failed_step"] == "apply"
+    assert report["error"] == "interrupted by SIGTERM"
+    # The step finished before the held signal was raised: its result is kept.
+    assert report["receipt"] == {
+        "path": str(harness.bound.receipt_path),
+        "receipt_id": "new-receipt",
+    }
+    assert report["result"] == "rolled-back"
+    assert "rollback" in harness.cli.commands()
+    assert "credentials inherit" not in harness.cli.commands()
+    assert harness.systemd.active == set(fx.SERVICES)
+    # One line tells the operator what happens and how to stop now.
+    assert capfd.readouterr().err.count(
+        "SIGTERM received; finishing apply, then rolling back; "
+        "send INT/TERM again to stop now"
+    ) == 1
+
+
+def test_a_held_signal_after_a_failed_step_reports_the_failure_too(
+    harness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    harness.cli.fail["apply"] = "preflight failed: boom"
+    _apply_child_signals_the_coordinator(
+        harness, monkeypatch, tmp_path / "apply-child", plan="TERM:0", linger=0.3
+    )
+
+    with _recording_handler(signal.SIGTERM):
+        code, report = _run_transaction(harness)
+
+    assert code == 1
+    assert report["error"] == (
+        "interrupted by SIGTERM (apply failed: trust-root install failed: preflight failed: boom)"
+    )
+    assert report["result"] == "rolled-back"
+
+
+def test_the_first_signal_notice_survives_a_dead_terminal(
+    harness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # After an SSH drop stderr may fail with EIO; the notice must not turn into
+    # an exception inside the signal handler.
+    read_end, write_end = os.pipe()
+    os.close(read_end)
+    monkeypatch.setattr(upgrade, "_STDERR_FD", write_end)
+    marker = tmp_path / "apply-child"
+    _apply_child_signals_the_coordinator(harness, monkeypatch, marker, plan="HUP:0", linger=0.3)
+    try:
+        with _recording_handler(signal.SIGHUP):
+            code, report = _run_transaction(harness)
+    finally:
+        os.close(write_end)
+
+    assert marker.read_text() == "finished"
+    assert report["error"] == "interrupted by SIGHUP"
+    assert report["result"] == "rolled-back"
+
+
+@pytest.mark.parametrize("gap", ["0", "0.4"], ids=["back-to-back", "spaced"])
+def test_two_sighups_from_an_ssh_drop_never_stop_the_running_step(
+    harness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, gap: str
+) -> None:
+    # #1270 review: an SSH drop delivers two SIGHUPs (the shell's hangup to its
+    # jobs and the kernel's to the old foreground group).  The second one must
+    # not escalate to "stop now", however late it comes.
+    monkeypatch.setattr(upgrade, "_ESCALATION_MIN_SECONDS", 0.1)
+    marker = tmp_path / "apply-child"
+    grandchild = tmp_path / "apply-grandchild"
+    _apply_child_signals_the_coordinator(
+        harness, monkeypatch, marker, plan=f"HUP:{gap},HUP:0", linger=1.5, grandchild=grandchild
+    )
+
+    with _recording_handler(signal.SIGHUP) as received:
+        code, report = _run_transaction(harness)
+
+    assert marker.read_text() == "finished"
+    assert grandchild.exists()
+    assert received == []
+    assert code == 1
+    assert report["error"] == "interrupted by SIGHUP"
+    assert report["result"] == "rolled-back"
+
+
+def test_a_second_interrupt_within_the_escalation_delay_is_ignored(
+    harness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    assert upgrade._ESCALATION_MIN_SECONDS >= 1.0
+    marker = tmp_path / "apply-child"
+    _apply_child_signals_the_coordinator(
+        harness, monkeypatch, marker, plan="TERM:0.3,INT:0", linger=0.3
+    )
+
+    with _recording_handlers(signal.SIGTERM, signal.SIGINT) as received:
+        code, report = _run_transaction(harness)
+
+    assert marker.read_text() == "finished"
+    assert received == []
+    assert report["error"] == "interrupted by SIGTERM"
+    assert report["result"] == "rolled-back"
+
+
+def test_a_later_interrupt_stops_the_step_and_its_whole_process_group(
+    harness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # An operator who signals again does not wait for a hung step.  The child
+    # and everything it started (its own process group) are killed before the
+    # rollback runs; nothing it spawned may touch the host afterwards.
+    monkeypatch.setattr(upgrade, "_ESCALATION_MIN_SECONDS", 0.2)
+    marker = tmp_path / "apply-child"
+    grandchild = tmp_path / "apply-grandchild"
+    _apply_child_signals_the_coordinator(
+        harness, monkeypatch, marker, plan="HUP:0.5,TERM:0", linger=60, grandchild=grandchild
+    )
+
+    with _recording_handlers(signal.SIGHUP, signal.SIGTERM) as received:
+        code, report = _run_transaction(harness)
+    time.sleep(2.0)
+
+    assert not marker.exists()
+    assert not grandchild.exists()
+    assert received == []
+    assert code == 1
+    assert report["failed_step"] == "apply"
+    assert report["error"] == "interrupted by SIGTERM"
+    assert report["result"] == "rolled-back"
+
+
+def test_escalation_ignores_further_interrupts_before_it_raises() -> None:
+    # #1270 review: no window between the escalation and `_abort` ignoring signals.
+    before = {signum: signal.getsignal(signum) for signum in upgrade._INTERRUPT_SIGNALS}
+    with upgrade._signals_raise():
+        with upgrade._interrupts_deferred("apply"):
+            upgrade._DEFERRAL.pending = "SIGTERM"
+            upgrade._DEFERRAL.pending_at = time.monotonic() - 60
+            with pytest.raises(upgrade.UpgradeInterrupted, match="SIGINT"):
+                upgrade._interrupt(signal.SIGINT, None)
+            assert all(
+                signal.getsignal(signum) == signal.SIG_IGN
+                for signum in upgrade._INTERRUPT_SIGNALS
+            )
+    assert {signum: signal.getsignal(signum) for signum in upgrade._INTERRUPT_SIGNALS} == before
+
+
+def test_a_hung_service_status_probe_times_out_as_unavailable(
+    harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    timeouts: list[object] = []
+
+    def hung(argv, **kwargs):
+        timeouts.append(kwargs.get("timeout"))
+        raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+
+    monkeypatch.setattr(upgrade, "_run", hung)
+
+    mismatch, payload = upgrade.await_loaded_runtime(
+        harness.prior.plan, harness.prior.path, {}, settle_seconds=0
+    )
+
+    assert payload is None
+    assert mismatch.startswith("service_status=unavailable (TimeoutExpired")
+    assert timeouts == [upgrade._STATUS_TIMEOUT_SECONDS]
+
+
+def test_a_silent_service_status_failure_names_its_exit_code_once(
+    harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #1270: a child with no output used to read "exit 3: exit 3".
+    monkeypatch.setattr(
+        upgrade, "_run", lambda argv, **_kwargs: subprocess.CompletedProcess(argv, 3, "", "")
+    )
+
+    mismatch, _payload = upgrade.await_loaded_runtime(
+        harness.prior.plan, harness.prior.path, {}, settle_seconds=0
+    )
+
+    assert mismatch == "service_status=unavailable (exit 3 with no output)"
+
+
+def test_a_silent_verify_failure_names_its_exit_code_once(
+    harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def run(argv, **kwargs):
+        if tuple(argv)[3:4] == ("verify",):
+            return subprocess.CompletedProcess(argv, 1, "", "")
+        return harness.cli(argv, **kwargs)
+
+    monkeypatch.setattr(upgrade, "_run", run)
+
+    _code, report = _run_transaction(harness)
+
+    assert report["failed_step"] == "verify"
+    assert report["error"] == "verify did not PASS (exit 1) with no output"
+
+
+def test_a_silent_rollback_child_names_its_exit_code_once(
+    harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness.cli.fail["verify"] = "verify FAIL"
+
+    def run(argv, **kwargs):
+        if tuple(argv)[3:4] == ("rollback",):
+            harness.cli.calls.append(("rollback",))
+            return subprocess.CompletedProcess(argv, 1, "", "")
+        return harness.cli(argv, **kwargs)
+
+    monkeypatch.setattr(upgrade, "_run", run)
+
+    code, report = _run_transaction(harness)
+
+    assert code == 1
+    assert report["result"] == "halted"
+    assert report["rollback"]["error"] == "rollback exited 1 with no output"
+    assert report["rollback"]["restore_safe"] is False
+    assert install_cli._read_maintenance_snapshot() is not None
+
+
+def test_a_sigint_right_after_the_window_closes_keeps_the_upgrade_recorded(
+    harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #1270: the result used to be written after `_signals_raise` restored the
+    # default handlers, so a SIGINT landing in between left `result` unset and
+    # perform_upgrade reported a finished upgrade as "halted".
+    real_signal = signal.signal
+    saved = {sig: signal.getsignal(sig) for sig in upgrade._INTERRUPT_SIGNALS}
+    last = upgrade._INTERRUPT_SIGNALS[-1]
+    armed: list[bool] = []
+    clear = install_cli._clear_maintenance_snapshot
+
+    def clear_then_arm(plan, *, receipt_path):
+        cleared = clear(plan, receipt_path=receipt_path)
+        armed.append(True)
+        return cleared
+
+    def restore_then_interrupt(signum, handler):
+        previous = real_signal(signum, handler)
+        if armed and signum == last and handler is saved[last]:
+            armed.clear()
+            raise KeyboardInterrupt
+        return previous
+
+    monkeypatch.setattr(install_cli, "_clear_maintenance_snapshot", clear_then_arm)
+    monkeypatch.setattr(signal, "signal", restore_then_interrupt)
+    report: dict[str, object] = {"version": "0.1.13", "services_stopped": False}
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            upgrade.run_transaction(
+                harness.sealed,
+                harness.bound,
+                harness.prior,
+                report,
+                upgrade.StepLog(),
+                wait_idle=0,
+            )
+    finally:
+        for sig, handler in saved.items():
+            real_signal(sig, handler)
+
+    assert report["result"] == "upgraded"
+    assert "rollback" not in harness.cli.commands()
+
+
+def test_perform_upgrade_keeps_an_upgrade_finished_before_a_late_interrupt(
+    composed, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def transaction(_sealed, _bound, _prior, report, _steps, *, wait_idle):
+        report["result"] = "upgraded"
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(upgrade, "run_transaction", transaction)
+
+    assert upgrade.perform_upgrade(
+        upgrade.UpgradeOptions(version="0.1.13", json_output=True)
+    ) == 0
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["result"] == "upgraded"
+    assert report["error"] is None
+
+
+def test_an_activate_failure_rolls_back_as_post_activate(harness) -> None:
+    # #1270: activate counts as attempted before its child runs, so a failed
+    # activate is a post-activate rollback (restore_safe decides what restarts).
+    harness.cli.fail["activate"] = "unit start failed"
+
+    code, report = _run_transaction(harness)
+
+    assert code == 1
+    assert report["failed_step"] == "activate"
+    assert report["phase"] == "post-activate"
+    assert "unit start failed" in report["error"]
+    assert "verify" not in harness.cli.commands()
+    assert report["rollback"]["attempted"] is True
+    assert report["result"] == "rolled-back"
+    assert report["rollback"]["services_restored"] == list(fx.SERVICES)
+    assert install_cli._read_maintenance_snapshot() is None
+    assert _marker() is None
+
+
+def test_a_failed_service_restore_halts_with_the_snapshot_kept(
+    harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness.cli.fail["credentials inherit"] = "credential drifted"
+
+    def restore(_services):
+        raise install_core.InstallError("cannot restore previously active service: x")
+
+    monkeypatch.setattr(install_cli, "_restore_snapshot_services", restore)
+
+    code, report = _run_transaction(harness)
+
+    assert code == 1
+    assert report["result"] == "halted"
+    assert report["rollback"]["services_restored"] == []
+    assert "cannot restore previously active service" in report["rollback"]["restore_error"]
+    assert "cortex upgrade --recover" in report["next_action"]
+    snapshot = install_cli._read_maintenance_snapshot()
+    assert snapshot is not None
+    assert snapshot["receipt_path"] == str(harness.bound.receipt_path)
+    assert _marker()["plan_sha256"] == harness.bound.sha256
+
+
+@pytest.mark.parametrize("failing", ["_service_snapshot", "_write_maintenance_snapshot"])
+def test_a_snapshot_step_failure_stops_nothing_and_releases_the_lease(
+    harness, monkeypatch: pytest.MonkeyPatch, failing: str
+) -> None:
+    def fail(*_args, **_kwargs):
+        raise install_core.InstallError(f"{failing} failed")
+
+    monkeypatch.setattr(install_cli, failing, fail)
+    report: dict[str, object] = {"version": "0.1.13", "services_stopped": False}
+    steps = upgrade.StepLog()
+
+    with pytest.raises(install_core.InstallError, match=f"{failing} failed"):
+        upgrade.run_transaction(
+            harness.sealed, harness.bound, harness.prior, report, steps, wait_idle=0
+        )
+
+    assert steps.current == "maintenance-snapshot"
+    assert report["services_stopped"] is False
+    assert not [call for call in harness.systemd.calls if call[0] == "stop"]
+    assert harness.cli.commands() == []
+    assert install_cli._read_maintenance_snapshot() is None
+    assert _marker() is None
+
+
+def test_an_existing_new_receipt_path_is_refused_before_anything_stops(harness) -> None:
+    harness.bound.receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    harness.bound.receipt_path.write_text("{}\n", encoding="utf-8")
+    report: dict[str, object] = {"version": "0.1.13", "services_stopped": False}
+
+    with pytest.raises(upgrade.UpgradeError, match="new receipt path already exists"):
+        upgrade.run_transaction(
+            harness.sealed, harness.bound, harness.prior, report, upgrade.StepLog(), wait_idle=0
+        )
+
+    assert not [call for call in harness.systemd.calls if call[0] == "stop"]
+    assert install_cli._read_maintenance_snapshot() is None
+    assert _marker() is None
+
+
+def test_a_real_sighup_outside_a_candidate_child_is_raised_at_once(
+    harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Only a running candidate child defers an interrupt; a signal while the
+    # coordinator itself works (here: right after stopping the services) stops
+    # the transaction before the next step starts.
+    stop = install_cli._stop_current_services
+
+    def stop_then_hang_up():
+        stopped = stop()
+        os.kill(os.getpid(), signal.SIGHUP)
+        return stopped
+
+    monkeypatch.setattr(install_cli, "_stop_current_services", stop_then_hang_up)
+
+    with _recording_handler(signal.SIGHUP) as received:
+        code, report = _run_transaction(harness)
+
+    assert received == []
+    assert code == 1
+    assert report["failed_step"] == "stop-services"
+    assert report["error"] == "interrupted by SIGHUP"
+    assert "apply" not in harness.cli.commands()
+    assert report["rollback"]["attempted"] is False
+    assert report["result"] == "rolled-back"
     assert harness.systemd.active == set(fx.SERVICES)
 
 
