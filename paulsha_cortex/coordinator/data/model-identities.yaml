@@ -31,3 +31,18 @@ identities:
     model_id: glm-5.2
     independence_domain: zhipu
     capabilities: [planning, review]
+  # #1291: current release identities are candidates after the existing roster.
+  # AGY is deliberately not advertised as a builder.
+  - executor: agy
+    model_id: gemini-3.8-flash-high
+    independence_domain: google
+    capabilities: [planning, review]
+    live_probe: agy-plan-sandbox
+  - executor: copilot
+    model_id: gpt-5.4-mini
+    independence_domain: openai
+    capabilities: [build]
+  - executor: codex
+    model_id: gpt-6-luna
+    independence_domain: openai
+    capabilities: [build]

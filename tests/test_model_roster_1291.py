@@ -1,4 +1,4 @@
-"""#1291 T3: packaged roster must cover supported system-deploy builder pins."""
+"""#1291 T3: packaged roster must cover supported system-deploy identities."""
 
 from __future__ import annotations
 
@@ -30,5 +30,6 @@ def test_packaged_roster_includes_supported_system_deploy_builder_identities(
         + ", ".join(missing)
     )
 
-    for executor, model_id in sorted(expected):
-        assert "build" in available[(executor, model_id)].capabilities
+    assert "build" not in available[("agy", "gemini-3.8-flash-high")].capabilities
+    assert "build" in available[("codex", "gpt-6-luna")].capabilities
+    assert "build" in available[("copilot", "gpt-5.4-mini")].capabilities

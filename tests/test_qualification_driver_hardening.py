@@ -1150,7 +1150,7 @@ def test_generated_canary_identity_overlay_authorizes_independent_dispatch(
 
 
 @pytest.mark.parametrize(
-    "mutation", ["missing-overlay", "same-domain-reviewer", "builder-without-build"]
+    "mutation", ["same-domain-reviewer", "builder-without-build"]
 )
 def test_canary_identity_preflight_rejects_unusable_roster(
     tmp_path: Path, mutation: str
@@ -1165,13 +1165,26 @@ def test_canary_identity_preflight_rejects_unusable_roster(
         overlay = overlay.replace('["planning", "review"]', '["review"]')
     elif mutation == "builder-without-build":
         overlay = overlay.replace('capabilities: ["build"]', 'capabilities: ["review"]')
-    if mutation != "missing-overlay":
-        (config_root / "model-identities.yaml").write_text(overlay, encoding="utf-8")
+    (config_root / "model-identities.yaml").write_text(overlay, encoding="utf-8")
 
     with pytest.raises(driver.QualificationFailure, match="model identity roster"):
         driver._validate_canary_dispatch_model_identities(
             {"PSC_PROJECT_CONFIG_ROOT": str(config_root)}
         )
+
+
+def test_canary_identity_preflight_accepts_packaged_roster_without_overlay(
+    tmp_path: Path,
+) -> None:
+    """#1291 packages the exact builder/reviewer identities needed by system installs."""
+
+    driver = _load_driver()
+    config_root = tmp_path / "config"
+    config_root.mkdir()
+
+    driver._validate_canary_dispatch_model_identities(
+        {"PSC_PROJECT_CONFIG_ROOT": str(config_root)}
+    )
 
 
 def test_canary_builder_argv_matches_the_production_template_launcher(

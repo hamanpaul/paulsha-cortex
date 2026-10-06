@@ -24,7 +24,7 @@ work_item: system-deploy-ops-defects
       `github_refresh_interval_seconds=1800` 互相矛盾，約一半的時間 intake 會被擋成
       `provider-degraded-or-stale`。讓刷新週期一定小於門檻，或由刷新週期推導門檻；兩種部署
       （system、使用者層級）都要一致。
-- [ ] **T3 model roster 隨 release 更新**：packaged roster 與 adopted overlay 都沒有 `codex/gpt-6-luna`、
+- [x] **T3 model roster 隨 release 更新**：packaged roster 與 adopted overlay 都沒有 `codex/gpt-6-luna`、
       `agy/gemini-3.8-flash-high`、`copilot/gpt-5.4-mini`，builder pin 會因 identity unknown 被拒。更新
       packaged roster，並讓 system 部署有受支援的方式加入身分（不手改 cortex-manager 0600 的檔案）。
 - [ ] **T4 quota-pools 預設設定**：system 部署沒有 quota-pools 設定，`PSC_QUOTA_POOLS_CONFIG` 也沒設，

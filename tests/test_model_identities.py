@@ -86,13 +86,16 @@ identities:
         ("claude", "sonnet"),
         ("codex", "gpt-5.3-codex-spark"),
         ("cg", "glm-5.2"),
+        ("agy", "gemini-3.8-flash-high"),
+        ("copilot", "gpt-5.4-mini"),
+        ("codex", "gpt-6-luna"),
     ]
 
 
 def test_packaged_default_without_custom_file_returns_packaged_only(tmp_path: Path) -> None:
     registry = load_model_identities(tmp_path, use_packaged_default=True)
 
-    # #452 B／#456 R3：packaged roster 登錄 5 個候選身分，agy 維持首位
+    # #452 B／#456 R3：packaged roster 登錄候選身分，agy 維持首位
     # （PLANNER_PRIORITY 熱路徑選擇不變）。
     assert [
         (identity.executor, identity.model_id)
@@ -103,6 +106,9 @@ def test_packaged_default_without_custom_file_returns_packaged_only(tmp_path: Pa
         ("claude", "sonnet"),
         ("codex", "gpt-5.3-codex-spark"),
         ("cg", "glm-5.2"),
+        ("agy", "gemini-3.8-flash-high"),
+        ("copilot", "gpt-5.4-mini"),
+        ("codex", "gpt-6-luna"),
     ]
 
 

@@ -846,7 +846,9 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    （`operator-overlay`／`evaluated-roster`／`packaged-fallback`／`parked`）。
 
    > **升級遷移註記**：packaged roster 已收編 `copilot/gpt-5.4`、
-   > `claude/sonnet`、`codex/gpt-5.3-codex-spark`、`cg/glm-5.2` 四個身分。
+   > `copilot/gpt-5.4-mini`、`claude/sonnet`、`codex/gpt-5.3-codex-spark`、
+   > `codex/gpt-6-luna`、`cg/glm-5.2`，以及只具 planning/review 的
+   > `agy/gemini-3.1-pro-high`、`agy/gemini-3.8-flash-high`。
    > host overlay（`$PSC_PROJECT_CONFIG_ROOT/model-identities.yaml`）宣告其中
    > 任一鍵時，**以 overlay 為準**（人工指定優先，見下方三層解析鏈）；建議在
    > 該列加上 `override_packaged: true` 明示覆寫意圖，否則 `cortex doctor` 會
@@ -1288,6 +1290,27 @@ identities:
     capabilities: [planning, review]
     executable: /opt/cortex/bin/claude-compatible
 ```
+
+Trust Root system deployment keeps this overlay under its Manager-owned config root.
+Add an identity through the validated CLI instead of editing the `0600`
+`cortex-manager` file directly. Run the installed CLI as root and pass the
+`PSC_PROJECT_CONFIG_ROOT` used by the installed Manager (the standard location is
+`/var/lib/cortex/config/paulsha`):
+
+```bash
+sudo /opt/cortex/venv/bin/cortex model identity add \
+  --config-root /var/lib/cortex/config/paulsha \
+  --executor codex \
+  --model-id '<model-id>' \
+  --independence-domain openai \
+  --capability build
+```
+
+Replace `<model-id>` with an ID accepted by that executor. The command validates
+the complete overlay, rejects duplicate identities and unsafe file types, then
+replaces it atomically while preserving the file owner and mode. Repeat
+`--capability` only for roles the identity is intended to serve; AGY's packaged
+`gemini-3.8-flash-high` identity deliberately has no `build` capability.
 
 - schema v1–v3 仍可讀取；schema v2 起可設 `capabilities` / `live_probe`，schema v3 起可設封套欄位，schema v4 可為 Claude identity 選填 `executable` 絕對路徑。Claude job 與 `cortex doctor` 的 review-sandbox probe 共用該路徑；路徑必須指向一般可執行檔，無效時拒絕啟動且不回退 PATH，job 記錄保存解析後路徑。packaged registry 提供 canonical agy 候選；host overlay 宣告同鍵身分時以 overlay 為準（見下方「模型引擎三層解析鏈」）。`cortex doctor` 依解析政策確認至少有一個可用的 planning identity，不要求部署保留 canonical agy；agy discovery 與 smoke probe 只判定 agy 是否可用。
 - planner/builder/reviewer 必須是 explicit `(executor, model_id)` 且可解析；agy 只有在 `doctor --probe-live` 的 model discovery 與 plan/sandbox smoke 都吻合時才可用。

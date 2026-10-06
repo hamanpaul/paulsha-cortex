@@ -1,0 +1,1 @@
+#1291：packaged roster 新增 `codex/gpt-6-luna`、`copilot/gpt-5.4-mini` 與不含 build capability 的 `agy/gemini-3.8-flash-high`。新增 `cortex model identity add`，以驗證與原子替換支援 system deployment 的 model overlay 更新，並保留既有檔案 owner/mode。

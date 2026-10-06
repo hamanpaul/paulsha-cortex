@@ -4,16 +4,29 @@ coordinator.model_profile）。patchmud 不在場時印明確 skip 訊息並回 
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
+import os
+import stat
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Sequence
 
+import yaml
+
+from paulsha_cortex.config import paths
+from paulsha_cortex.coordinator import model_resolution
 from paulsha_cortex.coordinator.model_profile import (
     DEFAULT_DECK_ID,
     ProfileOptions,
     run_model_profile,
+)
+from paulsha_cortex.coordinator.model_identities import (
+    MODEL_IDENTITY_SCHEMA_VERSION,
+    _load_model_identity_file,
+    load_model_identities,
 )
 
 from . import COMMANDS, PorcelainCommand, register
@@ -54,6 +67,27 @@ def _build_parser() -> argparse.ArgumentParser:
         help="只處理指定身分（executor/model_id 或 executor:model_id，可重複；查無對應身分即報錯）",
     )
     profile.add_argument("--json", action="store_true", help="輸出 cortex-porcelain/model-profile/v1 JSON")
+
+    identity = sub.add_parser("identity", help="以驗證過的方式管理 host model identity overlay")
+    identity_sub = identity.add_subparsers(dest="identity_command", required=True)
+    identity_add = identity_sub.add_parser("add", help="新增一筆 host overlay identity")
+    identity_add.add_argument("--config-root", default=None, help="設定目錄；預設使用目前 Cortex instance")
+    identity_add.add_argument("--executor", required=True)
+    identity_add.add_argument("--model-id", required=True)
+    identity_add.add_argument("--independence-domain", required=True)
+    identity_add.add_argument(
+        "--capability",
+        action="append",
+        choices=("planning", "build", "review"),
+        required=True,
+        help="可重複指定；只授予明確列出的能力",
+    )
+    identity_add.add_argument("--live-probe", default=None)
+    identity_add.add_argument(
+        "--override-packaged",
+        action="store_true",
+        help="明示此 overlay row 覆寫同鍵 packaged identity",
+    )
 
     qualification = sub.add_parser(
         "qualification",
@@ -171,6 +205,14 @@ def main(argv: Sequence[str]) -> int:
     args = parser.parse_args(list(argv))
     if args.command == "qualification":
         return _qualification_main(args)
+    if args.command == "identity":
+        try:
+            path = _add_model_identity(args)
+        except (OSError, ValueError) as exc:
+            print(f"錯誤: {exc}", file=sys.stderr)
+            return 2
+        sys.stdout.write(f"已新增 {args.executor}/{args.model_id} 至 {path}\n")
+        return 0
     if args.command != "profile":  # pragma: no cover - argparse required=True 已擋
         parser.error(f"unsupported model command: {args.command}")
     options = ProfileOptions(
@@ -195,6 +237,132 @@ def main(argv: Sequence[str]) -> int:
     if any(cell.get("status") == "failed" for cell in result.get("cells", [])):
         return 1
     return 0
+
+
+def _regular_leaf(path: Path, *, label: str) -> os.stat_result | None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise ValueError(f"{label} must be a single-link regular file: {path}")
+    return info
+
+
+def _add_model_identity(args: argparse.Namespace) -> Path:
+    """Atomically add a validated identity without hand-editing the host overlay."""
+
+    root = (
+        Path(args.config_root).expanduser()
+        if args.config_root
+        else paths.project_config_root()
+    )
+    if not root.is_absolute():
+        raise ValueError("model identity config root must be an absolute path")
+    try:
+        root_info = root.lstat()
+    except FileNotFoundError as exc:
+        raise ValueError(f"model identity config root does not exist: {root}") from exc
+    if not stat.S_ISDIR(root_info.st_mode):
+        raise ValueError(f"model identity config root must be a real directory: {root}")
+
+    overlay_path = root / "model-identities.yaml"
+    lock_path = root / ".model-identities.lock"
+    _regular_leaf(lock_path, label="model identity lock")
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    lock_fd = os.open(lock_path, flags, 0o600)
+    temp_path: Path | None = None
+    try:
+        opened_lock = os.fstat(lock_fd)
+        if not stat.S_ISREG(opened_lock.st_mode) or opened_lock.st_nlink != 1:
+            raise ValueError(f"model identity lock must be a single-link regular file: {lock_path}")
+        if opened_lock.st_uid != root_info.st_uid or opened_lock.st_gid != root_info.st_gid:
+            if os.geteuid() != 0:
+                raise ValueError(f"model identity lock owner does not match config root: {lock_path}")
+            os.fchown(lock_fd, root_info.st_uid, root_info.st_gid)
+        os.fchmod(lock_fd, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        overlay_info = _regular_leaf(overlay_path, label="model-identities.yaml")
+        if overlay_info is None:
+            payload: dict[str, object] = {
+                "schema_version": MODEL_IDENTITY_SCHEMA_VERSION,
+                "identities": [],
+            }
+        else:
+            registry = load_model_identities(root, use_packaged_default=False)
+            parsed = yaml.safe_load(overlay_path.read_text(encoding="utf-8"))
+            if not isinstance(parsed, dict):
+                raise ValueError(f"model-identities.yaml invalid root: {overlay_path}")
+            payload = parsed
+            schema_version = payload.get("schema_version")
+            if schema_version == 1:
+                # Schema v1 has no capability field; normalize the loader's
+                # explicit legacy interpretation before adding a v2+ row.
+                payload["schema_version"] = 3
+                payload["identities"] = [item.to_dict() for item in registry.identities]
+            rows = payload.get("identities")
+            if not isinstance(rows, list):
+                raise ValueError(f"model-identities identities must be a list: {overlay_path}")
+
+        rows = payload.get("identities")
+        if not isinstance(rows, list):
+            raise ValueError(f"model-identities identities must be a list: {overlay_path}")
+        new_key = (args.executor, args.model_id)
+        if any(
+            isinstance(row, dict)
+            and (row.get("executor"), row.get("model_id")) == new_key
+            for row in rows
+        ):
+            raise ValueError(f"model identity already exists in overlay: {args.executor}/{args.model_id}")
+
+        new_row: dict[str, object] = {
+            "executor": args.executor,
+            "model_id": args.model_id,
+            "independence_domain": args.independence_domain,
+            "capabilities": list(args.capability),
+        }
+        if args.live_probe:
+            new_row["live_probe"] = args.live_probe
+        if args.override_packaged:
+            new_row["override_packaged"] = True
+        rows.append(new_row)
+
+        rendered = yaml.safe_dump(payload, allow_unicode=True, sort_keys=False)
+        fd, temp_name = tempfile.mkstemp(prefix=".model-identities.yaml.add-", dir=root)
+        temp_path = Path(temp_name)
+        target_uid = overlay_info.st_uid if overlay_info is not None else root_info.st_uid
+        target_gid = overlay_info.st_gid if overlay_info is not None else root_info.st_gid
+        target_mode = stat.S_IMODE(overlay_info.st_mode) if overlay_info is not None else 0o600
+        try:
+            os.fchmod(fd, target_mode)
+            if os.geteuid() == 0:
+                os.fchown(fd, target_uid, target_gid)
+            elif (target_uid, target_gid) != (os.geteuid(), os.getegid()):
+                raise ValueError("caller cannot preserve model-identities.yaml ownership")
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                fd = -1
+                stream.write(rendered)
+                stream.flush()
+                os.fsync(stream.fileno())
+            _load_model_identity_file(
+                temp_path, origin=model_resolution.IDENTITY_ORIGIN_OVERLAY
+            )
+            os.replace(temp_path, overlay_path)
+            temp_path = None
+            directory_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+    return overlay_path
 
 
 def _confirm_operator_action(args: argparse.Namespace, *, action: str) -> None:

@@ -283,6 +283,9 @@ def test_packaged_roster_positive_load_and_bindings(tmp_path: Path) -> None:
         ("claude", "sonnet"),
         ("codex", "gpt-5.3-codex-spark"),
         ("cg", "glm-5.2"),
+        ("agy", "gemini-3.8-flash-high"),
+        ("copilot", "gpt-5.4-mini"),
+        ("codex", "gpt-6-luna"),
     }
     agy = by_key[("agy", AGY_MODEL_ID)]
     assert agy.independence_domain == "google"
@@ -290,6 +293,13 @@ def test_packaged_roster_positive_load_and_bindings(tmp_path: Path) -> None:
     assert set(agy.capabilities) == {"planning", "review"}
     assert by_key[("copilot", "gpt-5.4")].capabilities == ("build",)
     assert by_key[("cg", "glm-5.2")].independence_domain == "zhipu"
+    assert by_key[("agy", "gemini-3.8-flash-high")].capabilities == (
+        "planning",
+        "review",
+    )
+    assert "build" not in by_key[("agy", "gemini-3.8-flash-high")].capabilities
+    assert by_key[("codex", "gpt-6-luna")].capabilities == ("build",)
+    assert by_key[("copilot", "gpt-5.4-mini")].capabilities == ("build",)
     # roster 全體為候選宣告：無任何實測封套欄位（#453 R4 資料層一眼可辨）。
     for identity in registry.identities:
         assert identity.measured_envelope_fields() == ()
