@@ -131,7 +131,7 @@ prior_artifact_root=/run/cortex-prior-artifacts
 prior_bundle_path=$prior_artifact_root/bundle.json
 prior_config_path=$prior_artifact_root/install-config.yaml
 readarray -t prior_artifact_digests < <(docker exec "$container_name" python3 - \
-    "$wheel_name" "$candidate_sha" <<'PY'
+    "$wheel_name" "$candidate_sha" "$prior_artifact_root" /artifacts <<'PY'
 import hashlib
 import json
 import shutil
@@ -139,16 +139,18 @@ import sys
 import zipfile
 from pathlib import Path
 
-root = Path("/run/cortex-prior-artifacts")
+root = Path(sys.argv[3])
+artifact_root = Path(sys.argv[4])
 wheel_name = sys.argv[1]
 candidate_sha = sys.argv[2]
 
 if root.exists() or root.is_symlink():
     raise SystemExit("prior artifact root already exists")
-shutil.copytree("/artifacts", root, symlinks=False)
+shutil.copytree(artifact_root, root, symlinks=False)
 
-dist_wheel = root / "dist" / wheel_name
-wheelhouse_wheel = root / "wheelhouse" / wheel_name
+dist_wheel = root / wheel_name
+wheelhouse_wheel = root / "wheelhouse" / Path(wheel_name).name
+wheelhouse_path = wheelhouse_wheel.relative_to(root).as_posix()
 with zipfile.ZipFile(dist_wheel, "a") as archive:
     archive.comment = b"qualification-prior-same-version\n"
 shutil.copyfile(dist_wheel, wheelhouse_wheel)
@@ -158,7 +160,7 @@ document = json.loads(bundle_path.read_text(encoding="utf-8"))
 document["candidate_sha"] = candidate_sha
 document["wheel"]["sha256"] = hashlib.sha256(dist_wheel.read_bytes()).hexdigest()
 for row in document["wheelhouse"]:
-    if row.get("path") == f"wheelhouse/{wheel_name}":
+    if row.get("path") == wheelhouse_path:
         row["sha256"] = hashlib.sha256(wheelhouse_wheel.read_bytes()).hexdigest()
 for row in document.get("source_repositories", []):
     if isinstance(row, dict) and row.get("slug") == "paulsha-cortex":

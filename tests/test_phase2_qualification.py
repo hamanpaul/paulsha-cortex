@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -754,6 +755,79 @@ def test_runner_uses_exact_artifacts_and_never_an_editable_checkout() -> None:
     }
     for label, pattern in forbidden.items():
         assert not re.search(pattern, raw, re.IGNORECASE), f"run.sh must forbid {label}"
+
+
+def test_synthetic_prior_wheel_paths_exist_and_match_the_bundle(tmp_path: Path) -> None:
+    runner = _required_text(RUNNER)
+    marker = (
+        'readarray -t prior_artifact_digests < <(docker exec '
+        '"$container_name" python3 -'
+    )
+    block_start = runner.index(marker)
+    heredoc_start = runner.index("<<'PY'\n", block_start) + len("<<'PY'\n")
+    heredoc_end = runner.index("\nPY\n)", heredoc_start)
+    prior_builder = runner[heredoc_start:heredoc_end]
+
+    artifact_root = tmp_path / "artifacts"
+    wheel_name = "candidate.whl"
+    wheel = artifact_root / "dist" / wheel_name
+    wheel.parent.mkdir(parents=True)
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("candidate.txt", "candidate")
+    wheelhouse_wheel = artifact_root / "wheelhouse" / wheel_name
+    wheelhouse_wheel.parent.mkdir()
+    shutil.copyfile(wheel, wheelhouse_wheel)
+    candidate_sha = "a" * 40
+    bundle = artifact_root / "bundle.json"
+    bundle.write_text(
+        json.dumps(
+            {
+                "candidate_sha": candidate_sha,
+                "wheel": {"sha256": hashlib.sha256(wheel.read_bytes()).hexdigest()},
+                "wheelhouse": [
+                    {
+                        "path": f"wheelhouse/{wheel_name}",
+                        "sha256": hashlib.sha256(wheelhouse_wheel.read_bytes()).hexdigest(),
+                    }
+                ],
+                "source_repositories": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    prior_root = tmp_path / "prior"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            prior_builder,
+            "dist/candidate.whl",
+            candidate_sha,
+            str(prior_root),
+            str(artifact_root),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    prior_dist_wheel = prior_root / "dist" / wheel_name
+    prior_wheelhouse_wheel = prior_root / "wheelhouse" / wheel_name
+    assert prior_dist_wheel.is_file()
+    assert prior_wheelhouse_wheel.is_file()
+    assert not (prior_root / "dist" / "dist").exists()
+    assert not (prior_root / "wheelhouse" / "dist").exists()
+    prior_bundle = json.loads((prior_root / "bundle.json").read_text(encoding="utf-8"))
+    assert prior_bundle["wheel"]["sha256"] == hashlib.sha256(
+        prior_dist_wheel.read_bytes()
+    ).hexdigest()
+    assert prior_bundle["wheelhouse"] == [
+        {
+            "path": f"wheelhouse/{wheel_name}",
+            "sha256": hashlib.sha256(prior_wheelhouse_wheel.read_bytes()).hexdigest(),
+        }
+    ]
 
 
 def test_runner_keeps_preinstall_control_files_outside_managed_state() -> None:
