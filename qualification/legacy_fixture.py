@@ -5,7 +5,9 @@
 的五個 cortex 帳號、實體 venv 目錄、手工 unit 與 installer 不產生的 drop-in、polkit
 rule、帶 ACL 的 state（含 plan 未宣告的頂層項目、受管目錄內未列管子目錄與暫存殘留）、
 worktree pool、帶 branch／worktree 的非 canonical source repo，以及內容全為假值的
-credential 類檔。
+credential 類檔。#1282 起另含參考主機 adoption 遇到的形狀：服務停止後殘留的 UNIX
+socket（state 頂層一個、被 quarantine 的目錄內一個）與 FIFO、Manager HOME 頂層的
+retry 檔；review-sandboxes 的 census 發現不再需要 operator 例外。
 
 布置只在兩種情況執行：
 - 以 root 在 disposable qualification 容器內（`/`，有容器標記），由
@@ -50,7 +52,9 @@ PRINCIPAL_ACCOUNTS = {
 }
 #: 會被 writable census 檢查的 job 帳號（Manager 不在其內）。
 CENSUS_PRINCIPALS = ("cortex-builder", "cortex-reviewer-planner", "cortex-gate", "cortex-egress")
-#: release install config（`write_install_config.py`）的帳號 id；legacy fixture 必須避開。
+#: v0.1.13 以前 release install config 寫死的帳號 id（#1286 起改由 plan 決定；Ubuntu 上
+#: 這段屬於 systemd-resolve 與 udev 群組）。legacy fixture 必須避開，adoption 才證明是
+#: overlay 宣告的號碼而不是預設值。
 RELEASE_ACCOUNT_IDS = frozenset({991, 992, 993, 994, 995})
 SERVICES = ("cortex-egress-proxy.service", "cortex-manager.service", "cortex-monitor.service")
 
@@ -87,7 +91,8 @@ LEGACY_EVIDENCE_FILES = (
     "legacy-rollback.json",
 )
 
-_ENTRY_TYPES = frozenset({"directory", "file", "symlink", "sparse"})
+#: ``socket``／``fifo`` 是沒有 listener／reader 的殘留物件（#1282），以 mknod 建立。
+_ENTRY_TYPES = frozenset({"directory", "file", "symlink", "sparse", "socket", "fifo"})
 _MODE = re.compile(r"^0[0-7]{3}$")
 _ACL_ENTRY = re.compile(r"^(?:[ug]:[a-z_][a-z0-9_-]*|[ugo]:):[r-][w-][x-]$")
 _PERMS = re.compile(r"^[r-][w-][x-]$")
@@ -673,6 +678,11 @@ def _create_entry(
             raise FixtureError(f"fixture path already exists; the fixture needs a fresh host: {path}")
         if kind == "directory":
             os.mkdir(path, 0o700)
+        elif kind == "socket":
+            # A stale socket: the inode a stopped service leaves behind.
+            os.mknod(path, 0o600 | stat.S_IFSOCK)
+        elif kind == "fifo":
+            os.mkfifo(path, 0o600)
         elif kind == "symlink":
             target = entry["target"]
             os.symlink(rebase(target, root) if target.startswith("/") else target, path)
