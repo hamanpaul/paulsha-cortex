@@ -58,7 +58,8 @@ receipt 一致。生效中的 receipt 由 receipt chain 判定，不看檔名或
 - `cortex upgrade --status` 唯讀顯示生效中的 receipt、上一次升級結果與 loaded runtime 是否一致。
 - 升級中途 shell 或主機被 SIGKILL、OOM、斷電打斷時，執行
   `sudo /opt/cortex/venv/bin/cortex upgrade --recover`：它從 maintenance snapshot 取得 plan sha、
-  核對 durable plan，再走 §6 的 recovery。
+  核對 durable plan；該次升級的 receipt 已 verify PASS 且正在服務時直接收尾（`finalized`），
+  否則走 §6 的 rollback recovery（判斷條件見 §6「手動恢復 `cortex upgrade` 中斷的升級」）。
 - 每次執行都在 `/var/lib/cortex-installer/<版本>/attempt-*` 留下完整的 install input、toolchain
   與封存 venv（數百 MB 到約 1 GB），工具不會自動清理：失敗重試會在同一版本目錄下累積。report 的
   `candidate.attempt_dir` 指向該次使用的目錄，`--recover` 與 §6 的手動恢復都要用到它，durable plan
@@ -1065,8 +1066,36 @@ state，必須先人工裁決。不得改用 tokenless rollback 或手動刪 rec
 
 `cortex upgrade` 中斷或停在原地（`halted`）時，第一步一律先執行
 `sudo /opt/cortex/venv/bin/cortex upgrade --recover`：它從 maintenance snapshot（只剩 stale
-lease marker 時改用 marker）取得 plan sha、核對 durable plan，再走上面同一個 `recover`。只有
-它拒絕執行或回報要人工裁決時，才照上面的 snippet 手動恢復。這時 snippet 裡寫死的
+lease marker 時改用 marker）取得 plan sha、核對 durable plan，先判斷能不能直接收尾，不能才走
+上面同一個 `recover`（rollback）。
+
+收尾（輸出 `"action": "finalized"`）只在下列三點都在 maintenance lease 與該 receipt 的
+transaction lock 下得到證明時才發生：
+
+1. 該次升級綁定的 receipt（snapshot 的 `receipt_path`；只剩 marker 時是 receipt chain 判定的
+   effective receipt）由同一份 plan 產生（`plan_sha256` 相同），且為 applied＋qualified（verify
+   PASS 已記錄）；
+2. `cortex-egress-proxy`、`cortex-manager`、`cortex-monitor` 三個 service 都 active；
+3. Manager／Monitor 的 loaded runtime 與該 receipt 一致（與升級 verify 後同一個比對，最多等
+   60 秒穩定）。
+
+收尾只清 snapshot 與 lease marker，不 stop／start 任何 service、不 rollback；report 的 `result`
+改為 `finalized`，`recovery.receipt` 記下收尾的 receipt。這涵蓋升級在 verify PASS 之後、清
+snapshot／marker 之前被 SIGKILL 或斷電打斷（重開機後 `/run` 的 marker 會消失，只剩 snapshot），
+以及清 snapshot 本身失敗的情況：已驗證、正在服務的 receipt 不會被 rollback 成服務停止、等人工。
+三點證明成立之後，`--recover` 自己清 snapshot 或 marker 失敗也不會改走 rollback：receipt 與服務
+都不動、剩下的 snapshot／marker 保留，report 記 `halted` 與 `recovery.action=finalize-failed`，
+指令以非 0 結束；排除原因後重跑 `--recover` 會重新證明並收尾。有 snapshot 時不要求該 receipt
+是 receipt chain 的 head；chain 若判不出，下一次升級的 preflight 仍會照舊擋下。
+
+證明完成前任何一點不成立或無法證明（receipt 不存在或讀不到、不是該 plan 的、未 qualified、service 不
+active、loaded runtime 不一致或 status 探測失敗），就照舊執行上面的 `recover`，輸出多帶
+`"action": "rolled-back"` 與 `reason`（例如 `receipt-not-qualified: …`、`services-inactive: …`、
+`loaded-runtime-mismatch: …`）；report 的 `result` 為 `recovered`（失敗則 `halted`），
+`recovery.reason` 記下原因。只剩 marker、而生效中的不是該 plan 的 receipt 時（例如寫 snapshot
+前就被打斷），`recover` 本來就只清 marker、不動 service，輸出標為 `"action": "marker-cleared"`。
+
+只有 `--recover` 拒絕執行或回報要人工裁決時，才照上面的 snippet 手動恢復。這時 snippet 裡寫死的
 `0.1.14/venv` 不適用：該次升級的 sealed CLI 在它自己的 attempt 目錄。每個變數改由該次升級的
 report（`/var/lib/cortex-installer/<版本>/upgrade-report.json`，與
 `/var/lib/cortex-installer/last-upgrade-report.json` 內容相同）對應：

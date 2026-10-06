@@ -12,7 +12,7 @@ import stat
 import subprocess
 import sys
 from pathlib import Path
-from typing import Iterator, Mapping, Sequence
+from typing import Callable, Iterator, Mapping, Sequence
 
 import yaml
 
@@ -1132,7 +1132,19 @@ def _lease_release_command(args: argparse.Namespace) -> int:
     return 0
 
 
-def _recover_command(args: argparse.Namespace) -> int:
+def _recover_command(
+    args: argparse.Namespace,
+    *,
+    emit: Callable[[dict[str, object]], None] | None = None,
+) -> int:
+    """Runbook §6: roll the snapshot's receipt back, restore the previous services.
+
+    Without a snapshot only the stale marker is cleared.  ``emit`` replaces
+    ``_emit`` for the result: `cortex upgrade --recover` adds why it did not
+    finalize instead (#1270).
+    """
+
+    report = emit or _emit
     _require_root()
     plan = _load_plan(Path(args.plan))
     validate_apply_plan(plan, confirm_sha256=args.confirm_sha256)
@@ -1143,7 +1155,7 @@ def _recover_command(args: argparse.Namespace) -> int:
         snapshot = _read_maintenance_snapshot()
         if snapshot is None:
             lifecycle_state["complete"] = True
-            _emit(
+            report(
                 {
                     "maintenance_recovered": True,
                     "plan_sha256": plan_sha256(plan),
@@ -1181,7 +1193,7 @@ def _recover_command(args: argparse.Namespace) -> int:
         restored = _restore_snapshot_services(previously_active)
         _clear_maintenance_snapshot(plan, receipt_path=receipt_path)
         lifecycle_state["complete"] = True
-        _emit(
+        report(
             {
                 "maintenance_recovered": True,
                 "plan_sha256": plan_sha256(plan),

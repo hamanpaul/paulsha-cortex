@@ -129,6 +129,7 @@ cortex upgrade --status
 
 - 從 maintenance snapshot 讀出 plan sha 與 receipt path。plan sha 不再由人工輸入；snapshot 本身就是 root-owned、plan-bound 的 durable 記錄。
 - 舊 helper 還活著時拒絕執行。
+- （#1270 owner 裁決 2026-10-06）先判斷能否收尾：snapshot 綁定的 receipt（只剩 marker 時為 receipt chain 判定、由同一份 plan 產生的 effective receipt）為 applied＋qualified、三個 service 都 active、Manager／Monitor 的 loaded runtime 與它一致時，只清 snapshot 與 marker、不 rollback，report 記為 `finalized`。任何一點不成立或無法證明才走下一點，輸出帶 `"action": "rolled-back"` 與原因。
 - 先停止所有 Cortex unit，再以 snapshot 綁定的 receipt 執行 rollback；只有 `restore_safe=true` 時才恢復原本 active 的 unit。
 - 最後清除 snapshot 與 marker。
 
