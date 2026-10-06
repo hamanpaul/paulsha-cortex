@@ -152,7 +152,12 @@ def test_rechain_positive_updates_all_pins_and_keeps_old_resolved_evidence(tmp_p
     }
     assert updated.resolved_model_chain == run.resolved_model_chain
     assert updated.candidate_head == run.candidate_head
-    assert updated.current_phase == run.current_phase
+    # A rechain from verify/review must return through a fresh build. Resuming
+    # directly in review would reuse the old Candidate and ask for the same
+    # review again.
+    assert updated.current_phase == "build"
+    assert updated.steps[0].gate_result == "pending"
+    assert updated.attempts["build"] == run.attempts.get("build", 0) + 1
     assert "needs_human" not in updated.facets
     assert "blocked" not in updated.facets
     assert updated.gate_status == "running"

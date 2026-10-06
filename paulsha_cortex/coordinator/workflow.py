@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -12,6 +13,9 @@ from .diagnostics import DiagnosticReason
 
 
 DEFAULT_WORKFLOW_COMBO = "feature-oneshot"
+DEFAULT_AUTO_RETRY_LIMIT = 2
+MAX_AUTO_RETRY_LIMIT = 10
+AUTO_RETRY_LIMIT_ENV = "PSC_WORKFLOW_AUTO_RETRY_LIMIT"
 WORKFLOW_MANIFEST_VERSION = 1
 WORKFLOW_PHASES = ("claim", "define", "plan", "build", "verify", "review", "ship")
 SHIP_TRANSITION_STAGES = ("local-closeout", "pr-preflight", "external-ship")
@@ -944,6 +948,8 @@ class WorkflowRun:
     gate_status: str
     created_at: str
     updated_at: str
+    auto_retry_limit: int = DEFAULT_AUTO_RETRY_LIMIT
+    auto_retry_history: tuple[dict[str, Any], ...] = ()
     planning_authority: tuple[PlanningArtifactAuthority, ...] = ()
     planning_source_revision: str | None = None
     status: str = "ongoing"
@@ -1099,6 +1105,20 @@ class WorkflowRun:
             for key, value in self.attempts.items()
         ):
             raise ValueError("workflow run attempts 格式錯誤")
+        if (
+            not isinstance(self.auto_retry_limit, int)
+            or isinstance(self.auto_retry_limit, bool)
+            or not 0 <= self.auto_retry_limit <= MAX_AUTO_RETRY_LIMIT
+        ):
+            raise ValueError(
+                f"workflow run auto_retry_limit 必須為 0–{MAX_AUTO_RETRY_LIMIT} 的整數"
+            )
+        if (
+            not isinstance(self.auto_retry_history, tuple)
+            or len(self.auto_retry_history) > 100
+            or any(not isinstance(item, dict) for item in self.auto_retry_history)
+        ):
+            raise ValueError("workflow run auto_retry_history 格式錯誤")
         if (
             not isinstance(self.facets, tuple)
             or len(set(self.facets)) != len(self.facets)
@@ -1338,6 +1358,10 @@ class WorkflowRun:
             }
         if self.main_sync_repair is not None:
             payload["main_sync_repair"] = dict(self.main_sync_repair)
+        if self.auto_retry_history or self.auto_retry_limit != DEFAULT_AUTO_RETRY_LIMIT:
+            payload["auto_retry_limit"] = self.auto_retry_limit
+        if self.auto_retry_history:
+            payload["auto_retry_history"] = [dict(item) for item in self.auto_retry_history]
         return payload
 
     @classmethod
@@ -1375,6 +1399,9 @@ class WorkflowRun:
         planning_authority = payload.get("planning_authority", [])
         if not isinstance(planning_authority, list):
             raise ValueError("workflow run planning_authority 格式錯誤")
+        auto_retry_history = payload.get("auto_retry_history", [])
+        if not isinstance(auto_retry_history, list):
+            raise ValueError("workflow run auto_retry_history 格式錯誤")
         return cls(
             run_id=payload["run_id"],
             work_id=payload["work_id"],
@@ -1399,6 +1426,8 @@ class WorkflowRun:
             gate_status=payload["gate_status"],
             created_at=payload["created_at"],
             updated_at=payload["updated_at"],
+            auto_retry_limit=payload.get("auto_retry_limit", DEFAULT_AUTO_RETRY_LIMIT),
+            auto_retry_history=tuple(auto_retry_history),
             planning_authority=tuple(
                 PlanningArtifactAuthority.from_dict(item) for item in planning_authority
             ),
@@ -1443,6 +1472,30 @@ class WorkflowRun:
                 else None
             ),
         )
+
+
+def configured_auto_retry_limit(value: object | None = None) -> int:
+    """Resolve the run-scoped retry cap from its explicit value or environment.
+
+    The environment is read only when a run is created; the selected value is
+    persisted on that run so later service configuration changes do not alter
+    an in-flight recovery budget.
+    """
+
+    raw = os.environ.get(AUTO_RETRY_LIMIT_ENV) if value is None else value
+    if raw is None:
+        return DEFAULT_AUTO_RETRY_LIMIT
+    if isinstance(raw, bool):
+        raise ValueError(f"{AUTO_RETRY_LIMIT_ENV} must be an integer")
+    if isinstance(raw, int):
+        result = raw
+    elif isinstance(raw, str) and re.fullmatch(r"(?:0|[1-9][0-9]*)", raw):
+        result = int(raw)
+    else:
+        raise ValueError(f"{AUTO_RETRY_LIMIT_ENV} must be an integer")
+    if not 0 <= result <= MAX_AUTO_RETRY_LIMIT:
+        raise ValueError(f"{AUTO_RETRY_LIMIT_ENV} must be between 0 and {MAX_AUTO_RETRY_LIMIT}")
+    return result
 
 
 #: planning-authority 對帳在「缺 brainstorm 背書」時的**唯一**訊息字面值。

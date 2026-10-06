@@ -3883,7 +3883,12 @@ def test_same_input_content_isolated_across_workflow_runs(tmp_path: Path) -> Non
     assert all(Path(ref).is_file() for ref in refs)
 
 
-def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp_path: Path) -> None:
+def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # This scenario also exercises manual recovery from rejected review evidence;
+    # automatic retry routing has dedicated production-path coverage elsewhere.
+    monkeypatch.setattr(manager, "auto_retry_is_eligible", lambda _run: False)
     coordinator_dir = tmp_path.parent / f".{tmp_path.name}-coordinator"
     state_path = coordinator_dir / "registry.json"
     registry = JobRegistry(state_path=state_path)

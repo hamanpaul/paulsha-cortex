@@ -505,6 +505,21 @@ def test_inspect_work_surfaces_schema_retry_counter_and_limit(
                     "limit": limit,
                     "by_card": {"tdd-red": limit, "impl": 1},
                 },
+                "automatic_retries": {
+                    "count": 2,
+                    "limit_per_builder": 2,
+                    "remaining_for_current_builder": 0,
+                    "builder_switches": [
+                        {
+                            "card": "impl",
+                            "reason": "sandbox-panic",
+                            "from": {"executor": "codex", "model_id": "gpt"},
+                            "to": {"executor": "claude", "model_id": "opus"},
+                            "job_id": "job-1",
+                        }
+                    ],
+                    "attempts": [],
+                },
             },
         }
 
@@ -519,6 +534,8 @@ def test_inspect_work_surfaces_schema_retry_counter_and_limit(
         line for line in human.splitlines() if line.startswith("schema_retry[impl]")
     )
     assert "(exhausted)" not in impl_line
+    assert "automatic_retries: 2 (limit 2, remaining 0)" in human
+    assert "automatic_builder_switch: impl" in human
 
     assert _run_cli(
         ["inspect", "work", "retry-storm", "--repo", "example/acme", "--json"]
@@ -526,6 +543,7 @@ def test_inspect_work_surfaces_schema_retry_counter_and_limit(
     rendered = json.loads(capsys.readouterr().out)
     assert rendered["schema_retry"]["limit"] == limit
     assert rendered["schema_retry"]["by_card"]["tdd-red"] == limit
+    assert rendered["automatic_retries"]["count"] == 2
 
 
 def test_inspect_work_omits_schema_retry_when_never_mismatched(

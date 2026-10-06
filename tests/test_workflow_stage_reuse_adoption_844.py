@@ -932,9 +932,11 @@ class TestS05RejectedSources:
 
         result = harness.resume()
 
-        assert result["reason"] == "blocking-findings"
-        assert harness.gate("code-review") == "needs_human"
-        assert "needs_human" in harness.run().facets
+        assert result["reason"] == "automatic-retry-build"
+        assert harness.gate("code-review") == "pending"
+        assert "needs_human" not in harness.run().facets
+        assert harness.run().current_phase == "build"
+        assert harness.run().auto_retry_history[-1]["reason"] == "blocking-findings"
         _assert_reused_receipt(
             harness.receipt("code-review"),
             harness=harness,

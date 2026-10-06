@@ -33,6 +33,7 @@ from .workflow import (
     WorkflowPlanningDriftStop,
     WorkflowRun,
     WorkflowStep,
+    configured_auto_retry_limit,
     validate_workflow_phase_transition,
 )
 
@@ -5272,6 +5273,7 @@ class JobRegistry:
         frozen_readiness: dict[str, Any] | None = None,
         model_chain_override: dict[str, dict[str, str]] | None = None,
         combo_selection: dict[str, Any] | None = None,
+        auto_retry_limit: int | None = None,
         needs_human_reason: DiagnosticReason | Mapping[str, Any] | None = None,
     ) -> WorkflowRun:
         matches = [
@@ -5333,6 +5335,7 @@ class JobRegistry:
             gate_status=gate_status,
             created_at=now,
             updated_at=now,
+            auto_retry_limit=configured_auto_retry_limit(auto_retry_limit),
             planning_authority=tuple(planning_authority),
             planning_source_revision=source_revision,
             sizing_score=sizing_score,
@@ -5403,6 +5406,8 @@ class JobRegistry:
         quota_admission: dict[str, dict[str, str]] | None = None,
         combo_selection: dict[str, Any] | None = None,
         stage_reuse_receipts: dict[str, dict[str, Any]] | None = None,
+        auto_retry_limit: int | None = None,
+        auto_retry_history: tuple[dict[str, Any], ...] | None = None,
         needs_human_reason: DiagnosticReason | Mapping[str, Any] | None = None,
     ) -> WorkflowRun:
         index = self._find_workflow_run_index(run_id)
@@ -5428,6 +5433,17 @@ class JobRegistry:
             current_reason=current.needs_human_reason,
             supplied=needs_human_reason,
         )
+        next_auto_retry_history = (
+            current.auto_retry_history
+            if auto_retry_history is None
+            else tuple(dict(item) for item in auto_retry_history)
+        )
+        if (
+            len(next_auto_retry_history) < len(current.auto_retry_history)
+            or next_auto_retry_history[: len(current.auto_retry_history)]
+            != current.auto_retry_history
+        ):
+            raise ValueError("workflow auto-retry history is append-only")
         updated = WorkflowRun(
             run_id=current.run_id,
             work_id=current.work_id,
@@ -5456,6 +5472,12 @@ class JobRegistry:
             gate_status=current.gate_status if gate_status is None else gate_status,
             created_at=current.created_at,
             updated_at=_now_iso(),
+            auto_retry_limit=(
+                current.auto_retry_limit if auto_retry_limit is None else auto_retry_limit
+            ),
+            auto_retry_history=(
+                next_auto_retry_history
+            ),
             planning_authority=(
                 current.planning_authority
                 if planning_authority is None
@@ -5597,18 +5619,59 @@ class JobRegistry:
                 raise ValueError(f"rechain {persona} identity pin malformed")
         if not isinstance(evidence_ref, str) or not evidence_ref:
             raise ValueError("rechain requires immutable audit evidence reference")
+        if current.current_phase in {"verify", "review"}:
+            build_steps = [step for step in current.steps if step.phase == "build"]
+            if not build_steps:
+                raise ValueError("rechain recovery requires a build phase")
+            repair_card = build_steps[-1].card
+            repair_action = (
+                "Rebuild the exact current Candidate with the readjudicated builder identity. "
+                "Use the recorded verification or review findings to fix the Candidate before "
+                "it is verified and reviewed again."
+            )
+            reset_steps = tuple(
+                replace(
+                    step,
+                    executor=None,
+                    model=None,
+                    domain=None,
+                    gate_result="pending",
+                    action=(
+                        repair_action
+                        if step.phase == "build" and step.card == repair_card
+                        else step.action
+                    ),
+                )
+                if (step.phase == "build" and step.card == repair_card)
+                or step.phase in {"verify", "review"}
+                or (step.phase == "ship" and step.gate_result != "passed")
+                else step
+                for step in current.steps
+            )
+            reset = retry_build_reset_projection(current)
+            base = replace(
+                reset,
+                current_phase="build",
+                steps=reset_steps,
+                gate_refs=tuple(ref for ref in current.gate_refs if ref.kind == "brainstorm"),
+                facets=tuple(facet for facet in current.facets if facet not in {"needs_human", "blocked"}),
+                needs_human_reason=None,
+                gate_status="running",
+            )
+        else:
+            base = current
         updated = replace(
-            current,
+            base,
             model_chain_override={
                 persona: dict(identity)
                 for persona, identity in model_chain_override.items()
             },
             facets=tuple(
-                facet for facet in current.facets
+                facet for facet in base.facets
                 if facet not in {"needs_human", "blocked"}
             ),
             gate_status="running",
-            evidence_refs=tuple(dict.fromkeys((*current.evidence_refs, evidence_ref))),
+            evidence_refs=tuple(dict.fromkeys((*base.evidence_refs, evidence_ref))),
             needs_human_reason=None,
             updated_at=_now_iso(),
         )
@@ -5908,6 +5971,7 @@ class JobRegistry:
         model_chain_override: dict[str, dict[str, str]] | None = None,
         post_pass_adjudicated: bool = False,
         main_sync_repair: dict[str, str] | None = None,
+        auto_retry_record: dict[str, Any] | None = None,
     ) -> WorkflowRun:
         """以 exact Candidate 重開最後 builder 卡，保留既有 evidence 與下游重驗契約。
 
@@ -6028,6 +6092,15 @@ class JobRegistry:
                 **dict(current.model_chain_override or {}),
                 **{persona: dict(row) for persona, row in model_chain_override.items()},
             }
+        next_auto_retry_history = current.auto_retry_history
+        if auto_retry_record is not None:
+            if (
+                not isinstance(auto_retry_record, dict)
+                or auto_retry_record.get("schema") != "cortex-workflow-auto-retry/v1"
+                or auto_retry_record.get("run_id") != current.run_id
+            ):
+                raise ValueError("workflow auto-retry audit record binding invalid")
+            next_auto_retry_history = (*current.auto_retry_history, dict(auto_retry_record))
         updated = replace(
             retry_build_reset_projection(current),
             steps=steps,
@@ -6040,8 +6113,11 @@ class JobRegistry:
             main_sync_repair=(
                 dict(main_sync_repair) if main_sync_repair is not None else None
             ),
+            auto_retry_history=next_auto_retry_history,
             updated_at=_now_iso(),
         )
+        if len(updated.auto_retry_history) > 100:
+            raise ValueError("workflow auto-retry audit history limit reached")
         self._workflows[index] = updated
         self._persist()
         return self._copy_workflow_run(updated)

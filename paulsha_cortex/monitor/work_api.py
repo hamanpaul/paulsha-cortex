@@ -258,6 +258,9 @@ class WorkReadModelStore:
             retries = self._schema_retry(item.repo, item.work_id)
             if retries:
                 envelope["schema_retry"] = retries
+            automatic_retries = self._automatic_retries(item.repo, item.work_id)
+            if automatic_retries:
+                envelope["automatic_retries"] = automatic_retries
             # 診斷 invariant（#527）：run 掛著 needs_human 時把結構化理由帶出來。
             # 資料源與 `schema_retry` 完全相同（workflow provider 的
             # observations），欄位名沿用 `claim.ClaimDecision.blocking_reason`
@@ -386,6 +389,21 @@ class WorkReadModelStore:
                         if isinstance(count, int) and not isinstance(count, bool)
                     },
                 }
+        return {}
+
+    def _automatic_retries(self, repo: str, work_id: str) -> dict:
+        for provider_id, provider in self._snapshot.providers.items():
+            if not provider_id.startswith("workflow:") or _provider_repo(provider_id) != repo:
+                continue
+            observations = provider.observations
+            if not isinstance(observations, Mapping):
+                continue
+            rows = observations.get("automatic_retries", {})
+            if not isinstance(rows, Mapping):
+                continue
+            found = rows.get(work_id)
+            if isinstance(found, Mapping) and found:
+                return dict(found)
         return {}
 
     def explain_work_item(self, work_id: str, *, repo: str | None = None) -> dict:

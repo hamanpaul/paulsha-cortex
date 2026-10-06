@@ -29,6 +29,7 @@ from .._yaml import YAMLError, safe_load
 from ..lib import idle
 from ..persona import gate, handoff
 from . import autonomy
+from . import automatic_retry
 from . import candidate_base
 from . import completion
 from . import coverage
@@ -1756,6 +1757,7 @@ def workflow_status_entry(
             if not filtered_next_actions:
                 next_step_hint = "目前沒有符合正式入口前置條件的 recovery action。"
         next_actions = filtered_next_actions
+    retry_projection = automatic_retry.automatic_retry_summary(run)
     try:
         candidate_git_base = candidate_base.candidate_git_base_for_run(
             run, registry, probe=candidate_base_probe
@@ -1804,6 +1806,8 @@ def workflow_status_entry(
         "updated_at": run.updated_at,
         **execution_identity,
     }
+    if retry_projection["attempts"]:
+        entry["automatic_retries"] = retry_projection
     accepted_workflow_results = workflow_accepted_results_for_run(registry, run)
     if accepted_workflow_results:
         entry["accepted_workflow_results"] = accepted_workflow_results
@@ -4938,8 +4942,13 @@ def _job_gate_worktree_state(job: Mapping[str, object]) -> Mapping[str, object] 
     return state
 
 
-def _verify_exact_candidate(job: Mapping[str, object], *, git_runner=None) -> str:
-    candidate = job.get("subject_head")
+def _verify_exact_candidate(
+    job: Mapping[str, object],
+    *,
+    candidate_override: object | None = None,
+    git_runner=None,
+) -> str:
+    candidate = candidate_override if candidate_override is not None else job.get("subject_head")
     # reviewer 走 `workflow_repo_root`，不讀 reviewer 的工作樹（那是 sandbox）。
     # #650 之後那個欄位是 **Manager 自己從來源樹 clone 出來的 candidate 樹**
     # （`_reviewer_candidate_workspace()`，HEAD 恰為 candidate），不再是前一張
@@ -5004,11 +5013,16 @@ def _verify_build_candidate_transition(
     job: Mapping[str, object],
     *,
     previous_candidate: object,
+    candidate_override: object | None = None,
     git_runner=None,
 ) -> str:
     """Accept an exact build HEAD only when it monotonically extends its trusted baseline."""
 
-    candidate = _verify_exact_candidate(job, git_runner=git_runner)
+    candidate = _verify_exact_candidate(
+        job,
+        candidate_override=candidate_override,
+        git_runner=git_runner,
+    )
     baseline = previous_candidate if previous_candidate is not None else job.get("dispatch_head")
     worktree = job.get("worktree")
     if (
@@ -13845,6 +13859,7 @@ def _operator_adjudications(
 def _workflow_retry_context(
     prior_jobs: Sequence[Mapping[str, object]],
     *,
+    run=None,
     registry=None,
     review_rejection: Mapping[str, object] | None = None,
     operator_adjudications: Sequence[Mapping[str, object]] | None = None,
@@ -13891,6 +13906,18 @@ def _workflow_retry_context(
     if review_rejection is not None:
         # #750：repair 回合的跨卡回饋。鍵名明示它是「打回 candidate 的那份判定」。
         context["review_rejection"] = dict(review_rejection)
+    history = getattr(run, "auto_retry_history", ())
+    if isinstance(history, (list, tuple)):
+        prior_retry = next(
+            (row for row in reversed(history) if isinstance(row, Mapping) and row.get("card") == latest.get("workflow_card")),
+            None,
+        )
+        if prior_retry is not None:
+            context["automatic_retry"] = {
+                "reason": str(prior_retry.get("reason") or ""),
+                "decision": str(prior_retry.get("decision") or ""),
+                "feedback": str(prior_retry.get("feedback") or "")[:RETRY_CONTEXT_EVIDENCE_LIMIT],
+            }
     if operator_adjudications:
         # #752：operator 的人裁紀錄——needs_human 判定的權威答覆，優先於文件間的
         # 表面矛盾（例：design 與 todo 不一致時，以裁決指定的那一邊為準）。
@@ -17172,6 +17199,7 @@ def _dispatch_workflow_card(
             # retry_context 為 None → prompt 逐字不變）。
             retry_context=_workflow_retry_context(
                 matching,
+                run=run,
                 registry=registry,
                 review_rejection=(
                     _prior_review_rejection(run, registry)
@@ -17849,6 +17877,559 @@ def _rebind_reviewed_planning_for_verify(
         return None, "workflow-planning-drift-recovery-ineligible"
 
 
+def _automatic_retry_failure(run) -> tuple[str, Mapping[str, object]] | None:
+    if run.status != "ongoing" or "needs_human" not in run.facets:
+        return None
+    payload = getattr(run, "needs_human_reason", None)
+    if not isinstance(payload, Mapping):
+        return None
+    code = payload.get("reason")
+    if code == "blocking-findings" and run.current_phase == "review":
+        return str(code), payload
+    if code == "gate-contradiction" and run.current_phase == "build":
+        return str(code), payload
+    return None
+
+
+def auto_retry_is_eligible(run) -> bool:
+    """Whether the periodic Manager loop should route this stop into recovery."""
+
+    return _automatic_retry_failure(run) is not None
+
+
+def _auto_retry_builder_identity(run, registry, card: str) -> dict[str, str] | None:
+    jobs = [
+        job for job in registry.list_jobs()
+        if job.get("workflow_run_id") == run.run_id
+        and job.get("workflow_phase") == "build"
+        and job.get("workflow_card") == card
+        and job.get("workflow_claim_key") in (None, run.claim_key)
+    ]
+    for job in reversed(jobs):
+        executor, model_id = job.get("executor"), job.get("model_id")
+        if isinstance(executor, str) and executor and isinstance(model_id, str) and model_id:
+            return {"executor": executor, "model_id": model_id}
+    resolved = run.resolved_model_chain or {}
+    row = resolved.get("builder") if isinstance(resolved, Mapping) else None
+    if isinstance(row, Mapping):
+        executor, model_id = row.get("executor"), row.get("model_id")
+        if isinstance(executor, str) and executor and isinstance(model_id, str) and model_id:
+            return {"executor": executor, "model_id": model_id}
+    for step in reversed(run.steps):
+        if step.phase == "build" and step.executor and step.model:
+            return {"executor": step.executor, "model_id": step.model}
+    override = run.model_chain_override or {}
+    row = override.get("builder") if isinstance(override, Mapping) else None
+    if isinstance(row, Mapping):
+        executor, model_id = row.get("executor"), row.get("model_id")
+        if isinstance(executor, str) and executor and isinstance(model_id, str) and model_id:
+            return {"executor": executor, "model_id": model_id}
+    return None
+
+
+def _auto_retry_next_builder(run, identities, current: dict[str, str] | None):
+    override = dict(run.model_chain_override or {})
+    override.pop("builder", None)
+    eligible_run = replace(run, model_chain_override=override or None)
+    candidates = _workflow_identity_candidates_for_persona(eligible_run, "builder", identities)
+    if not candidates:
+        return None
+
+    reviewer_domain = None
+    reviewer_override = (run.model_chain_override or {}).get("reviewer")
+    reviewer_resolved = (run.resolved_model_chain or {}).get("reviewer")
+    reviewer_pair = reviewer_override or reviewer_resolved
+    if isinstance(reviewer_pair, Mapping):
+        reviewer = identities.get(reviewer_pair.get("executor"), reviewer_pair.get("model_id"))
+        reviewer_domain = getattr(reviewer, "independence_domain", None)
+    if reviewer_domain is None:
+        for step in reversed(run.steps):
+            if step.phase in {"verify", "review"} and step.domain:
+                reviewer_domain = step.domain
+                break
+    if reviewer_domain is None:
+        try:
+            reviewer_domain = _workflow_identity_candidates_for_persona(
+                run, "reviewer", identities
+            )[0].independence_domain
+        except (IndexError, ValueError, RuntimeError):
+            return None
+
+    current_pair = (current or {}).get("executor"), (current or {}).get("model_id")
+    used_targets = {
+        (
+            row.get("builder_after", {}).get("executor"),
+            row.get("builder_after", {}).get("model_id"),
+        )
+        for row in run.auto_retry_history
+        if isinstance(row.get("builder_after"), Mapping)
+        and row.get("decision") == "switch-builder"
+    }
+    start = 0
+    for index, identity in enumerate(candidates):
+        if (identity.executor, identity.model_id) == current_pair:
+            start = index + 1
+            break
+    for identity in candidates[start:]:
+        pair = (identity.executor, identity.model_id)
+        if pair == current_pair or pair in used_targets:
+            continue
+        if identity.independence_domain == reviewer_domain:
+            continue
+        return identity
+    return None
+
+
+def _auto_retry_feedback(run, reason_payload: Mapping[str, object], coordinator_root) -> str:
+    """Read bounded Manager-reviewed findings for the next build prompt."""
+
+    context = reason_payload.get("context")
+    refs = context.get("evidence_refs") if isinstance(context, Mapping) else None
+    if not isinstance(refs, (list, tuple)):
+        refs = ()
+    for raw_ref in refs:
+        if not isinstance(raw_ref, str):
+            continue
+        path = Path(raw_ref)
+        try:
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > 128 * 1024:
+                continue
+            evaluation = foreign_review.validate_gate_evaluation(
+                json.loads(path.read_text(encoding="utf-8"))
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            continue
+        if (
+            evaluation.get("state") != "rejected"
+            or evaluation.get("candidate") != run.candidate_head
+        ):
+            continue
+        findings = evaluation.get("findings")
+        if isinstance(findings, list):
+            return json.dumps(findings, ensure_ascii=False, sort_keys=True)[:RETRY_CONTEXT_EVIDENCE_LIMIT]
+    detail = reason_payload.get("detail")
+    return str(detail)[:RETRY_CONTEXT_EVIDENCE_LIMIT] if isinstance(detail, str) else ""
+
+
+def _append_auto_retry_exhaustion(
+    registry,
+    *,
+    run,
+    reason: str,
+    detail: str,
+    builder: dict[str, str] | None,
+    job_id: str | None,
+    feedback: str,
+) -> dict[str, object]:
+    history = list(run.auto_retry_history)
+    card = next(
+        (step.card for step in reversed(run.steps) if step.phase == "build"),
+        "unknown",
+    )
+    history.append(
+        {
+            "schema": automatic_retry.AUTO_RETRY_HISTORY_SCHEMA,
+            "run_id": run.run_id,
+            "attempt": len(history) + 1,
+            "card": card,
+            "phase": run.current_phase,
+            "candidate": run.candidate_head,
+            "reason": reason,
+            "decision": "exhausted",
+            "builder_before": dict(builder) if builder else None,
+            "builder_after": dict(builder) if builder else None,
+            "builder_retry_number": 0,
+            "limit": run.auto_retry_limit,
+            "job_id": job_id,
+            "feedback": feedback[:RETRY_CONTEXT_EVIDENCE_LIMIT],
+            "created_at": _utcnow(),
+        }
+    )
+    full_history = [dict(item) for item in history]
+    detail_text = (
+        f"自動重試／換 builder 已用盡：原因={reason}；"
+        f"candidate={run.candidate_head or 'none'}；{detail[:500]}；"
+        "建議檢視完整嘗試紀錄後執行 retry-build。"
+    )
+    stopped = registry._manager_update_workflow_run(
+        run.run_id,
+        facets=tuple(dict.fromkeys((*run.facets, "needs_human"))),
+        gate_status="running",
+        auto_retry_history=tuple(full_history),
+        needs_human_reason=diagnostic_reason(
+            "automatic-retry-exhausted",
+            detail_text,
+            source="manager.resume_workflow_run:auto-retry-exhausted",
+            run_id=run.run_id,
+            work_id=run.work_id,
+            candidate=run.candidate_head or "none",
+            job_id=job_id or "",
+            attempt_count=str(len(full_history)),
+            retry_limit=str(run.auto_retry_limit),
+            recommended_action="retry-build",
+        ),
+    )
+    return {
+        "run_id": stopped.run_id,
+        "current_phase": stopped.current_phase,
+        "reason": "automatic-retry-exhausted",
+        "automatic_retries": automatic_retry.automatic_retry_summary(stopped),
+    }
+
+
+def _known_executor_environment_failure(job: Mapping[str, object]) -> str | None:
+    diagnostic = job.get("runtime_diagnostic")
+    if not isinstance(diagnostic, Mapping):
+        return None
+    text = " ".join(
+        str(diagnostic.get(key) or "") for key in ("reason", "detail")
+    ).lower().replace("-", " ").replace("_", " ")
+    if "permission denied" in text or "permission error" in text:
+        return "permission-denied"
+    if "sandbox panic" in text or "sandbox panicked" in text:
+        return "sandbox-panic"
+    return None
+
+
+def _auto_reroute_environment_failure(
+    dispatcher,
+    *,
+    registry,
+    run,
+    step,
+    job: Mapping[str, object],
+    identities,
+    launcher_factory,
+    coordinator_root,
+    builder_todo_admission_loader=None,
+    spawn_admission=None,
+    quota_admission_context=None,
+) -> dict[str, object] | None:
+    failure = _known_executor_environment_failure(job)
+    if failure is None or step.phase != "build":
+        return None
+    before = {
+        key: str(job[key])
+        for key in ("executor", "model_id")
+        if isinstance(job.get(key), str) and job.get(key)
+    }
+    before_identity = before if set(before) == {"executor", "model_id"} else None
+    target = _auto_retry_next_builder(run, identities, before_identity)
+    history = list(run.auto_retry_history)
+    base_record = {
+        "schema": automatic_retry.AUTO_RETRY_HISTORY_SCHEMA,
+        "run_id": run.run_id,
+        "attempt": len(history) + 1,
+        "card": step.card,
+        "phase": step.phase,
+        "candidate": run.candidate_head,
+        "reason": failure,
+        "builder_before": before_identity,
+        "builder_after": (
+            {"executor": target.executor, "model_id": target.model_id}
+            if target is not None
+            else before_identity
+        ),
+        "builder_retry_number": 1 if target is not None else 0,
+        "limit": run.auto_retry_limit,
+        "job_id": str(job.get("job_id") or "") or None,
+        "feedback": str(
+            (job.get("runtime_diagnostic") or {}).get("detail") or failure
+        )[:RETRY_CONTEXT_EVIDENCE_LIMIT],
+        "created_at": _utcnow(),
+    }
+    if target is None or run.auto_retry_limit == 0:
+        exhausted = {
+            **base_record,
+            "decision": "exhausted",
+            "builder_after": before_identity,
+        }
+        updated = registry._manager_update_workflow_run(
+            run.run_id,
+            facets=tuple(dict.fromkeys((*run.facets, "needs_human"))),
+            gate_status="running",
+            auto_retry_history=(*history, exhausted),
+            needs_human_reason=diagnostic_reason(
+                "automatic-retry-exhausted",
+                "已知 executor 環境錯誤無法安全換派 builder；"
+                f"原因={failure}，detail={base_record['feedback']}。"
+                "建議檢查 executor 環境後執行 retry-build。",
+                source="manager.resume_workflow_run:environment-fallback-exhausted",
+                run_id=run.run_id,
+                work_id=run.work_id,
+                job_id=base_record["job_id"] or "",
+                candidate=run.candidate_head or "none",
+                recommended_action="retry-build",
+            ),
+        )
+        return {
+            "run_id": updated.run_id,
+            "current_phase": updated.current_phase,
+            "job_id": base_record["job_id"],
+            "reason": "automatic-retry-exhausted",
+            "automatic_retries": automatic_retry.automatic_retry_summary(updated),
+        }
+
+    switched = {
+        **base_record,
+        "decision": "switch-builder",
+    }
+    model_chain_override = {
+        **dict(run.model_chain_override or {}),
+        "builder": {"executor": target.executor, "model_id": target.model_id},
+    }
+    routed = registry._manager_update_workflow_run(
+        run.run_id,
+        auto_retry_history=(*history, switched),
+        model_chain_override=model_chain_override,
+    )
+    try:
+        admission = (
+            builder_todo_admission_loader(routed)
+            if builder_todo_admission_loader is not None
+            else None
+        )
+        replacement = dispatch_workflow_card(
+            dispatcher,
+            run=routed,
+            identities=identities,
+            launcher_factory=launcher_factory,
+            coordinator_root=coordinator_root,
+            retry_failed=True,
+            force_new_card=True,
+            forced_identity=target,
+            spawn_admission=spawn_admission,
+            builder_todo_admission=admission,
+            quota_admission_context=quota_admission_context,
+        )
+    except Exception as exc:
+        current = registry.get_workflow_run(run.run_id)
+        failure_record = {
+            **switched,
+            "attempt": len(current.auto_retry_history) + 1,
+            "decision": "dispatch-failed",
+            "reason": "automatic-retry-dispatch-failed",
+            "feedback": summarize_exception(exc),
+            "created_at": _utcnow(),
+        }
+        failed = registry._manager_update_workflow_run(
+            run.run_id,
+            facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
+            gate_status="running",
+            auto_retry_history=(*current.auto_retry_history, failure_record),
+            needs_human_reason=diagnostic_reason(
+                "automatic-retry-dispatch-failed",
+                f"已知 executor 環境錯誤換派 builder 失敗：{summarize_exception(exc)}",
+                source="manager.resume_workflow_run:environment-fallback-dispatch",
+                run_id=run.run_id,
+                work_id=run.work_id,
+                candidate=run.candidate_head or "none",
+                recommended_action="retry-build",
+            ),
+        )
+        return {
+            "run_id": failed.run_id,
+            "current_phase": failed.current_phase,
+            "reason": "automatic-retry-dispatch-failed",
+            "automatic_retries": automatic_retry.automatic_retry_summary(failed),
+        }
+    if classify_dispatch_result(replacement, registry=registry, run_id=run.run_id)["kind"] == "decision":
+        return {
+            **dict(replacement),
+            "automatic_retries": automatic_retry.automatic_retry_summary(
+                registry.get_workflow_run(run.run_id)
+            ),
+        }
+    return {
+        "run_id": run.run_id,
+        "current_phase": "build",
+        "job_id": str(replacement["job_id"]),
+        "reason": "automatic-builder-fallback",
+        "automatic_retries": automatic_retry.automatic_retry_summary(
+            registry.get_workflow_run(run.run_id)
+        ),
+    }
+
+
+def _auto_retry_build_after_stop(
+    dispatcher,
+    *,
+    registry,
+    run,
+    identities,
+    launcher_factory,
+    coordinator_root,
+    builder_todo_admission_loader=None,
+    spawn_admission=None,
+    quota_admission_context=None,
+) -> dict[str, object]:
+    eligible = _automatic_retry_failure(run)
+    if eligible is None:
+        return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": "operator-resume-required"}
+    reason, reason_payload = eligible
+    builds = [step for step in run.steps if step.phase == "build"]
+    if not builds or run.current_phase not in {"build", "review"}:
+        return _append_auto_retry_exhaustion(
+            registry, run=run, reason=reason, detail="missing build phase", builder=None,
+            job_id=None, feedback=str(reason_payload.get("detail") or ""),
+        )
+    card = builds[-1].card
+    candidate = run.candidate_head
+    if not isinstance(candidate, str) or verification.SAFE_SHA_RE.fullmatch(candidate) is None:
+        return _append_auto_retry_exhaustion(
+            registry, run=run, reason=reason, detail="exact candidate unavailable", builder=None,
+            job_id=None, feedback=str(reason_payload.get("detail") or ""),
+        )
+    jobs = [
+        job for job in registry.list_jobs()
+        if job.get("workflow_run_id") == run.run_id
+        and job.get("workflow_card") == (builds[-1].card if run.current_phase == "build" else card)
+        and job.get("workflow_phase") == "build"
+        and job.get("workflow_claim_key") in (None, run.claim_key)
+    ]
+    failed_job = jobs[-1] if jobs else None
+    builder = _auto_retry_builder_identity(run, registry, card)
+    if builder is None:
+        return _append_auto_retry_exhaustion(
+            registry, run=run, reason=reason, detail="builder identity unavailable", builder=None,
+            job_id=str(failed_job.get("job_id")) if failed_job else None,
+            feedback=_auto_retry_feedback(run, reason_payload, coordinator_root),
+        )
+    previous_uses = [
+        row.get("builder_retry_number", 0)
+        for row in run.auto_retry_history
+        if row.get("card") == card and row.get("builder_after") == builder
+    ]
+    used = max((value for value in previous_uses if isinstance(value, int)), default=0)
+    limit = run.auto_retry_limit
+    if limit == 0:
+        return _append_auto_retry_exhaustion(
+            registry, run=run, reason=reason,
+            detail="automatic retries are disabled for this workflow run",
+            builder=builder,
+            job_id=str(failed_job.get("job_id")) if failed_job else None,
+            feedback=_auto_retry_feedback(run, reason_payload, coordinator_root),
+        )
+    target = None
+    decision = "retry"
+    retry_number = used + 1
+    if limit > 0 and used < limit:
+        target = identities.get(builder["executor"], builder["model_id"])
+    else:
+        target = _auto_retry_next_builder(run, identities, builder)
+        decision = "switch-builder"
+        retry_number = 1
+    if target is None:
+        return _append_auto_retry_exhaustion(
+            registry, run=run, reason=reason,
+            detail="retry budget exhausted and no independent capable builder remains",
+            builder=builder,
+            job_id=str(failed_job.get("job_id")) if failed_job else None,
+            feedback=_auto_retry_feedback(run, reason_payload, coordinator_root),
+        )
+    target_pair = {"executor": target.executor, "model_id": target.model_id}
+    feedback = _auto_retry_feedback(run, reason_payload, coordinator_root)
+    record = {
+        "schema": automatic_retry.AUTO_RETRY_HISTORY_SCHEMA,
+        "run_id": run.run_id,
+        "attempt": len(run.auto_retry_history) + 1,
+        "card": card,
+        "phase": run.current_phase,
+        "candidate": candidate.lower(),
+        "reason": reason,
+        "decision": decision if target_pair != builder else "retry",
+        "builder_before": dict(builder),
+        "builder_after": target_pair,
+        "builder_retry_number": retry_number,
+        "limit": limit,
+        "job_id": str(failed_job.get("job_id")) if failed_job else None,
+        "feedback": feedback,
+        "created_at": _utcnow(),
+    }
+    override = None
+    if target_pair != builder:
+        override = {**dict(run.model_chain_override or {}), "builder": target_pair}
+    repair_action = (
+        "Repair the exact Candidate after a Manager-detected gate or review failure. "
+        "Use the attached gate output summary or reviewer findings, fix only those concrete "
+        "failures, then commit a tested descendant Candidate."
+    )
+    from . import work_actions
+
+    state_path = getattr(registry, "_state_path", None)
+    work_actions._record_retry_build_receipt(run=run, state_path=state_path)
+    reset = registry._manager_reset_workflow_for_retry_build(
+        run.run_id,
+        expected_candidate=candidate.lower(),
+        repair_action=repair_action,
+        retry_classification=work_actions._classify_retry(run, registry).value,
+        model_chain_override=override,
+        auto_retry_record=record,
+    )
+    try:
+        admission = (
+            builder_todo_admission_loader(reset)
+            if builder_todo_admission_loader is not None
+            else None
+        )
+        replacement = dispatch_workflow_card(
+            dispatcher,
+            run=reset,
+            identities=identities,
+            launcher_factory=launcher_factory,
+            coordinator_root=coordinator_root,
+            retry_failed=True,
+            force_new_card=True,
+            spawn_admission=spawn_admission,
+            builder_todo_admission=admission,
+            quota_admission_context=quota_admission_context,
+        )
+    except Exception as exc:
+        current = registry.get_workflow_run(run.run_id)
+        failure_record = {
+            **record,
+            "attempt": len(current.auto_retry_history) + 1,
+            "decision": "dispatch-failed",
+            "reason": "automatic-retry-dispatch-failed",
+            "feedback": summarize_exception(exc),
+            "created_at": _utcnow(),
+        }
+        failed = registry._manager_update_workflow_run(
+            run.run_id,
+            facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
+            gate_status="running",
+            auto_retry_history=(*current.auto_retry_history, failure_record),
+            needs_human_reason=diagnostic_reason(
+                "automatic-retry-dispatch-failed",
+                f"自動 retry-build 重派失敗：{summarize_exception(exc)}",
+                source="manager.resume_workflow_run:auto-retry-dispatch",
+                run_id=run.run_id,
+                work_id=run.work_id,
+                candidate=candidate,
+                recommended_action="retry-build",
+            ),
+        )
+        return {
+            "run_id": failed.run_id,
+            "current_phase": failed.current_phase,
+            "reason": "automatic-retry-dispatch-failed",
+            "automatic_retries": automatic_retry.automatic_retry_summary(failed),
+        }
+    if classify_dispatch_result(replacement, registry=registry, run_id=run.run_id)["kind"] == "decision":
+        return {**dict(replacement), "automatic_retries": automatic_retry.automatic_retry_summary(
+            registry.get_workflow_run(run.run_id)
+        )}
+    return {
+        "run_id": run.run_id,
+        "current_phase": "build",
+        "job_id": str(replacement["job_id"]),
+        "reason": "automatic-retry-build",
+        "automatic_retries": automatic_retry.automatic_retry_summary(
+            registry.get_workflow_run(run.run_id)
+        ),
+    }
+
+
 def resume_workflow_run(
     dispatcher,
     *,
@@ -17925,9 +18506,10 @@ def resume_workflow_run(
             quota_admission_context=quota_admission_context,
         )
     )
+    automatic_retry_eligible = auto_retry_is_eligible(run)
     if (
         "needs_human" in run.facets and run.status == "ongoing"
-        and not operator_resume and not quota_auto_retry
+        and not operator_resume and not quota_auto_retry and not automatic_retry_eligible
     ):
         return {
             "run_id": run.run_id,
@@ -17982,6 +18564,18 @@ def resume_workflow_run(
             gate_status="running",
         )
         retry_failed = True
+    elif automatic_retry_eligible and not operator_resume:
+        return _auto_retry_build_after_stop(
+            dispatcher,
+            registry=registry,
+            run=run,
+            identities=identities,
+            launcher_factory=launcher_factory,
+            coordinator_root=coordinator_root,
+            builder_todo_admission_loader=builder_todo_admission_loader,
+            spawn_admission=spawn_admission,
+            quota_admission_context=quota_admission_context,
+        )
     elif "needs_human" in run.facets and run.status == "ongoing":
         recovery_step = _current_workflow_step(run)
         if recovery_step is not None:
@@ -18535,6 +19129,25 @@ def resume_workflow_run(
             # diagnosis.  It must not be reclassified as a retryable provider
             # outage or fed back into provider routing.
             classification = None
+        if sandbox_ok and step.phase == "build":
+            environment_fallback = _auto_reroute_environment_failure(
+                dispatcher,
+                registry=registry,
+                run=run,
+                step=step,
+                job=job,
+                identities=identities,
+                launcher_factory=launcher_factory,
+                coordinator_root=coordinator_root,
+                builder_todo_admission_loader=builder_todo_admission_loader,
+                spawn_admission=spawn_admission,
+                quota_admission_context=quota_admission_context,
+            )
+            if environment_fallback is not None:
+                return {
+                    **environment_fallback,
+                    "terminal_diagnostics": diagnostics.as_dict(),
+                }
         status_fields: dict[str, object] = {}
         if classification is not None:
             status_fields["provider_outcome"] = classification.outcome.value
@@ -18549,8 +19162,8 @@ def resume_workflow_run(
             attempts = dict(run.attempts)
             seen = attempts.get(retry_key, 0)
             status_fields["provider_retry_count"] = seen
-            status_fields["provider_retry_limit"] = terminal_contract.MAX_PROVIDER_RETRIES
-            if seen < terminal_contract.MAX_PROVIDER_RETRIES:
+            status_fields["provider_retry_limit"] = run.auto_retry_limit
+            if seen < run.auto_retry_limit:
                 rerouted_target = _provider_failure_reroute(
                     run,
                     step,
@@ -18604,7 +19217,56 @@ def resume_workflow_run(
                     current = registry.get_workflow_run(run.run_id)
                     attempts = dict(current.attempts)
                     attempts[retry_key] = seen + 1
-                    registry._manager_update_workflow_run(run.run_id, attempts=attempts)
+                    history = list(current.auto_retry_history)
+                    if step.phase == "build":
+                        replacement_job = registry.get_job(str(replacement["job_id"]))
+                        before_pair = {
+                            "executor": str(job.get("executor") or "unknown"),
+                            "model_id": str(job.get("model_id") or "unknown"),
+                        }
+                        after_pair = {
+                            "executor": str(replacement_job.get("executor") or "unknown"),
+                            "model_id": str(replacement_job.get("model_id") or "unknown"),
+                        }
+                        previous_retry_numbers = [
+                            row.get("builder_retry_number", 0)
+                            for row in history
+                            if row.get("card") == step.card
+                            and row.get("builder_after") == before_pair
+                        ]
+                        retry_number = (
+                            max(
+                                (number for number in previous_retry_numbers if isinstance(number, int)),
+                                default=0,
+                            )
+                            + 1
+                            if before_pair == after_pair
+                            else 1
+                        )
+                        history.append(
+                            {
+                                "schema": automatic_retry.AUTO_RETRY_HISTORY_SCHEMA,
+                                "run_id": run.run_id,
+                                "attempt": len(history) + 1,
+                                "card": step.card,
+                                "phase": step.phase,
+                                "candidate": run.candidate_head,
+                                "reason": classification.reason[:RETRY_CONTEXT_EVIDENCE_LIMIT],
+                                "decision": "retry" if before_pair == after_pair else "switch-builder",
+                                "builder_before": before_pair,
+                                "builder_after": after_pair,
+                                "builder_retry_number": retry_number,
+                                "limit": run.auto_retry_limit,
+                                "job_id": str(job.get("job_id") or "") or None,
+                                "feedback": classification.reason[:RETRY_CONTEXT_EVIDENCE_LIMIT],
+                                "created_at": _utcnow(),
+                            }
+                        )
+                    registry._manager_update_workflow_run(
+                        run.run_id,
+                        attempts=attempts,
+                        auto_retry_history=tuple(history) if step.phase == "build" else None,
+                    )
                     return {
                         "run_id": run.run_id,
                         "current_phase": run.current_phase,
@@ -18876,21 +19538,73 @@ def resume_workflow_run(
             require_candidate_unchanged=True,
         )
         current = registry.get_workflow_run(run.run_id)
+        gate_contradiction = (
+            isinstance(exc, terminal_contract.GateContradictionError)
+            and step.phase == "build"
+            and bool([item for item in current.steps if item.phase == "build"])
+            and step.card == [item for item in current.steps if item.phase == "build"][-1].card
+        )
+        candidate_error = None
+        if gate_contradiction:
+            try:
+                terminal_payload, _ = _extract_terminal_payload(job.get("log_path"))
+                exact_candidate = _verify_build_candidate_transition(
+                    job,
+                    previous_candidate=current.candidate_head,
+                    candidate_override=terminal_payload.get("candidate"),
+                    git_runner=getattr(dispatcher, "_git_runner", None),
+                )
+            except Exception as candidate_exc:  # noqa: BLE001 - gate retry requires an exact commit anchor
+                gate_contradiction = False
+                candidate_error = summarize_exception(candidate_exc)
+            else:
+                current = registry._manager_update_workflow_run(
+                    run.run_id,
+                    candidate_head=exact_candidate,
+                )
+        reason_code = "gate-contradiction" if gate_contradiction else "terminalize-workflow-job-failed"
+        if candidate_error is not None:
+            reason_code = "gate-contradiction-candidate-unverified"
         registry._manager_update_workflow_run(
             run.run_id,
             facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
             gate_status="running",
             needs_human_reason=diagnostic_reason(
-                "terminalize-workflow-job-failed",
+                reason_code,
                 f"採信 terminal envelope 時擲出例外：{summarize_exception(exc)}",
                 source="manager._poll_workflow_job:terminalize",
                 run_id=run.run_id,
                 work_id=run.work_id,
                 job_id=str(job["job_id"]),
                 card=step.card,
+                error_class=type(exc).__name__,
+                candidate=current.candidate_head or "none",
+                failure_summary=str(exc)[:180],
+                candidate_error=candidate_error or "",
                 **review_terminal_context,
             ),
         )
+        if gate_contradiction:
+            stopped = registry.get_workflow_run(run.run_id)
+            return _auto_retry_build_after_stop(
+                dispatcher,
+                registry=registry,
+                run=stopped,
+                identities=identities,
+                launcher_factory=launcher_factory,
+                coordinator_root=coordinator_root,
+                builder_todo_admission_loader=builder_todo_admission_loader,
+                spawn_admission=spawn_admission,
+                quota_admission_context=quota_admission_context,
+            )
+        if reason_code == "gate-contradiction-candidate-unverified":
+            stopped = registry.get_workflow_run(run.run_id)
+            return {
+                "run_id": stopped.run_id,
+                "current_phase": stopped.current_phase,
+                "job_id": str(job["job_id"]),
+                "reason": reason_code,
+            }
         raise
     if step.card == RED_DECOMPOSITION_CARD:
         plan_text = _red_decomposition_plan_from_job(job)
@@ -19139,6 +19853,18 @@ def resume_workflow_run(
         if isinstance(adopted_receipt, dict):
             result["stage_reuse"] = {"card": step.card, **adopted_receipt}
     if "needs_human" in updated.facets:
+        if auto_retry_is_eligible(updated):
+            return _auto_retry_build_after_stop(
+                dispatcher,
+                registry=registry,
+                run=updated,
+                identities=identities,
+                launcher_factory=launcher_factory,
+                coordinator_root=coordinator_root,
+                builder_todo_admission_loader=builder_todo_admission_loader,
+                spawn_admission=spawn_admission,
+                quota_admission_context=quota_admission_context,
+            )
         return result
     next_job = dispatch_or_stop(updated)
     classified = classify_dispatch_result(

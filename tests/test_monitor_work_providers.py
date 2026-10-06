@@ -1516,6 +1516,25 @@ def test_schema_retry_counts_surface_without_degrading_projection(tmp_path):
                             "schema-mismatch:tdd-red": 2,
                             "schema-mismatch:impl": 1,
                         },
+                        "auto_retry_limit": 2,
+                        "auto_retry_history": [
+                            {
+                                "schema": "cortex-workflow-auto-retry/v1",
+                                "attempt": 1,
+                                "card": "impl",
+                                "phase": "build",
+                                "candidate": "a" * 40,
+                                "reason": "blocking-findings",
+                                "decision": "switch-builder",
+                                "builder_before": {"executor": "codex", "model_id": "gpt"},
+                                "builder_after": {"executor": "claude", "model_id": "opus"},
+                                "builder_retry_number": 1,
+                                "limit": 2,
+                                "job_id": "job-1",
+                                "feedback": "fix the blocker",
+                                "created_at": "2026-10-06T00:00:00Z",
+                            }
+                        ],
                     },
                     {
                         "run_id": "run-2",
@@ -1540,6 +1559,11 @@ def test_schema_retry_counts_surface_without_degrading_projection(tmp_path):
     # 只有 schema-mismatch:* 會被萃取出來，一般的 phase attempts 不混入。
     assert result.observations["schema_retry"] == {
         "work": {"tdd-red": 2, "impl": 1}
+    }
+    assert result.observations["automatic_retries"]["work"]["count"] == 1
+    assert result.observations["automatic_retries"]["work"]["builder_switches"][0]["to"] == {
+        "executor": "claude",
+        "model_id": "opus",
     }
 
 

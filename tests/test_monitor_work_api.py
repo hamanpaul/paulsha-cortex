@@ -672,6 +672,15 @@ def test_schema_retry_and_candidate_git_base_are_scoped_to_exact_repo():
         observations={
             "schema_retry": {shared_work_id: {"code-review": 2}},
             "candidate_git_bases": {shared_work_id: {"sha": "b" * 40}},
+            "automatic_retries": {
+                shared_work_id: {
+                    "count": 1,
+                    "limit_per_builder": 2,
+                    "remaining_for_current_builder": 1,
+                    "builder_switches": [],
+                    "attempts": [{"decision": "retry"}],
+                }
+            },
         },
     )
     acme_empty = ProviderSnapshot(
@@ -702,3 +711,5 @@ def test_schema_retry_and_candidate_git_base_are_scoped_to_exact_repo():
     assert "candidate_git_base" not in acme_envelope
     assert other_envelope["schema_retry"]["by_card"] == {"code-review": 2}
     assert other_envelope["candidate_git_base"] == {"sha": "b" * 40}
+    assert "automatic_retries" not in acme_envelope
+    assert other_envelope["automatic_retries"]["count"] == 1

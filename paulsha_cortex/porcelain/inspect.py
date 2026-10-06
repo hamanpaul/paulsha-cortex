@@ -272,7 +272,12 @@ def _print_ready(ready_rows: list[dict[str, Any]]) -> None:
         )
 
 
-def _print_work(item: dict[str, Any], *, schema_retry: dict[str, Any] | None = None) -> None:
+def _print_work(
+    item: dict[str, Any],
+    *,
+    schema_retry: dict[str, Any] | None = None,
+    automatic_retries: dict[str, Any] | None = None,
+) -> None:
     sys.stdout.write(f"repo: {item.get('repo')}\n")
     sys.stdout.write(f"work_id: {item.get('work_id')}\n")
     sys.stdout.write(f"title: {item.get('title')}\n")
@@ -288,6 +293,18 @@ def _print_work(item: dict[str, Any], *, schema_retry: dict[str, Any] | None = N
         for card, count in sorted(schema_retry.get("by_card", {}).items()):
             exhausted = " (exhausted)" if isinstance(limit, int) and count >= limit else ""
             sys.stdout.write(f"schema_retry[{card}]: {count}/{limit}{exhausted}\n")
+    if automatic_retries:
+        attempts = automatic_retries.get("count", 0)
+        limit = automatic_retries.get("limit_per_builder", 0)
+        remaining = automatic_retries.get("remaining_for_current_builder", 0)
+        sys.stdout.write(f"automatic_retries: {attempts} (limit {limit}, remaining {remaining})\n")
+        for row in automatic_retries.get("builder_switches", []):
+            if isinstance(row, dict):
+                sys.stdout.write(
+                    "automatic_builder_switch: "
+                    f"{row.get('card')} {row.get('from')} -> {row.get('to')} "
+                    f"reason={row.get('reason')}\n"
+                )
 
 
 def _print_doctor(report: dict[str, Any]) -> None:
@@ -350,7 +367,9 @@ def _monitor_socket_path() -> str:
         return str(default_socket_path())
 
 
-def _load_work_item(work_id: str, *, repo: str | None) -> tuple[dict[str, Any], dict[str, Any]]:
+def _load_work_item(
+    work_id: str, *, repo: str | None
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     request = {"kind": "get_work_item", "work_id": work_id}
     if repo is not None:
         request["repo"] = repo
@@ -366,18 +385,25 @@ def _load_work_item(work_id: str, *, repo: str | None) -> tuple[dict[str, Any], 
     # #261：schema retry 摘要與 item 平行放在 envelope 上（非 item 欄位），
     # 沿用 Monitor 既有的 work item 讀模型，不需要新增 WorkItem 欄位。
     schema_retry = data.get("schema_retry")
-    return item, schema_retry if isinstance(schema_retry, dict) else {}
+    automatic_retries = data.get("automatic_retries")
+    return (
+        item,
+        schema_retry if isinstance(schema_retry, dict) else {},
+        automatic_retries if isinstance(automatic_retries, dict) else {},
+    )
 
 
 def _run_work(work_id: str, *, repo: str | None, json_output: bool) -> int:
-    item, schema_retry = _load_work_item(work_id, repo=repo)
+    item, schema_retry, automatic_retries = _load_work_item(work_id, repo=repo)
     if json_output:
         payload: dict[str, Any] = {"item": item}
         if schema_retry:
             payload["schema_retry"] = schema_retry
+        if automatic_retries:
+            payload["automatic_retries"] = automatic_retries
         _json_dump(_inspect_envelope("work", **payload))
         return 0
-    _print_work(item, schema_retry=schema_retry)
+    _print_work(item, schema_retry=schema_retry, automatic_retries=automatic_retries)
     return 0
 
 

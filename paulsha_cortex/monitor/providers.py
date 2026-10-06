@@ -18,6 +18,7 @@ import yaml
 
 from paulsha_cortex.config import paths
 from paulsha_cortex.coordinator import candidate_base
+from paulsha_cortex.coordinator import automatic_retry
 from paulsha_cortex.coordinator import quota_admission as quota_admission_module
 from paulsha_cortex.coordinator.diagnostics import diagnostic_reason
 from paulsha_cortex.github_rate_limit import is_auth_signal, is_rate_limit_signal
@@ -524,6 +525,7 @@ class WorkflowRegistryProvider:
             sources: list[WorkSource] = []
             links: dict[str, str] = {}
             schema_retry: dict[str, dict[str, int]] = {}
+            automatic_retries: dict[str, dict[str, object]] = {}
             needs_human_reasons: dict[str, dict[str, object]] = {}
             candidate_git_bases: dict[str, dict[str, object]] = {}
             quota_decisions: dict[str, dict[str, object]] = {}
@@ -565,6 +567,9 @@ class WorkflowRegistryProvider:
                 retry_rows = _schema_retry_rows(row.get("attempts"))
                 if retry_rows:
                     schema_retry.setdefault(work_id, {}).update(retry_rows)
+                retry_summary = automatic_retry.automatic_retry_summary(row)
+                if retry_summary["attempts"]:
+                    automatic_retries[work_id] = retry_summary
                 # 診斷 invariant（#527）：run 掛著 needs_human 時，把它的結構化
                 # 理由帶進 observations，`cortex work show` 才有得印。手法比照
                 # 上面的 `schema_retry`——資料走既有的 observations 通道隨
@@ -686,6 +691,7 @@ class WorkflowRegistryProvider:
             "workflow_links": links,
             "validated_completions": validated_completions,
             "schema_retry": schema_retry,
+            "automatic_retries": automatic_retries,
             "needs_human_reasons": needs_human_reasons,
             "candidate_git_bases": candidate_git_bases,
             "quota_decisions": quota_decisions,
@@ -963,6 +969,8 @@ _WORKFLOW_V2_OPTIONAL_ROW_KEYS = frozenset(
         # 判成「含不支援的欄位」，整份 workflow projection 因此 degraded——那正是
         # #261 D5 選擇把 schema retry 計數塞進既有 `attempts` 而不新增欄位的原因。
         "needs_human_reason",
+        # #1306: per-run automatic retry budget and manager-authored attempt history.
+        "auto_retry_limit", "auto_retry_history",
     }
 )
 

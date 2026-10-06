@@ -1532,6 +1532,7 @@ def build_periodic_tick_runner(
                         and not manager.quota_wait_retry_is_eligible(
                             run=workflow, quota_admission_context=quota_admission_ctx,
                         )
+                        and not manager.auto_retry_is_eligible(workflow)
                     )
                 ):
                     continue
