@@ -460,6 +460,7 @@ class WorkActionFlagTests(unittest.TestCase):
             with self.subTest(action=action):
                 submitted: list[tuple[str, dict[str, object], str]] = []
                 captured: dict[str, object] = {}
+                stdout = io.StringIO()
 
                 class FakeRun:
                     def __init__(self, model_chain_override: dict[str, dict[str, str]] | None):
@@ -510,22 +511,23 @@ class WorkActionFlagTests(unittest.TestCase):
                             fake_start_canonical_workflow,
                         ),
                     ):
-                        rc = cli.main(
-                            [
-                                "work",
-                                action,
-                                "demo",
-                                "--repo",
-                                "acme/demo",
-                                "--builder-executor",
-                                "codex",
-                                "--builder-model",
-                                "gpt-6-luna",
-                            ],
-                            control_read_status=lambda: {"degraded": False},
-                            control_submit_request=submit,
-                            control_poll_done=poll_done,
-                        )
+                        with redirect_stdout(stdout):
+                            rc = cli.main(
+                                [
+                                    "work",
+                                    action,
+                                    "demo",
+                                    "--repo",
+                                    "acme/demo",
+                                    "--builder-executor",
+                                    "codex",
+                                    "--builder-model",
+                                    "gpt-6-luna",
+                                ],
+                                control_read_status=lambda: {"degraded": False},
+                                control_submit_request=submit,
+                                control_poll_done=poll_done,
+                            )
 
                 self.assertEqual(rc, 0)
                 self.assertEqual(submitted[0][1]["builder_executor"], "codex")
@@ -533,6 +535,115 @@ class WorkActionFlagTests(unittest.TestCase):
                 self.assertEqual(
                     captured["start_kwargs"]["model_chain_override"], expected_override
                 )
+                self.assertEqual(
+                    json.loads(stdout.getvalue()),
+                    {"action": action, "run": {"model_chain_override": expected_override}},
+                )
+
+    def test_work_start_rejects_partial_model_chain_override(self) -> None:
+        submitted = []
+        error = io.StringIO()
+
+        with redirect_stderr(error):
+            rc = cli.main(
+                [
+                    "work",
+                    "start",
+                    "demo",
+                    "--repo",
+                    "acme/demo",
+                    "--builder-executor",
+                    "codex",
+                ],
+                control_read_status=lambda: {"degraded": False},
+                control_submit_request=lambda kind, args, actor: submitted.append(args)
+                or "request-1",
+                control_poll_done=lambda *_args, **_kwargs: {
+                    "status": "ok",
+                    "result": {"action": "start"},
+                },
+            )
+
+        self.assertEqual(rc, 2)
+        self.assertEqual(submitted, [])
+        self.assertIn("requires both executor and model", error.getvalue())
+
+    def test_work_resume_rejects_model_chain_override_flags(self) -> None:
+        submitted = []
+        error = io.StringIO()
+
+        with redirect_stderr(error):
+            rc = cli.main(
+                [
+                    "work",
+                    "resume",
+                    "demo",
+                    "--repo",
+                    "acme/demo",
+                    "--builder-executor",
+                    "codex",
+                    "--builder-model",
+                    "gpt-6-luna",
+                ],
+                control_read_status=lambda: {"degraded": False},
+                control_submit_request=lambda kind, args, actor: submitted.append(args)
+                or "request-2",
+                control_poll_done=lambda *_args, **_kwargs: {
+                    "status": "ok",
+                    "result": {"action": "resume"},
+                },
+            )
+
+        self.assertEqual(rc, 2)
+        self.assertEqual(submitted, [])
+        self.assertIn(
+            "只支援 work start／intake／rechain／supersede-attempt",
+            error.getvalue(),
+        )
+
+    def test_work_start_rejects_conflicting_model_chain_payload(self) -> None:
+        submitted = []
+        error = io.StringIO()
+
+        with tempfile.TemporaryDirectory() as root:
+            payload = Path(root) / "payload.json"
+            payload.write_text(
+                json.dumps(
+                    {
+                        "builder_executor": "claude",
+                        "builder_model": "sonnet",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with redirect_stderr(error):
+                rc = cli.main(
+                    [
+                        "work",
+                        "start",
+                        "demo",
+                        "--repo",
+                        "acme/demo",
+                        "--builder-executor",
+                        "codex",
+                        "--builder-model",
+                        "gpt-6-luna",
+                        "--payload",
+                        str(payload),
+                    ],
+                    control_read_status=lambda: {"degraded": False},
+                    control_submit_request=lambda kind, args, actor: submitted.append(args)
+                    or "request-3",
+                    control_poll_done=lambda *_args, **_kwargs: {
+                        "status": "ok",
+                        "result": {"action": "start"},
+                    },
+                )
+
+        self.assertEqual(rc, 2)
+        self.assertEqual(submitted, [])
+        self.assertIn("builder_executor", error.getvalue())
+        self.assertIn("不一致", error.getvalue())
 
     def test_work_resume_drops_combo(self) -> None:
         """--combo 標註為 start 專用；resume 帶 --combo 時 CLI 不得轉送，

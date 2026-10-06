@@ -21,10 +21,10 @@ work_item: intake-model-flags
 - [x] **T1 RED**：測試 `cortex work intake ... --builder-executor codex --builder-model gpt-6-luna` 送出的 request
       args 含 `builder_executor`／`builder_model`，建立的 run `model_chain_override` 為指定值；`start` 同理。
       現行應失敗。
-- [ ] **T2 intake／start 套用旗標**：CLI 把這些旗標轉成 request args，與 `--payload` 走同一條
+- [x] **T2 intake／start 套用旗標**：CLI 把這些旗標轉成 request args，與 `--payload` 走同一條
       `extract_model_chain_override` 路徑；旗標與 payload 同時給、但值不同時拒絕。只給 executor 或只給 model
       時明確報錯。
-- [ ] **T3 不支援的 action 明確拒絕**：其他 action 帶上這些旗標時，以非 0 結束，並說明哪些 action 支援。
-- [ ] **T4 intake 輸出解析結果**：intake 成功後，輸出解析後的 planner／builder／reviewer（executor 與 model），
+- [x] **T3 不支援的 action 明確拒絕**：其他 action 帶上這些旗標時，以非 0 結束，並說明哪些 action 支援。
+- [x] **T4 intake 輸出解析結果**：intake 成功後，輸出解析後的 planner／builder／reviewer（executor 與 model），
       方便 operator 立即核對。
-- [ ] **T5 文件**：CLI help 與 operator 文件更新。新增 changelog fragment，並同步 `CHANGELOG.md [Unreleased]`。
+- [x] **T5 文件**：CLI help 與 operator 文件更新。新增 changelog fragment，並同步 `CHANGELOG.md [Unreleased]`。

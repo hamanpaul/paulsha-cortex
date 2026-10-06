@@ -17,6 +17,7 @@ from .launcher import _ARGV_BUILDERS, AgentLauncher, SubprocessLauncher
 from .registry import JobRegistry
 from .seams import PaneSender, ScriptWorktreeCreator, TmuxPaneSender, WorktreeCreator
 from .usage_aggregate import aggregate_usage_by_run
+from . import work_bridge
 from .workflow import WorkflowRun
 
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 5.0
@@ -31,6 +32,14 @@ _REQUEST_TIMEOUTS: dict[str, float] = {
     "complete": 30.0,
     "work-action": 30.0,
 }
+_WORK_MODEL_CHAIN_ACTIONS = ("start", "intake", "rechain", "supersede-attempt")
+_WORK_MODEL_CHAIN_FIELDS = tuple(
+    f"{persona}_{suffix}"
+    for persona in ("planner", "builder", "reviewer")
+    for suffix in ("executor", "model")
+)
+_WORK_MODEL_CHAIN_FLAG_LABEL = "／".join(f"--{field}" for field in _WORK_MODEL_CHAIN_FIELDS)
+_WORK_MODEL_CHAIN_ACTION_LABEL = "／".join(_WORK_MODEL_CHAIN_ACTIONS)
 
 
 def _resolve_launcher(
@@ -63,6 +72,34 @@ def _resolve_launcher(
         model=model,
         executable=executable,
     )
+
+
+def _work_action_model_chain_args(
+    args: argparse.Namespace,
+    *,
+    payload: dict[str, object] | None = None,
+) -> dict[str, object] | None:
+    model_chain_args: dict[str, object] = {}
+    for field in _WORK_MODEL_CHAIN_FIELDS:
+        value = getattr(args, field, None)
+        if value is not None:
+            model_chain_args[field] = value
+    if payload is not None:
+        for field in _WORK_MODEL_CHAIN_FIELDS:
+            if field not in payload:
+                continue
+            value = payload[field]
+            existing = model_chain_args.get(field)
+            if existing is not None and existing != value:
+                raise ValueError(f"work payload 與 CLI 的 {field} 不一致")
+            model_chain_args[field] = value
+    if not model_chain_args:
+        return None
+    if args.action not in _WORK_MODEL_CHAIN_ACTIONS:
+        raise ValueError(
+            f"錯誤: {_WORK_MODEL_CHAIN_FLAG_LABEL} 只支援 work {_WORK_MODEL_CHAIN_ACTION_LABEL}。"
+        )
+    return model_chain_args
 
 
 def _refuse_unsafe_fanout(metas, predicate, *, allow_unsafe, max_ready=1):
@@ -273,8 +310,20 @@ def _build_parser() -> argparse.ArgumentParser:
     p_work.add_argument("--expected-era", help="rechain 專用：exact claim:v1 era CAS")
     p_work.add_argument("--expected-job-id", help="supersede-attempt 專用：被取代 attempt 的 exact job CAS")
     for persona in ("planner", "builder", "reviewer"):
-        p_work.add_argument(f"--{persona}-executor", help=f"rechain 專用：{persona} identity executor")
-        p_work.add_argument(f"--{persona}-model", help=f"rechain 專用：{persona} identity model ID")
+        p_work.add_argument(
+            f"--{persona}-executor",
+            help=(
+                "start/intake/rechain/supersede-attempt 專用："
+                f"{persona} identity executor"
+            ),
+        )
+        p_work.add_argument(
+            f"--{persona}-model",
+            help=(
+                "start/intake/rechain/supersede-attempt 專用："
+                f"{persona} identity model ID"
+            ),
+        )
     p_work.add_argument(
         "--card",
         help="retry-card／regenerate-gates 專用：card id；retry-card 須是下一張待派的卡",
@@ -474,6 +523,7 @@ def main(
         )
 
     if args.cmd == "work":
+        model_chain_request_args: dict[str, object] | None = None
         if args.action == "verify-attest" and (
             args.actor is None or args.expected_candidate is None or args.payload is None
         ):
@@ -537,6 +587,7 @@ def main(
             request_args["combo"] = args.combo
         if args.enable or args.disable:
             request_args["enabled"] = bool(args.enable)
+        payload_args: dict[str, object] | None = None
         if args.payload:
             try:
                 extra = json.loads(Path(args.payload).read_text(encoding="utf-8"))
@@ -564,7 +615,21 @@ def main(
                     )
                     return 2
                 del extra["expected_candidate"]
-            request_args.update(extra)
+            payload_args = extra
+        try:
+            model_chain_request_args = _work_action_model_chain_args(
+                args,
+                payload=payload_args,
+            )
+            if model_chain_request_args is not None:
+                work_bridge.extract_model_chain_override(model_chain_request_args)
+        except ValueError as exc:
+            print(f"錯誤: {exc}", file=sys.stderr)
+            return 2
+        if model_chain_request_args is not None:
+            request_args.update(model_chain_request_args)
+        if payload_args is not None:
+            request_args.update(payload_args)
         if args.action == "retry-build" and "expected_run_id" in request_args:
             print(
                 "錯誤: retry-build 不接受 expected_run_id；請改用 --payload 的 expected_candidate CAS。",

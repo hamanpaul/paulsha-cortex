@@ -1,0 +1,2 @@
+- **#1296 work 進件模型鏈旗標**：`cortex run work start/intake/rechain/supersede-attempt` 現在會把 `--planner-executor`／`--planner-model`／`--builder-executor`／`--builder-model`／`--reviewer-executor`／`--reviewer-model` 送入同一條 `extract_model_chain_override` 路徑；與 `--payload` 衝突時會明確拒絕，未成對指定時也會報錯，其他 work action 帶這些旗標則不受理。README 與 `CHANGELOG.md` 的 `[Unreleased]` 也同步更新。
+- **CLI help**：`work` 子命令的 model-chain 旗標說明也已更新為 `start/intake/rechain/supersede-attempt` 專用。
