@@ -206,6 +206,14 @@ def main(argv: Sequence[str]) -> int:
     args = parser.parse_args(list(argv))
     request_type, build_args = RUN_REQUESTS[args.command]
     action = args.command if args.command != "work" else f"work {args.action}"
+    status = control_client.read_status()
+    if isinstance(status, dict) and status.get("degraded"):
+        reason = status.get("degraded_reason") or "unknown"
+        print(
+            f"錯誤: manager daemon 未就緒（{reason}）；無法處理 {action}，請先啟動 daemon。",
+            file=sys.stderr,
+        )
+        return 1
     try:
         request_id = control_client.submit_request(
             request_type,

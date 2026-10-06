@@ -7,7 +7,9 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -660,7 +662,115 @@ def test_run_loop_publishes_ship_activity_while_request_is_running(monkeypatch, 
     assert observed[0]["activity"]["request_id"] == request_id
     assert observed[0]["activity"]["action"] == "ship"
     assert observed[0]["activity"]["repo"] == "acme/demo"
+    assert observed[0]["activity"]["started_at"] == "2026-09-26T00:00:00+00:00"
     assert not constants.activity_path().exists()
+
+
+def test_long_request_background_execution_preserves_status_and_serializes_requests(monkeypatch, tmp_path):
+    from paulsha_cortex.control import client
+
+    control_root = tmp_path / "control"
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(control_root))
+    monkeypatch.setattr(client.os, "kill", lambda pid, sig: None)
+
+    gate_started = threading.Event()
+    gate_proceed = threading.Event()
+    second_processed = threading.Event()
+    calls = []
+
+    def fake_work_action(args, requested_by):
+        action = args.get("action")
+        calls.append(action)
+        if action == "regenerate-gates":
+            gate_started.set()
+            assert gate_proceed.wait(timeout=5)
+            return {"action": "regenerate-gates", "regenerated": True}
+        if action == "resume":
+            second_processed.set()
+            return {"action": "resume", "resumed": True}
+        return {"action": action}
+
+    dispatcher = SimpleNamespace(_registry=FakeRegistry())
+    executor = manager_daemon.build_request_executor(
+        dispatcher=dispatcher,
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(tmp_path / "handoff"),
+        scan_specs_fn=lambda _: [],
+        work_action_fn=fake_work_action,
+    )
+
+    contract.atomic_write_json(
+        constants.status_path(),
+        {
+            "schema_version": constants.SCHEMA_VERSION,
+            "updated_at": "2000-01-01T00:00:00+00:00",
+            "daemon": {"pid": 4321},
+            "ready": [],
+            "held": [],
+            "in_flight": [],
+            "recent_done": [],
+        },
+    )
+
+    req1_id = "req-1-regenerate"
+    _write_request(
+        req1_id,
+        type="work-action",
+        args={
+            "action": "regenerate-gates",
+            "repo": "acme/demo",
+            "work_id": "demo",
+            "expected_run_id": "workflow-0123456789abcdef0123",
+        },
+    )
+    req2_id = "req-2-resume"
+    _write_request(
+        req2_id,
+        type="work-action",
+        args={"action": "resume", "repo": "acme/demo", "work_id": "demo"},
+    )
+
+    def sleep_fn(_interval):
+        time.sleep(0.01)
+
+    runner = threading.Thread(
+        target=manager_daemon.run_loop,
+        kwargs={
+            "request_executor": executor,
+            "status_provider": lambda: {"ready": [], "in_flight": [], "recent_done": []},
+            "periodic_tick_runner": lambda: {"dispatch_skipped": False},
+            "poll_interval": 0.01,
+            "tick_interval": 300.0,
+            "now_fn": lambda: datetime.now(timezone.utc).isoformat(),
+            "monotonic_fn": time.monotonic,
+            "sleep_fn": sleep_fn,
+            "pid": 4321,
+            "max_rounds": 50,
+        },
+        daemon=True,
+    )
+    runner.start()
+
+    assert gate_started.wait(timeout=5)
+    status = client.read_status()
+    assert status["degraded"] is False
+    assert status["busy"] is True
+    assert status["activity"]["action"] == "regenerate-gates"
+    assert "started_at" in status["activity"]
+
+    assert second_processed.is_set() is False
+    assert calls == ["regenerate-gates"]
+
+    gate_proceed.set()
+
+    assert second_processed.wait(timeout=5)
+    runner.join(timeout=5)
+
+    assert calls == ["regenerate-gates", "resume"]
+    done1 = contract.read_json(constants.done_dir() / f"{req1_id}.json")
+    done2 = contract.read_json(constants.done_dir() / f"{req2_id}.json")
+    assert done1 is not None and done1["status"] == "ok"
+    assert done2 is not None and done2["status"] == "ok"
 
 
 def test_run_loop_idle_poll_backoff_is_bounded_at_ten_seconds(monkeypatch, tmp_path):

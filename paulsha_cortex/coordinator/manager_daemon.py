@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import fcntl
 import hashlib
 import inspect
@@ -10,6 +11,7 @@ import os
 import re
 import signal
 import sys
+import threading
 import traceback
 import tempfile
 import time
@@ -72,6 +74,20 @@ TICK_CIRCUIT_BREAKER_COOLDOWN_SECONDS = 3600.0  # cool-down before one retry
 LOG_ERROR_SUMMARY_INTERVAL = 50  # suppressed-repeat summary cadence for _log_error
 _MULTI_SEGMENT_PATH_PATTERN = re.compile(r"\S*/\S*/\S+")
 TICK_ERROR_REASON_MAX_LENGTH = 200  # bounds status.json against a runaway message
+
+
+@dataclass
+class _DeferredRequest:
+    future: concurrent.futures.Future[dict[str, Any]]
+
+
+@dataclass
+class _PendingRequest:
+    request_id: str
+    request_path: Path
+    started_at: str
+    activity: dict[str, Any]
+    future: concurrent.futures.Future[dict[str, Any]]
 
 
 @dataclass
@@ -844,7 +860,7 @@ def build_request_executor(
     work_action_fn: Callable[..., dict[str, Any]] | None = None,
     stage_evidence_validator: Callable[[dict[str, str]], bool] | None = None,
     spawn_admission: SpawnAdmissionLimiter | None = None,
-) -> Callable[[dict[str, Any]], dict[str, Any]]:
+) -> Callable[[dict[str, Any]], dict[str, Any] | _DeferredRequest]:
     def decomposition_intake_for(repo: str, registry):
         def intake(child_work_id: str):
             args = {
@@ -867,7 +883,24 @@ def build_request_executor(
 
         return intake
 
-    def execute(request: dict[str, Any]) -> dict[str, Any]:
+    def _submit_background_request(request: dict[str, Any]) -> concurrent.futures.Future[dict[str, Any]]:
+        future: concurrent.futures.Future[dict[str, Any]] = concurrent.futures.Future()
+
+        def _run() -> None:
+            try:
+                future.set_result(execute_now(request))
+            except BaseException as exc:  # noqa: BLE001 - worker 結果要回寫給主迴圈
+                future.set_exception(exc)
+
+        worker = threading.Thread(
+            target=_run,
+            name="manager-request",
+            daemon=True,
+        )
+        worker.start()
+        return future
+
+    def execute_now(request: dict[str, Any]) -> dict[str, Any]:
         args = request.get("args", {})
         request_specs_dir = args.get("specs_dir") or specs_dir
         request_handoff_dir = args.get("handoff_dir") or handoff_dir
@@ -1390,6 +1423,12 @@ def build_request_executor(
             result.setdefault("dispatch_skipped_by_backoff", [])
         return result
 
+    def execute(request: dict[str, Any]) -> dict[str, Any] | _DeferredRequest:
+        if _request_is_backgroundable(request):
+            future = _submit_background_request(request)
+            return _DeferredRequest(future=future)
+        return execute_now(request)
+
     return execute
 
 
@@ -1887,7 +1926,64 @@ def run_loop(
     # #716：最近一輪 periodic tick 中「resume 沒派 job、也沒轉 needs_human」的
     # workflow 與原因，寫進 status.json 供 inspect status／canary 診斷。
     last_workflow_waits: list[dict[str, Any]] = []
+    pending_request: _PendingRequest | None = None
     _reset_log_error_dedup_state()
+
+    def _drain_pending_request() -> bool:
+        nonlocal pending_request, daemon_idle
+        if pending_request is None:
+            return False
+        if not pending_request.future.done():
+            try:
+                contract.atomic_write_json(constants.activity_path(), pending_request.activity)
+            except Exception as exc:  # noqa: BLE001 - activity 心跳失敗不應中止主迴圈
+                _log_error(exc)
+            daemon_idle = False
+            return True
+
+        try:
+            summary = pending_request.future.result()
+            done_payload = contract.build_done(
+                req_id=pending_request.request_id,
+                status="ok",
+                result=summary,
+                started_at=pending_request.started_at,
+            )
+            skipped = isinstance(summary, dict) and summary.get("dispatch_skipped") == "not-idle"
+            daemon_idle = not skipped
+        except Exception as exc:  # noqa: BLE001
+            done_payload = contract.build_done(
+                req_id=pending_request.request_id,
+                status="error",
+                error=f"{type(exc).__name__}: {exc}",
+                started_at=pending_request.started_at,
+            )
+            daemon_idle = True
+            _log_error(exc)
+
+        activity_cleared = False
+        try:
+            constants.activity_path().unlink(missing_ok=True)
+            activity_cleared = True
+        except Exception as exc:  # noqa: BLE001 - 活動狀態清理失敗不改變 request 結果
+            _log_error(exc)
+
+        done_persisted = False
+        try:
+            _persist_done(done_payload)
+            done_persisted = True
+        except Exception as exc:  # noqa: BLE001
+            _log_error(exc)
+
+        if done_persisted and activity_cleared:
+            try:
+                pending_request.request_path.unlink(missing_ok=True)
+            except Exception as exc:  # noqa: BLE001
+                _log_error(exc)
+            pending_request = None
+        else:
+            daemon_idle = False
+        return pending_request is not None
 
     try:
         while max_rounds is None or rounds < max_rounds:
@@ -1896,89 +1992,111 @@ def run_loop(
             request_drain_interrupted = False
             snapshot: dict[str, Any] = {}
             request_paths = sorted(constants.requests_dir().glob("*.json"), key=_request_sort_key)
-            for request_path in request_paths:
-                if not request_path.exists():
-                    continue
-                request_id = request_path.stem
-                done_path = constants.done_dir() / f"{request_id}.json"
-                if done_path.exists():
+            pending_request_blocking = _drain_pending_request()
+            if pending_request_blocking:
+                request_drain_interrupted = True
+            else:
+                for request_path in request_paths:
+                    if not request_path.exists():
+                        continue
+                    request_id = request_path.stem
+                    done_path = constants.done_dir() / f"{request_id}.json"
+                    if done_path.exists():
+                        try:
+                            request_path.unlink(missing_ok=True)
+                        except Exception as exc:  # noqa: BLE001
+                            _log_error(exc)
+                            request_drain_interrupted = True
+                            break
+                        continue
+
+                    started_at = now_fn()
+                    activity_written = False
                     try:
+                        try:
+                            request = _load_request(request_path)
+                        except FileNotFoundError:
+                            continue
+                        args = request.get("args")
+                        if (
+                            request.get("type") == "work-action"
+                            and isinstance(args, dict)
+                            and args.get("action") in {"ship", "regenerate-gates"}
+                        ):
+                            activity = _request_activity(
+                                pid=runtime_pid,
+                                request=request,
+                                started_at=started_at,
+                            )
+                            try:
+                                contract.atomic_write_json(constants.activity_path(), activity)
+                                activity_written = True
+                            except Exception as exc:  # noqa: BLE001 - 活動狀態寫入失敗仍繼續執行 request
+                                _log_error(exc)
+                        summary = executor(request)
+                        if isinstance(summary, _DeferredRequest):
+                            if not activity_written:
+                                activity = _request_activity(
+                                    pid=runtime_pid,
+                                    request=request,
+                                    started_at=started_at,
+                                )
+                                try:
+                                    contract.atomic_write_json(constants.activity_path(), activity)
+                                except Exception as exc:  # noqa: BLE001
+                                    _log_error(exc)
+                            pending_request = _PendingRequest(
+                                request_id=request["req_id"],
+                                request_path=request_path,
+                                started_at=started_at,
+                                activity=activity,
+                                future=summary.future,
+                            )
+                            daemon_idle = False
+                            activity_written = False
+                            request_drain_interrupted = True
+                            break
+
+                        done_payload = contract.build_done(
+                            req_id=request["req_id"],
+                            status="ok",
+                            result=summary,
+                            started_at=started_at,
+                        )
+                        skipped = isinstance(summary, dict) and summary.get("dispatch_skipped") == "not-idle"
+                        daemon_idle = not skipped
+                        if request["type"] == "tick" and not skipped:
+                            last_tick_at = now_fn()
+                            last_tick_monotonic = monotonic_fn()
+                            tick_ran_this_round = True
+                            # A successful manual tick is the operator's rescue
+                            # channel for a tripped circuit breaker: clear the
+                            # periodic path's failure bookkeeping so it gets a
+                            # fresh normal-cadence attempt next round.
+                            consecutive_tick_failures = 0
+                            tick_circuit_open = False
+                            last_tick_error = None
+                    except Exception as exc:  # noqa: BLE001
+                        done_payload = contract.build_done(
+                            req_id=request_id,
+                            status="error",
+                            error=f"{type(exc).__name__}: {exc}",
+                            started_at=started_at,
+                        )
+                        _log_error(exc)
+                    finally:
+                        if activity_written:
+                            try:
+                                constants.activity_path().unlink(missing_ok=True)
+                            except Exception as exc:  # noqa: BLE001 - 活動狀態清理失敗不改變 request 結果
+                                _log_error(exc)
+                    try:
+                        _persist_done(done_payload)
                         request_path.unlink(missing_ok=True)
                     except Exception as exc:  # noqa: BLE001
                         _log_error(exc)
                         request_drain_interrupted = True
                         break
-                    continue
-
-                started_at = now_fn()
-                activity_written = False
-                try:
-                    try:
-                        request = _load_request(request_path)
-                    except FileNotFoundError:
-                        continue
-                    args = request.get("args")
-                    if (
-                        request.get("type") == "work-action"
-                        and isinstance(args, dict)
-                        and args.get("action") == "ship"
-                    ):
-                        activity = {
-                            "pid": runtime_pid,
-                            "request_id": request_id,
-                            "request_type": request.get("type"),
-                            "requested_by": request.get("requested_by"),
-                        }
-                        for key in ("action", "repo", "work_id", "pr_number"):
-                            value = args.get(key)
-                            if isinstance(value, (str, int)) and not isinstance(value, bool):
-                                activity[key] = value
-                        try:
-                            contract.atomic_write_json(constants.activity_path(), activity)
-                            activity_written = True
-                        except Exception as exc:  # noqa: BLE001 - 活動狀態寫入失敗仍繼續執行 request
-                            _log_error(exc)
-                    summary = executor(request)
-                    done_payload = contract.build_done(
-                        req_id=request["req_id"],
-                        status="ok",
-                        result=summary,
-                        started_at=started_at,
-                    )
-                    skipped = isinstance(summary, dict) and summary.get("dispatch_skipped") == "not-idle"
-                    daemon_idle = not skipped
-                    if request["type"] == "tick" and not skipped:
-                        last_tick_at = now_fn()
-                        last_tick_monotonic = monotonic_fn()
-                        tick_ran_this_round = True
-                        # A successful manual tick is the operator's rescue
-                        # channel for a tripped circuit breaker: clear the
-                        # periodic path's failure bookkeeping so it gets a
-                        # fresh normal-cadence attempt next round.
-                        consecutive_tick_failures = 0
-                        tick_circuit_open = False
-                        last_tick_error = None
-                except Exception as exc:  # noqa: BLE001
-                    done_payload = contract.build_done(
-                        req_id=request_id,
-                        status="error",
-                        error=f"{type(exc).__name__}: {exc}",
-                        started_at=started_at,
-                    )
-                    _log_error(exc)
-                finally:
-                    if activity_written:
-                        try:
-                            constants.activity_path().unlink(missing_ok=True)
-                        except Exception as exc:  # noqa: BLE001 - 活動狀態清理失敗不改變 request 結果
-                            _log_error(exc)
-                try:
-                    _persist_done(done_payload)
-                    request_path.unlink(missing_ok=True)
-                except Exception as exc:  # noqa: BLE001
-                    _log_error(exc)
-                    request_drain_interrupted = True
-                    break
 
             if tick_circuit_open:
                 effective_tick_interval = TICK_CIRCUIT_BREAKER_COOLDOWN_SECONDS
@@ -2053,6 +2171,7 @@ def run_loop(
                     bool(request_paths)
                     or bool(snapshot.get("in_flight", []))
                     or periodic_tick_attempted
+                    or pending_request is not None
                 )
                 if active_round:
                     sleep_interval = poll_interval
@@ -2098,6 +2217,37 @@ def _request_sort_key(path: Path) -> tuple[int, str]:
     except FileNotFoundError:
         return (sys.maxsize, path.name)
     return (stat.st_mtime_ns, path.name)
+
+
+def _request_activity(
+    *,
+    pid: int,
+    request: dict[str, Any],
+    started_at: str,
+) -> dict[str, Any]:
+    activity = {
+        "pid": pid,
+        "request_id": request.get("req_id"),
+        "request_type": request.get("type"),
+        "requested_by": request.get("requested_by"),
+        "started_at": started_at,
+    }
+    args = request.get("args")
+    if isinstance(args, dict):
+        for key in ("action", "repo", "work_id", "pr_number"):
+            value = args.get(key)
+            if isinstance(value, (str, int)) and not isinstance(value, bool):
+                activity[key] = value
+    return activity
+
+
+def _request_is_backgroundable(request: dict[str, Any]) -> bool:
+    if request.get("type") != "work-action":
+        return False
+    args = request.get("args")
+    if not isinstance(args, dict):
+        return False
+    return args.get("action") in {"regenerate-gates", "ship"}
 
 
 def _lock_is_live(path: Path, pid_alive: Callable[[int], bool]) -> bool:

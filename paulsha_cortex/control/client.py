@@ -133,6 +133,7 @@ def _read_manager_activity(payload: dict[str, Any]) -> dict[str, Any] | None:
         "request_id",
         "request_type",
         "requested_by",
+        "started_at",
         "action",
         "repo",
         "work_id",
