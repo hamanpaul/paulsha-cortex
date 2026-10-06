@@ -143,6 +143,9 @@ def test_legacy_capture_stops_before_running_root_cli_on_a_sealed_tree_mismatch(
     tmp_path: Path,
 ) -> None:
     text = LEGACY.read_text(encoding="utf-8")
+    root_cli = _block(
+        TRANSACTIONAL.read_text(encoding="utf-8"), "cortex_root_cli() {", "\n}\n"
+    )
     capture = _block(
         text,
         "cortex_capture_result=$(cortex_root_cli install trust-root legacy inventory \\",
@@ -156,11 +159,7 @@ def test_legacy_capture_stops_before_running_root_cli_on_a_sealed_tree_mismatch(
             'cortex_bundle=/tmp/bundle.json',
             'cortex_cli_tree_sha() { printf "%s\\n" mismatch; }',
             'cortex_sealed_cli_tree_sha=expected',
-            'cortex_root_cli() {',
-            '  test "$(cortex_cli_tree_sha)" = "$cortex_sealed_cli_tree_sha"',
-            '  printf "%s\\n" "$*" >>"$cortex_calls"',
-            '  printf "%s\\n" captured',
-            '}',
+            root_cli,
             capture,
         ]
     )
@@ -175,6 +174,10 @@ def test_transactional_rollback_trap_stops_before_running_root_cli_on_a_sealed_t
     tmp_path: Path,
 ) -> None:
     text = TRANSACTIONAL.read_text(encoding="utf-8")
+    recovery = text.split(
+        "cortex_recovery_sealed_cli_tree_sha=$(cortex_recovery_cli_tree_sha)", 1
+    )[1]
+    root_cli = _block(recovery, "cortex_root_cli() {", "\n}\n")
     abort_restore = _block(text, "cortex_abort_restore() {", "\n}\n")
     abort_restore = abort_restore.replace("/usr/bin/sudo ", "cortex_fake_sudo ")
     script = "\n".join(
@@ -184,13 +187,9 @@ def test_transactional_rollback_trap_stops_before_running_root_cli_on_a_sealed_t
             'cortex_apply_attempted=1',
             'cortex_receipt_path=/var/lib/cortex-installer/receipt.json',
             'cortex_maintenance_token=token',
-            'cortex_cli_tree_sha() { printf "%s\\n" mismatch; }',
-            'cortex_sealed_cli_tree_sha=expected',
-            'cortex_root_cli() {',
-            '  test "$(cortex_cli_tree_sha)" = "$cortex_sealed_cli_tree_sha"',
-            '  printf "%s\\n" "$*" >>"$cortex_calls"',
-            '  printf \'{"restore_safe": true}\\n\'',
-            '}',
+            'cortex_recovery_cli_tree_sha() { printf "%s\\n" mismatch; }',
+            'cortex_recovery_sealed_cli_tree_sha=expected',
+            root_cli,
             'cortex_fake_sudo() {',
             '  if [ "$1" = "/usr/bin/test" ] && [ "$2" = "-f" ]; then',
             '    return 0',
