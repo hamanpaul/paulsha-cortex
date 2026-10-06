@@ -1,0 +1,1 @@
+- 進件：在 `.cortex/work-items.yaml` 登記 work item `task-memory-disposition`（#1309），附 accepted todo，交給 cortex 派工。
