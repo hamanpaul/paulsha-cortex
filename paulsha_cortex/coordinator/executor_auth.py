@@ -19,10 +19,12 @@ Rate limit 訊號必須先於 login 訊號判定——這是 #369 真正修的�
 
 from __future__ import annotations
 
+import os
 import re
+import signal
 import subprocess
 import time
-from typing import Callable
+from typing import Callable, Sequence
 
 from .diagnostics import diagnostic_reason
 from .runtime_preflight import DEFAULT_PROVIDER_TTL_SECONDS, ProviderFreshness
@@ -31,6 +33,7 @@ __all__ = [
     "EXECUTOR_CANDIDATES",
     "EXECUTOR_AUTH_TTL_SECONDS",
     "classify_cli_output",
+    "run_probe",
     "check_executor_auth",
     "probe_copilot_model_availability",
     "cached_copilot_model_availability",
@@ -90,10 +93,117 @@ def classify_cli_output(returncode: int, output: str) -> tuple[str, str]:
     return "unknown", f"no definitive signal (exit {returncode})"
 
 
-def _default_runner(argv: list[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(  # noqa: S603 - argv 為內部組裝，非 shell
-        argv, check=False, capture_output=True, text=True, timeout=timeout
+_DEFAULT_PROBE_GRACE_SECONDS = 0.5
+
+
+def _stop_process_group(
+    process: subprocess.Popen[str],
+    *,
+    grace_seconds: float = _DEFAULT_PROBE_GRACE_SECONDS,
+) -> None:
+    """逾時或例外時，對整個 process group 先送 SIGTERM，短暫等待後送 SIGKILL 並等待回收。"""
+    pid = process.pid
+    if pid is None:
+        return
+
+    # 先送 SIGTERM 給整個 group
+    if hasattr(os, "killpg"):
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+    else:
+        try:
+            process.terminate()
+        except OSError:
+            pass
+
+    # 短暫等待（至多 grace_seconds）
+    deadline = time.monotonic() + max(grace_seconds, 0.0)
+    group_alive = True
+    while time.monotonic() < deadline:
+        if hasattr(os, "killpg"):
+            try:
+                os.killpg(pid, 0)
+            except OSError:
+                group_alive = False
+                break
+        else:
+            if process.poll() is not None:
+                group_alive = False
+                break
+        time.sleep(0.01)
+
+    # 若 group 成員或 leader 仍存活，送 SIGKILL 給整個 group
+    if group_alive or process.poll() is None:
+        if hasattr(os, "killpg"):
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+        else:
+            try:
+                process.kill()
+            except OSError:
+                pass
+
+    # 等待回收直接子程序，不留殭屍程序
+    try:
+        process.wait(timeout=2.0)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+    # 等待整個 process group 排空（至多 0.5 秒）
+    if hasattr(os, "killpg"):
+        drain_deadline = time.monotonic() + 0.5
+        while time.monotonic() < drain_deadline:
+            try:
+                os.killpg(pid, 0)
+            except OSError:
+                break
+            time.sleep(0.01)
+
+
+def run_probe(
+    argv: list[str] | Sequence[str],
+    *,
+    timeout: float = 20.0,
+    sigterm_grace_seconds: float = _DEFAULT_PROBE_GRACE_SECONDS,
+) -> subprocess.CompletedProcess[str]:
+    """以獨立 session / process group 執行 probe，逾時或例外時回收整個 process group。"""
+    process = subprocess.Popen(
+        list(argv),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
     )
+    with process:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except BaseException:
+            _stop_process_group(process, grace_seconds=sigterm_grace_seconds)
+            raise
+        returncode = process.returncode if process.returncode is not None else 0
+        return subprocess.CompletedProcess(
+            list(argv),
+            returncode,
+            stdout or "",
+            stderr or "",
+        )
+
+
+_default_runner = run_probe
 
 
 _EXECUTOR_AUTH_ARGV: dict[str, tuple[str, ...]] = {
