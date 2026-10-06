@@ -10,9 +10,15 @@ from pathlib import Path
 from unittest import mock
 
 from paulsha_cortex.control import client as control_client, contract as control_contract
-from paulsha_cortex.coordinator import cli
+from paulsha_cortex.coordinator import (
+    cli,
+    manager as coordinator_manager,
+    work_actions as coordinator_work_actions,
+    work_bridge,
+)
 from paulsha_cortex.coordinator.cli import _build_parser, _refuse_unsafe_fanout, _resolve_launcher
 from paulsha_cortex.coordinator.launcher import SubprocessLauncher
+from paulsha_cortex.coordinator.registry import JobRegistry
 
 
 def _meta(slice_id: str) -> dict:
@@ -444,6 +450,89 @@ class WorkActionFlagTests(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         self.assertEqual(submitted[0][1]["combo"], "fix-standard")
+
+    def test_work_start_and_intake_forward_builder_override_into_request_and_run(self) -> None:
+        expected_override = {
+            "builder": {"executor": "codex", "model_id": "gpt-6-luna"}
+        }
+
+        for action in ("start", "intake"):
+            with self.subTest(action=action):
+                submitted: list[tuple[str, dict[str, object], str]] = []
+                captured: dict[str, object] = {}
+
+                class FakeRun:
+                    def __init__(self, model_chain_override: dict[str, dict[str, str]] | None):
+                        self.model_chain_override = model_chain_override
+
+                    def to_dict(self) -> dict[str, object]:
+                        return {"model_chain_override": self.model_chain_override}
+
+                def fake_start_canonical_workflow(**kwargs):
+                    captured["start_kwargs"] = kwargs
+                    return FakeRun(kwargs.get("model_chain_override"))
+
+                def fake_execute_work_action(
+                    *,
+                    args,
+                    requested_by,
+                    workflow_registry,
+                    workflow_starter,
+                    **_kwargs,
+                ):
+                    run = workflow_starter(object(), "claim:v1:" + "1" * 64, None)
+                    return {"action": args["action"], "run": run.to_dict()}
+
+                with tempfile.TemporaryDirectory() as root:
+                    registry = JobRegistry(state_path=Path(root) / "jobs.json")
+
+                    def submit(req_type, args, requested_by):
+                        submitted.append((req_type, args, requested_by))
+                        return "request-1"
+
+                    def poll_done(req_id, timeout, interval):
+                        result = coordinator_manager.apply_work_action(
+                            args=submitted[0][1],
+                            requested_by="operator",
+                            registry=registry,
+                        )
+                        return {"status": "ok", "result": result}
+
+                    with (
+                        mock.patch.object(
+                            coordinator_work_actions,
+                            "execute_work_action",
+                            fake_execute_work_action,
+                        ),
+                        mock.patch.object(
+                            work_bridge,
+                            "start_canonical_workflow",
+                            fake_start_canonical_workflow,
+                        ),
+                    ):
+                        rc = cli.main(
+                            [
+                                "work",
+                                action,
+                                "demo",
+                                "--repo",
+                                "acme/demo",
+                                "--builder-executor",
+                                "codex",
+                                "--builder-model",
+                                "gpt-6-luna",
+                            ],
+                            control_read_status=lambda: {"degraded": False},
+                            control_submit_request=submit,
+                            control_poll_done=poll_done,
+                        )
+
+                self.assertEqual(rc, 0)
+                self.assertEqual(submitted[0][1]["builder_executor"], "codex")
+                self.assertEqual(submitted[0][1]["builder_model"], "gpt-6-luna")
+                self.assertEqual(
+                    captured["start_kwargs"]["model_chain_override"], expected_override
+                )
 
     def test_work_resume_drops_combo(self) -> None:
         """--combo 標註為 start 專用；resume 帶 --combo 時 CLI 不得轉送，

@@ -18,7 +18,7 @@ work_item: intake-model-flags
 
 ## Tasks
 
-- [ ] **T1 RED**：測試 `cortex work intake ... --builder-executor codex --builder-model gpt-6-luna` 送出的 request
+- [x] **T1 RED**：測試 `cortex work intake ... --builder-executor codex --builder-model gpt-6-luna` 送出的 request
       args 含 `builder_executor`／`builder_model`，建立的 run `model_chain_override` 為指定值；`start` 同理。
       現行應失敗。
 - [ ] **T2 intake／start 套用旗標**：CLI 把這些旗標轉成 request args，與 `--payload` 走同一條
