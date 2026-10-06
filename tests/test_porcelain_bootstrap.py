@@ -608,3 +608,25 @@ def test_bootstrap_sample_failure_is_degraded_but_not_fatal(
     assert payload["schema"] == BOOTSTRAP_SCHEMA
     assert payload["sample"]["ok"] is False
     assert "sample seed failed" in payload["sample"]["error"]
+
+
+def test_bootstrap_uses_shared_probe_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+    """T2：bootstrap._run 與 executor_auth.check_executor_auth 共用 run_probe。"""
+    from paulsha_cortex.coordinator import executor_auth
+    from paulsha_cortex.porcelain import bootstrap
+
+    assert bootstrap.run_probe is executor_auth.run_probe
+
+    calls: list[list[str]] = []
+
+    def fake_run_probe(argv, *, timeout=10):
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(list(argv), 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(bootstrap, "run_probe", fake_run_probe)
+    ok, detail, fix = bootstrap._executor_status("copilot")
+    assert ok is True
+    assert detail == "copilot prompt auth ok"
+    assert len(calls) == 1
+    assert calls[0][0] == "copilot"
+
