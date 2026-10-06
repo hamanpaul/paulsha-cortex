@@ -16,9 +16,9 @@ work_item: copilot-probe-reap
 
 ## Tasks
 
-- [ ] **T1 RED**：以測試替身模擬「wrapper 啟動一個不會自己結束的子程序」，probe 逾時後斷言子程序仍存活
+- [x] **T1 RED**：以測試替身模擬「wrapper 啟動一個不會自己結束的子程序」，probe 逾時後斷言子程序仍存活
       （現行行為）。
-- [ ] **T2 整組回收**：probe 一律在新的 session／process group 執行（`start_new_session=True`）。逾時或例外時，
+- [x] **T2 整組回收**：probe 一律在新的 session／process group 執行（`start_new_session=True`）。逾時或例外時，
       對整個 group 先送 SIGTERM、短暫等待後送 SIGKILL，並等待回收，不留殭屍程序。`executor_auth.py` 與
       `porcelain/bootstrap.py` 的 probe 共用同一個 runner。
-- [ ] **T3 文件**：新增 changelog fragment，並同步 `CHANGELOG.md [Unreleased]`。
+- [x] **T3 文件**：新增 changelog fragment，並同步 `CHANGELOG.md [Unreleased]`。
