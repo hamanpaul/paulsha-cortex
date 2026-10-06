@@ -794,6 +794,91 @@ def _require_sha256_hex(
     return normalized
 
 
+def _validate_operator_checkout_snapshot(
+    value: object,
+    *,
+    label: str,
+    state_path: Path,
+) -> dict[str, Any]:
+    snapshot = _require_exact_dict_keys(
+        value,
+        expected=frozenset({"root", "git_status_sha256", "planning_authority"}),
+        label=label,
+        state_path=state_path,
+    )
+    root = _require_non_empty_string(snapshot["root"], label=f"{label}.root", state_path=state_path)
+    root_path = Path(root)
+    if not root_path.is_absolute() or root_path.resolve(strict=False) != root_path:
+        raise _contract_error("malformed-recovery-context", state_path=state_path, detail=f"{label}.root")
+    status_hash = snapshot["git_status_sha256"]
+    if status_hash != "unavailable":
+        _require_sha256_hex(status_hash, label=f"{label}.git_status_sha256", state_path=state_path)
+    authority = snapshot["planning_authority"]
+    if not isinstance(authority, list):
+        raise _contract_error("malformed-recovery-context", state_path=state_path, detail=f"{label}.planning_authority")
+    normalized_rows: list[dict[str, str]] = []
+    seen_refs: set[str] = set()
+    for row in authority:
+        if not isinstance(row, Mapping) or set(row) != {"ref", "sha256"}:
+            raise _contract_error("malformed-recovery-context", state_path=state_path, detail=f"{label}.planning_authority")
+        ref = _require_non_empty_string(row["ref"], label=f"{label}.planning_authority.ref", state_path=state_path)
+        ref_path = Path(ref)
+        if ref_path.is_absolute() or ".." in ref_path.parts or ref_path.as_posix() != ref or ref in seen_refs:
+            raise _contract_error("malformed-recovery-context", state_path=state_path, detail=f"{label}.planning_authority.ref")
+        digest = row["sha256"]
+        if digest != "unavailable":
+            _require_sha256_hex(digest, label=f"{label}.planning_authority.sha256", state_path=state_path)
+        seen_refs.add(ref)
+        normalized_rows.append({"ref": ref, "sha256": digest})
+    if [row["ref"] for row in normalized_rows] != sorted(seen_refs):
+        raise _contract_error("malformed-recovery-context", state_path=state_path, detail=f"{label}.planning_authority order")
+    return {
+        "root": root,
+        "git_status_sha256": status_hash,
+        "planning_authority": normalized_rows,
+    }
+
+
+def _validate_operator_checkout_violation(
+    value: object,
+    *,
+    state_path: Path,
+) -> dict[str, Any]:
+    event = _require_exact_dict_keys(
+        value,
+        expected=frozenset({"schema_version", "baseline", "current", "changed_fields"}),
+        label="workflow_operator_checkout_violation",
+        state_path=state_path,
+    )
+    if type(event["schema_version"]) is not int or event["schema_version"] != 1:
+        raise _contract_error("malformed-recovery-context", state_path=state_path, detail="operator checkout schema")
+    baseline = _validate_operator_checkout_snapshot(
+        event["baseline"], label="operator_checkout.baseline", state_path=state_path
+    )
+    current = _validate_operator_checkout_snapshot(
+        event["current"], label="operator_checkout.current", state_path=state_path
+    )
+    if baseline["root"] != current["root"] or baseline["planning_authority"] and (
+        [row["ref"] for row in baseline["planning_authority"]]
+        != [row["ref"] for row in current["planning_authority"]]
+    ):
+        raise _contract_error("malformed-recovery-context", state_path=state_path, detail="operator checkout snapshot binding")
+    changed = event["changed_fields"]
+    expected_changed = []
+    if baseline["git_status_sha256"] != current["git_status_sha256"]:
+        expected_changed.append("git_status")
+    if baseline["planning_authority"] != current["planning_authority"]:
+        expected_changed.append("planning_authority")
+    if changed != expected_changed or not expected_changed:
+        raise _contract_error("malformed-recovery-context", state_path=state_path, detail="operator checkout changed fields")
+    return {
+        "schema_version": 1,
+        "baseline": baseline,
+        "current": current,
+        "changed_fields": expected_changed,
+    }
+
+
 def _require_safe_integer(
     value: object,
     *,
@@ -3214,6 +3299,29 @@ class JobRegistry:
                 )
             baseline_paths.add(row["path"])
         validated_job = dict(job)
+        operator_checkout_baseline = job.get("workflow_operator_checkout_baseline")
+        if operator_checkout_baseline is not None:
+            validated_job["workflow_operator_checkout_baseline"] = (
+                _validate_operator_checkout_snapshot(
+                    operator_checkout_baseline,
+                    label="workflow_operator_checkout_baseline",
+                    state_path=self._state_path,
+                )
+            )
+        operator_checkout_violation = job.get("workflow_operator_checkout_violation")
+        if operator_checkout_violation is not None:
+            if operator_checkout_baseline is None:
+                raise _contract_error(
+                    "malformed-recovery-context",
+                    state_path=self._state_path,
+                    detail="operator checkout violation without baseline",
+                )
+            validated_job["workflow_operator_checkout_violation"] = (
+                _validate_operator_checkout_violation(
+                    operator_checkout_violation,
+                    state_path=self._state_path,
+                )
+            )
         if "supersession" in job:
             validated_job["supersession"] = _validate_job_supersession(
                 job.get("supersession"),
@@ -3996,6 +4104,7 @@ class JobRegistry:
         workflow_input_root: str | None = None,
         workflow_inputs: tuple[str, ...] = (),
         workflow_input_snapshot: tuple[dict[str, str], ...] = (),
+        workflow_operator_checkout_baseline: Mapping[str, Any] | None = None,
         workflow_outputs: tuple[str, ...] = (),
         source_revision: str | None = None,
         workflow_sandbox_hash: str | None = None,
@@ -4131,6 +4240,10 @@ class JobRegistry:
             "exited_at": None,
             "created_at": _now_iso(),
         }
+        if workflow_operator_checkout_baseline is not None:
+            job["workflow_operator_checkout_baseline"] = dict(
+                workflow_operator_checkout_baseline
+            )
         job = self._validate_loaded_job(job)
         self._jobs.append(job)
         self._persist()
@@ -4149,13 +4262,29 @@ class JobRegistry:
         job_id: str,
         *,
         worktree: str | None = None,
+        workflow_operator_checkout_violation: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         job = self._find_job(job_id)
-        if worktree is None:
+        if worktree is None and workflow_operator_checkout_violation is None:
             raise ValueError("update_job 至少需要一個欄位")
-        if not isinstance(worktree, str) or not worktree.strip():
-            raise ValueError("worktree 必須為非空字串")
-        job["worktree"] = worktree
+        if worktree is not None:
+            if not isinstance(worktree, str) or not worktree.strip():
+                raise ValueError("worktree 必須為非空字串")
+            job["worktree"] = worktree
+        if workflow_operator_checkout_violation is not None:
+            if job.get("workflow_operator_checkout_baseline") is None:
+                raise ValueError("operator checkout violation requires its dispatch baseline")
+            proposed = dict(job)
+            proposed["workflow_operator_checkout_violation"] = (
+                _validate_operator_checkout_violation(
+                    workflow_operator_checkout_violation,
+                    state_path=self._state_path,
+                )
+            )
+            self._validate_loaded_job(proposed)
+            job["workflow_operator_checkout_violation"] = proposed[
+                "workflow_operator_checkout_violation"
+            ]
         self._persist()
         return _deepcopy_json(job)
 

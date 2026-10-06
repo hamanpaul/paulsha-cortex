@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -833,6 +834,74 @@ def _linked_worktree_git_write_dirs(worktree: str | None) -> tuple[str, ...]:
     except ValueError as exc:
         raise ValueError("linked worktree git write directory escapes branch scope") from exc
     return tuple(dict.fromkeys(str(path.resolve()) for path in required))
+
+
+def _direct_builder_state_dir(worktree: str, slice_id: str) -> Path:
+    """Keep executor-owned scratch files inside the builder's writable Git area."""
+
+    root = Path(worktree).resolve(strict=True)
+    marker = root / ".git"
+    if marker.is_symlink():
+        raise ValueError("worktree .git marker must not be a symlink")
+    if marker.is_dir():
+        git_root = marker.resolve(strict=True)
+    elif marker.is_file():
+        git_dirs = _linked_worktree_git_write_dirs(str(root))
+        if not git_dirs:
+            raise ValueError("linked worktree Git write directory is unavailable")
+        git_root = Path(git_dirs[0])
+    else:
+        # Keep launcher-level test and preflight workspaces contained even when
+        # Git setup is intentionally deferred to the caller.
+        git_root = root
+    slot = hashlib.sha256(slice_id.encode("utf-8")).hexdigest()[:20]
+    state_root = git_root / "cortex-executor"
+    if state_root.is_symlink() or (state_root.exists() and not state_root.is_dir()):
+        raise ValueError("executor state root must be a regular directory")
+    if state_root.exists() and state_root.resolve() != state_root.absolute():
+        raise ValueError("executor state root must not contain symlinks")
+    if not state_root.exists():
+        state_root.mkdir(mode=0o700)
+    state_dir = state_root / slot
+    if state_dir.is_symlink() or (state_dir.exists() and not state_dir.is_dir()):
+        raise ValueError("executor state directory must be a regular directory")
+    if state_dir.exists() and state_dir.resolve() != state_dir.absolute():
+        raise ValueError("executor state directory must not contain symlinks")
+    if not state_dir.exists():
+        state_dir.mkdir(mode=0o700)
+    return state_dir
+
+
+def _bubblewrap_worktree_argv(
+    command: Sequence[str],
+    worktree: str,
+    *,
+    bwrap_binary: str | None = None,
+) -> list[str]:
+    """Run an executor with only its worktree and linked Git metadata writable."""
+
+    resolved_worktree = Path(worktree).resolve(strict=True)
+    if not resolved_worktree.is_dir() or resolved_worktree == Path("/"):
+        raise ValueError("direct builder worktree is invalid")
+    binary = bwrap_binary or shutil.which("bwrap")
+    if not binary:
+        raise RuntimeError("direct builder containment requires bubblewrap")
+    resolved_binary = Path(binary).resolve(strict=True)
+    if not resolved_binary.is_file() or not os.access(resolved_binary, os.X_OK):
+        raise RuntimeError("direct builder containment bubblewrap executable is invalid")
+    git_dirs = _linked_worktree_git_write_dirs(str(resolved_worktree))
+    allowed = tuple(dict.fromkeys((str(resolved_worktree), *git_dirs)))
+    argv = [
+        str(resolved_binary),
+        "--die-with-parent",
+        "--ro-bind", "/", "/",
+        "--proc", "/proc",
+        "--dev", "/dev",
+    ]
+    for path in allowed:
+        argv.extend(("--bind", path, path))
+    argv.extend(("--chdir", str(resolved_worktree), "--", *command))
+    return argv
 
 
 def _validated_verdict_spool_dir(
@@ -2334,6 +2403,26 @@ class SubprocessLauncher:
             "read_only": self._read_only,
             "review_only": self._review_only,
         }
+        direct_builder_containment = (
+            runner_plan is None
+            and template_plan is None
+            and self._commit_required
+            and not self._read_only
+            and not self._review_only
+            and not self._write_forbidden
+        )
+        containment_binary = None
+        direct_state_dir: Path | None = None
+        if direct_builder_containment:
+            containment_binary = shutil.which("bwrap")
+            if not containment_binary:
+                raise RuntimeError("direct builder containment requires bubblewrap")
+            # The executor must not write logs or its final response into the
+            # Manager's log directory: those are outside the builder boundary.
+            direct_state_dir = _direct_builder_state_dir(worktree, slice_id)
+            builder_kwargs["log_dir"] = str(direct_state_dir)
+            if self._executor == "codex":
+                last_message_path = str(direct_state_dir / f"{slice_id}.last.json")
         # #396 item 3：claude 併入 commit_required 傳遞——builder-persona 的
         # as_commit_required() 轉換（autonomy.dispatch_ready）對所有可寫 executor
         # 一視同仁，漏掉這個 kwarg 會讓轉換對該 executor 變 no-op。
@@ -2401,6 +2490,10 @@ class SubprocessLauncher:
         if self._executor == "agy":
             builder_kwargs["print_timeout"] = resolve_agy_print_timeout(os.environ)
         inner_argv = adapter.build_argv(builder_kwargs)
+        if direct_builder_containment:
+            inner_argv = _bubblewrap_worktree_argv(
+                inner_argv, worktree, bwrap_binary=containment_binary
+            )
         # PSC_REPO_ROOT 讓已安裝 hook 的 `${PSC_REPO_ROOT}/scripts/coordinator/psc-relay-hook.sh`
         # 在 cwd=worktree（≠repo）時仍可解（worktree 雖是 repo checkout，但 hook 為全域安裝、
         # 不可依賴相對 cwd；互動 session 亦不應因相對路徑找不到 script 而報錯）。
@@ -2482,6 +2575,8 @@ class SubprocessLauncher:
                 env["PSC_RELAY_TARGET"] = self._relay_target
             if self._executor == "copilot":
                 env.update(_copilot_credential_env(env))
+        if direct_state_dir is not None:
+            env["TMPDIR"] = str(direct_state_dir)
         # （`log_path` 已在 argv 之前算好——#714：`-o` 的落點由它導出。）
         # 跨進程 durable 完成判定：以 bash -lc 包裝，子進程結束時把 $? 寫入 exit sentinel。
         # 用 shlex.join 安全嵌入內層 argv（prompt 含換行/空白仍為單一 token），

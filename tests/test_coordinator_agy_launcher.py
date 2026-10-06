@@ -439,7 +439,17 @@ def test_agy_commit_required_launcher_emits_real_scoped_git_dirs(monkeypatch, tm
     )
 
     assert calls
-    inner_argv = _script_inner_argv(calls[0][2])
+    launch_argv = _script_inner_argv(calls[0][2])
+    separator = launch_argv.index("--")
+    containment_argv = launch_argv[:separator]
+    inner_argv = launch_argv[separator + 1 :]
+    assert containment_argv[0].endswith("/bwrap")
+    assert containment_argv[1:5] == ["--die-with-parent", "--ro-bind", "/", "/"]
+    assert [
+        containment_argv[index + 1]
+        for index, value in enumerate(containment_argv[:-1])
+        if value == "--bind"
+    ] == [str(tmp_path.resolve()), *git_write_dirs]
     add_dirs = [
         inner_argv[index + 1]
         for index, value in enumerate(inner_argv)

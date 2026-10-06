@@ -4497,6 +4497,93 @@ def _planning_artifact_relative_path_after_archive(
     return matches[0].relative_to(workspace) if matches else relative
 
 
+def _frozen_brainstorm_artifacts(
+    run,
+    *,
+    coordinator_root: str | Path | None = None,
+    brainstorm_ref: GateEvidenceRef | None = None,
+) -> dict[str, bytes]:
+    """Read planning bytes from the immutable, hash-pinned brainstorm evidence.
+
+    New brainstorm evidence contains the primary integration's exact artifact
+    text as well as its path/hash manifest.  The live workspace can change
+    after define, so consumers use those captured bytes whenever available.
+    Older evidence did not embed artifact text; returning an empty mapping
+    preserves its existing workspace-backed compatibility path.
+    """
+
+    refs = (
+        [brainstorm_ref]
+        if brainstorm_ref is not None
+        else [ref for ref in getattr(run, "gate_refs", ()) or () if ref.kind == "brainstorm"]
+    )
+    if not refs:
+        return {}
+    if len(refs) != 1:
+        raise ValueError("workflow brainstorm authority must be unique")
+    gate_ref = refs[0]
+    evidence_path = Path(gate_ref.ref)
+    if not evidence_path.is_absolute() or evidence_path.is_symlink() or not evidence_path.is_file():
+        raise ValueError(BRAINSTORM_AUTHORITY_MISSING)
+    resolved = evidence_path.resolve()
+    if coordinator_root is not None:
+        evidence_root = Path(coordinator_root).resolve() / "evidence"
+        try:
+            resolved.relative_to(evidence_root)
+        except ValueError as exc:
+            raise ValueError("workflow brainstorm evidence outside coordinator root") from exc
+    encoded = resolved.read_bytes()
+    if hashlib.sha256(encoded).hexdigest() != gate_ref.sha256:
+        raise ValueError("workflow brainstorm evidence hash drift")
+    try:
+        payload = json.loads(encoded.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("workflow brainstorm evidence invalid") from exc
+    if not isinstance(payload, dict) or "primary_integration" not in payload:
+        return {}
+    integration = payload.get("primary_integration")
+    rows = payload.get("artifacts")
+    content_rows = integration.get("artifacts") if isinstance(integration, dict) else None
+    if not isinstance(rows, list) or not isinstance(content_rows, list):
+        raise ValueError("workflow brainstorm frozen artifacts invalid")
+    expected: dict[str, tuple[str, str]] = {}
+    for row in rows:
+        if (
+            not isinstance(row, dict)
+            or set(row) != {"kind", "ref", "sha256"}
+            or not isinstance(row.get("ref"), str)
+            or not isinstance(row.get("kind"), str)
+            or not isinstance(row.get("sha256"), str)
+        ):
+            raise ValueError("workflow brainstorm frozen artifact manifest invalid")
+        expected[row["ref"]] = (row["kind"], row["sha256"])
+    frozen: dict[str, bytes] = {}
+    for row in content_rows:
+        if (
+            not isinstance(row, dict)
+            or set(row) != {"kind", "path", "content"}
+            or not isinstance(row.get("path"), str)
+            or not isinstance(row.get("kind"), str)
+            or not isinstance(row.get("content"), str)
+        ):
+            raise ValueError("workflow brainstorm frozen artifact content invalid")
+        ref = row["path"]
+        content = row["content"].encode("utf-8")
+        binding = expected.get(ref)
+        if (
+            binding is None
+            or binding[0] != row["kind"]
+            or hashlib.sha256(content).hexdigest() != binding[1]
+            or ref in frozen
+        ):
+            raise ValueError("workflow brainstorm frozen artifact binding invalid")
+        frozen[ref] = content
+    # Existing artifacts can be attested in the evidence manifest without being
+    # repeated in the integration's ``artifacts`` list.  Freeze the embedded
+    # subset and leave legacy workspace fallback for those older inputs.
+    return frozen
+
+
 def _validated_brainstorm_planning_authority(
     run,
     *,
@@ -4587,6 +4674,13 @@ def _validated_brainstorm_planning_authority(
     persisted = {item.ref: item for item in run.planning_authority}
     scanned: dict[str, PlanningArtifactAuthority] = {}
     workspace = Path(run.workspace_root).resolve()
+    frozen_content = _frozen_brainstorm_artifacts(
+        run, coordinator_root=coordinator_root, brainstorm_ref=gate_ref
+    )
+    frozen_by_digest = {
+        hashlib.sha256(content).hexdigest(): content
+        for content in frozen_content.values()
+    }
     for index, row in enumerate(rows):
         if not isinstance(row, dict) or set(row) != {"kind", "ref", "sha256"}:
             raise ValueError(f"workflow brainstorm artifact[{index}] invalid")
@@ -4604,36 +4698,35 @@ def _validated_brainstorm_planning_authority(
         relative = Path(ref)
         if relative.is_absolute() or ".." in relative.parts:
             raise ValueError("workflow brainstorm artifact escapes workspace")
-        target_relative = _planning_artifact_relative_path_after_archive(
-            run,
-            workspace=workspace,
-            ref=ref,
-            digest=digest,
-        )
-        cursor = workspace
-        for part in target_relative.parts:
-            cursor = cursor / part
-            if cursor.is_symlink():
-                raise ValueError("workflow brainstorm artifact symlink rejected")
-        target = (workspace / target_relative).resolve()
-        try:
-            target.relative_to(workspace)
-        except ValueError as exc:
-            raise ValueError("workflow brainstorm artifact escapes workspace") from exc
-        # #514：以下每一條 raise 過去都只有一句沒有主詞的英文。本函式在迴圈裡
-        # 掃多個 ref，operator 拿到訊息時完全不知道是哪一個 artifact 出問題——
-        # 而上游 `resume_workflow_run` 又把整個例外吞掉、只回一個籠統的
-        # `planning-authority-reconciliation-failed`。訊息一律補上 `ref=`。
-        if not target.is_file():
-            raise ValueError(
-                f"workflow brainstorm artifact hash drift: ref={ref} (檔案不存在或不是一般檔案)"
+        data = frozen_content.get(ref) or frozen_by_digest.get(digest)
+        if data is None:
+            target_relative = _planning_artifact_relative_path_after_archive(
+                run,
+                workspace=workspace,
+                ref=ref,
+                digest=digest,
             )
-        data = target.read_bytes()
+            cursor = workspace
+            for part in target_relative.parts:
+                cursor = cursor / part
+                if cursor.is_symlink():
+                    raise ValueError("workflow brainstorm artifact symlink rejected")
+            target = (workspace / target_relative).resolve()
+            try:
+                target.relative_to(workspace)
+            except ValueError as exc:
+                raise ValueError("workflow brainstorm artifact escapes workspace") from exc
+            # 舊 evidence 沒有封存 artifact 文字；沿用既有的 hash 驗證路徑。
+            if not target.is_file():
+                raise ValueError(
+                    f"workflow brainstorm artifact hash drift: ref={ref} (檔案不存在或不是一般檔案)"
+                )
+            data = target.read_bytes()
         actual_digest = hashlib.sha256(data).hexdigest()
         if actual_digest != digest:
             # 0814 adversarial review 的修正：「artifact 在磁碟上被改動」這個
-            # 情境**先在這裡**失敗，走不到下面的 assessment 分支。它才是
-            # revalidation 最常見的現場，因此診斷必須做在這一條上。
+            # 情境**先在這裡**失敗，走不到下面的 assessment 分支。legacy evidence
+            # 沒有 frozen content 時仍保留這條 fail-closed 判準。
             raise ValueError(
                 f"workflow brainstorm artifact hash drift: ref={ref} "
                 f"(evidence={digest[:12]}; disk={actual_digest[:12]})"
@@ -5179,6 +5272,11 @@ def _validate_candidate_planning_authority(
 
     operator_root = Path(run.workspace_root).resolve()
     base = _candidate_planning_authority_base(run, job)
+    frozen_content = _frozen_brainstorm_artifacts(run)
+    frozen_by_digest = {
+        hashlib.sha256(content).hexdigest(): content
+        for content in frozen_content.values()
+    }
     drift_rows: list[dict[str, str]] = []
     for authority in authorities:
         content = subprocess.run(
@@ -5217,9 +5315,14 @@ def _validate_candidate_planning_authority(
             authority.kind == "plan"
             and Path(authority.ref).name in _CHECKBOX_VOLATILE_PLAN_BASENAMES
         ):
-            baseline_matches = _safe_input_matches(operator_root, authority.ref)
-            if len(baseline_matches) == 1:
-                baseline_bytes = baseline_matches[0].read_bytes()
+            baseline_bytes = frozen_content.get(authority.ref) or frozen_by_digest.get(
+                authority.baseline_sha256
+            )
+            if baseline_bytes is None:
+                baseline_matches = _safe_input_matches(operator_root, authority.ref)
+                if len(baseline_matches) == 1:
+                    baseline_bytes = baseline_matches[0].read_bytes()
+            if baseline_bytes is not None:
                 if (
                     hashlib.sha256(baseline_bytes).hexdigest() == authority.baseline_sha256
                     and _checkbox_insensitive_equal(baseline_bytes, current_bytes)
@@ -7915,6 +8018,11 @@ def _authority_map_with_checkbox_tolerance(
     `_workflow_input_snapshot` 同一判準，見 `_post_archive_openspec_alias`）。
     """
     operator_root = Path(run.workspace_root).resolve()
+    frozen_content = _frozen_brainstorm_artifacts(run)
+    frozen_by_digest = {
+        hashlib.sha256(content).hexdigest(): content
+        for content in frozen_content.values()
+    }
     mapping: dict[str, str] = {}
     for item in run.planning_authority:
         expected = item.baseline_sha256
@@ -7926,10 +8034,15 @@ def _authority_map_with_checkbox_tolerance(
         )
         if item.kind == "plan" and Path(item.ref).name in _CHECKBOX_VOLATILE_PLAN_BASENAMES:
             candidate_matches = _safe_input_matches(candidate_root, candidate_ref)
-            baseline_matches = _safe_input_matches(operator_root, item.ref)
-            if len(candidate_matches) == 1 and len(baseline_matches) == 1:
+            baseline_data = frozen_content.get(item.ref) or frozen_by_digest.get(
+                item.baseline_sha256
+            )
+            if baseline_data is None:
+                baseline_matches = _safe_input_matches(operator_root, item.ref)
+                if len(baseline_matches) == 1:
+                    baseline_data = baseline_matches[0].read_bytes()
+            if len(candidate_matches) == 1 and baseline_data is not None:
                 candidate_data = candidate_matches[0].read_bytes()
-                baseline_data = baseline_matches[0].read_bytes()
                 digest = hashlib.sha256(candidate_data).hexdigest()
                 if (
                     digest != expected
@@ -7976,6 +8089,11 @@ def _workflow_input_snapshot(
     root = repo_root.resolve()
     operator_root = Path(run.workspace_root).resolve()
     authority = {item.ref: item for item in run.planning_authority}
+    frozen_content = _frozen_brainstorm_artifacts(run, coordinator_root=coordinator_root)
+    frozen_by_digest = {
+        hashlib.sha256(content).hexdigest(): content
+        for content in frozen_content.values()
+    }
     seeds: dict[str, bytes] = {}
     drift_rows: list[dict[str, str]] = []
 
@@ -8013,20 +8131,23 @@ def _workflow_input_snapshot(
         if not authority_refs:
             raise ValueError(f"workflow declared input missing: {pattern}")
         for ref in authority_refs:
-            source_matches = _safe_input_matches(operator_root, ref)
-            if len(source_matches) != 1:
-                archived_ref = _planning_artifact_relative_path_after_archive(
-                    run,
-                    workspace=operator_root,
-                    ref=ref,
-                    digest=authority[ref].baseline_sha256,
-                ).as_posix()
-                if archived_ref != ref:
-                    source_matches = _safe_input_matches(operator_root, archived_ref)
-            if len(source_matches) != 1:
-                raise ValueError("workflow planning input missing")
-            source = source_matches[0]
-            data = source.read_bytes()
+            data = frozen_content.get(ref) or frozen_by_digest.get(
+                authority[ref].baseline_sha256
+            )
+            if data is None:
+                source_matches = _safe_input_matches(operator_root, ref)
+                if len(source_matches) != 1:
+                    archived_ref = _planning_artifact_relative_path_after_archive(
+                        run,
+                        workspace=operator_root,
+                        ref=ref,
+                        digest=authority[ref].baseline_sha256,
+                    ).as_posix()
+                    if archived_ref != ref:
+                        source_matches = _safe_input_matches(operator_root, archived_ref)
+                if len(source_matches) != 1:
+                    raise ValueError("workflow planning input missing")
+                data = source_matches[0].read_bytes()
             if hashlib.sha256(data).hexdigest() != authority[ref].baseline_sha256:
                 drift_rows.append(
                     {
@@ -8097,15 +8218,19 @@ def _workflow_input_snapshot(
                     bound.kind == "plan"
                     and Path(authority_ref).name in _CHECKBOX_VOLATILE_PLAN_BASENAMES
                 ):
-                    baseline_matches = _safe_input_matches(operator_root, authority_ref)
-                    if len(baseline_matches) == 1:
-                        baseline_data = baseline_matches[0].read_bytes()
-                        if (
-                            hashlib.sha256(baseline_data).hexdigest()
-                            == bound.baseline_sha256
-                            and _checkbox_insensitive_equal(baseline_data, data)
-                        ):
-                            tolerated = True
+                    baseline_data = frozen_content.get(authority_ref) or frozen_by_digest.get(
+                        bound.baseline_sha256
+                    )
+                    if baseline_data is None:
+                        baseline_matches = _safe_input_matches(operator_root, authority_ref)
+                        if len(baseline_matches) == 1:
+                            baseline_data = baseline_matches[0].read_bytes()
+                    if (
+                        baseline_data is not None
+                        and hashlib.sha256(baseline_data).hexdigest() == bound.baseline_sha256
+                        and _checkbox_insensitive_equal(baseline_data, data)
+                    ):
+                        tolerated = True
                 if not tolerated:
                     drift_rows.append(
                         {
@@ -8745,6 +8870,138 @@ def _planner_sandbox_path(job: Mapping[str, object], coordinator_root: str | Pat
     if path.parent not in allowed_parents or re.fullmatch(r"[0-9a-f]{32}", path.name) is None:
         raise ValueError("planner sandbox path outside coordinator boundary")
     return path
+
+
+def _operator_checkout_snapshot(
+    root: str | Path,
+    authority_refs: Sequence[str],
+) -> dict[str, object]:
+    """Capture read-only Git status and pinned planning-file hashes for job auditing."""
+
+    checkout = Path(root).resolve(strict=True)
+    if not checkout.is_dir():
+        raise ValueError("operator checkout is not a directory")
+    try:
+        status = subprocess.run(
+            [
+                "git", "-C", str(checkout), "-c", "core.fsmonitor=false",
+                "-c", "core.untrackedCache=false", "status", "--porcelain=v1", "-z",
+                "--untracked-files=all",
+            ],
+            check=False,
+            capture_output=True,
+            timeout=10,
+        )
+        status_hash = (
+            hashlib.sha256(status.stdout).hexdigest()
+            if status.returncode == 0
+            else "unavailable"
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        status_hash = "unavailable"
+    authority: list[dict[str, str]] = []
+    for ref in sorted(set(authority_refs)):
+        path = Path(ref)
+        if path.is_absolute() or ".." in path.parts or path.as_posix() != ref:
+            raise ValueError("operator checkout authority ref is not repo-relative")
+        target = checkout / path
+        try:
+            resolved = target.resolve(strict=True)
+            resolved.relative_to(checkout)
+            digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
+        except (OSError, ValueError):
+            digest = "unavailable"
+        authority.append({"ref": ref, "sha256": digest})
+    return {
+        "root": str(checkout),
+        "git_status_sha256": status_hash,
+        "planning_authority": authority,
+    }
+
+
+def _workflow_operator_checkout_baseline(run) -> dict[str, object] | None:
+    if not Path(run.workspace_root).is_dir():
+        return None
+    return _operator_checkout_snapshot(
+        run.workspace_root,
+        [item.ref for item in (run.planning_authority or ())],
+    )
+
+
+def _operator_checkout_violation(
+    baseline: Mapping[str, object],
+) -> dict[str, object] | None:
+    root = baseline.get("root")
+    refs = [
+        row["ref"]
+        for row in baseline.get("planning_authority", [])
+        if isinstance(row, Mapping) and isinstance(row.get("ref"), str)
+    ]
+    try:
+        current = _operator_checkout_snapshot(str(root), refs)
+    except (OSError, ValueError):
+        current = {
+            "root": str(root),
+            "git_status_sha256": "unavailable",
+            "planning_authority": [
+                {"ref": ref, "sha256": "unavailable"} for ref in sorted(set(refs))
+            ],
+        }
+    changed: list[str] = []
+    if baseline.get("git_status_sha256") != current.get("git_status_sha256"):
+        changed.append("git_status")
+    if baseline.get("planning_authority") != current.get("planning_authority"):
+        changed.append("planning_authority")
+    if not changed:
+        return None
+    return {
+        "schema_version": 1,
+        "baseline": dict(baseline),
+        "current": current,
+        "changed_fields": changed,
+    }
+
+
+def _record_operator_checkout_violation(registry, run, job) -> dict[str, object] | None:
+    baseline = job.get("workflow_operator_checkout_baseline")
+    if not isinstance(baseline, Mapping):
+        return None
+    event = job.get("workflow_operator_checkout_violation")
+    if not isinstance(event, Mapping):
+        event = _operator_checkout_violation(baseline)
+        if event is None:
+            return None
+        job = registry.update_job(
+            str(job["job_id"]),
+            workflow_operator_checkout_violation=event,
+        )
+    current = registry.get_workflow_run(run.run_id)
+    existing_reason = current.needs_human_reason
+    if not (
+        isinstance(existing_reason, Mapping)
+        and existing_reason.get("reason") == "operator-checkout-mutated"
+    ):
+        changed_fields = ",".join(str(item) for item in event["changed_fields"])
+        registry._manager_update_workflow_run(
+            run.run_id,
+            facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
+            needs_human_reason=diagnostic_reason(
+                "operator-checkout-mutated",
+                "builder job completed after the operator checkout changed; inspect the job audit before resuming",
+                source="manager.resume_workflow_run:operator-checkout",
+                run_id=run.run_id,
+                work_id=run.work_id,
+                card=job.get("workflow_card"),
+                job_id=job.get("job_id"),
+                changed_fields=changed_fields,
+            ),
+        )
+    return {
+        "run_id": run.run_id,
+        "current_phase": run.current_phase,
+        "job_id": job.get("job_id"),
+        "reason": "operator-checkout-mutated",
+    }
 
 
 def _discard_failed_planner_sandbox(
@@ -16950,6 +17207,11 @@ def _dispatch_workflow_card(
                 else f"feature/{run.work_id}"
             )
         )
+        operator_checkout_baseline = (
+            _workflow_operator_checkout_baseline(run)
+            if step.persona == "builder"
+            else None
+        )
         job = registry.create_job(
             task=task,
             job_id=reserved_job_id,
@@ -16974,6 +17236,7 @@ def _dispatch_workflow_card(
             workflow_input_root=str(effective_repo_root),
             workflow_inputs=effective_inputs,
             workflow_input_snapshot=input_snapshot,
+            workflow_operator_checkout_baseline=operator_checkout_baseline,
             workflow_outputs=step.outputs,
             source_revision=run.source_revision,
             workflow_sandbox_hash=sandbox_hash,
@@ -18501,6 +18764,9 @@ def resume_workflow_run(
         elif isinstance(fresh_receipt, dict) and fresh_receipt.get("job_id") == job["job_id"]:
             in_flight["stage_reuse"] = {"card": step.card, **fresh_receipt}
         return in_flight
+    checkout_violation = _record_operator_checkout_violation(registry, run, job)
+    if checkout_violation is not None:
+        return checkout_violation
     if job.get("status") != "exited" or job.get("exit_code") != 0:
         failure_reason = "job-failed"
         runtime_diagnostic = job.get("runtime_diagnostic")

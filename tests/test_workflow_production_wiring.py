@@ -3420,7 +3420,7 @@ def _materialize_authority_fixture(
     slug = "materialize-authority-repro"
     workspace = tmp_path / "workspace"
     coordinator_root = tmp_path / "coordinator"
-    plan_body = "---\nstatus: accepted\n---\n# Plan\n## Tasks\n- Ship.\n"
+    plan_body = "---\nstatus: accepted\n---\n# Plan\n## Tasks\n- [ ] Ship.\n"
     other_plan_body = "---\nstatus: accepted\n---\n# Plan\n## Tasks\n- Different.\n"
     spec_body = "---\nstatus: accepted\n---\n# Spec\n## Requirements\nBound.\n"
     design_body = "---\nstatus: accepted\n---\n# Design\n## Decisions\nBound.\n"
@@ -3561,6 +3561,56 @@ def test_brainstorm_authority_accepts_materialized_plan_byte_copy(tmp_path: Path
     assert authority == run.planning_authority
     assert source_revision == "2" * 64
     assert canonical_ref in {item.ref for item in authority}
+
+
+def test_planning_revalidation_uses_frozen_evidence_after_operator_edit(tmp_path: Path) -> None:
+    run, coordinator_root, canonical_ref = _materialize_authority_fixture(tmp_path)
+    evidence_path = Path(run.gate_refs[0].ref)
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    frozen_rows = []
+    for row in evidence["artifacts"]:
+        content = (Path(run.workspace_root) / row["ref"]).read_text(encoding="utf-8")
+        frozen_rows.append({"kind": row["kind"], "path": row["ref"], "content": content})
+    evidence["primary_integration"] = {"artifacts": frozen_rows}
+    encoded = (json.dumps(evidence, sort_keys=True) + "\n").encode("utf-8")
+    evidence_path.write_bytes(encoded)
+    run.gate_refs = (
+        GateEvidenceRef("brainstorm", str(evidence_path), hashlib.sha256(encoded).hexdigest()),
+    )
+
+    original_ref = evidence["artifacts"][0]["ref"]
+    source_path = Path(run.workspace_root) / original_ref
+    original_content = source_path.read_bytes()
+    source_path.write_bytes(original_content.replace(b"[ ]", b"[x]"))
+
+    authority, source_revision = manager._validated_brainstorm_planning_authority(
+        run,
+        coordinator_root=coordinator_root,
+    )
+    assert authority == run.planning_authority
+    assert source_revision == "2" * 64
+    assert canonical_ref in {item.ref for item in authority}
+
+    builder_root = tmp_path / "builder"
+    builder_root.mkdir()
+    input_snapshot = manager._workflow_input_snapshot(
+        run=run,
+        repo_root=builder_root,
+        patterns=(original_ref,),
+        coordinator_root=coordinator_root,
+        persist_content=False,
+    )
+    assert (builder_root / original_ref).read_bytes() == original_content
+    assert input_snapshot[0]["sha256"] == hashlib.sha256(original_content).hexdigest()
+
+    candidate_root = tmp_path / "candidate"
+    candidate_plan = candidate_root / original_ref
+    candidate_plan.parent.mkdir(parents=True)
+    candidate_plan.write_bytes(original_content.replace(b"[ ]", b"[x]"))
+    authority_hashes = manager._authority_map_with_checkbox_tolerance(
+        run, candidate_root=candidate_root
+    )
+    assert authority_hashes[original_ref] == hashlib.sha256(candidate_plan.read_bytes()).hexdigest()
 
 
 def test_brainstorm_authority_rejects_materialized_plan_with_different_digest(
