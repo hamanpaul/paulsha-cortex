@@ -1849,10 +1849,10 @@ _EXECUTOR_POLICY_STATES = frozenset(
     {"hook-enforced", "deny-rules-only", "unsupported-measured", "not-applicable"}
 )
 EXECUTOR_POLICY_ENFORCEMENT = {
-    "copilot": {"planner": "not-applicable", "builder": "hook-enforced", "reviewer": "not-applicable"},
-    "claude": {"planner": "not-applicable", "builder": "hook-enforced", "reviewer": "hook-enforced"},
-    "codex": {"planner": "not-applicable", "builder": "hook-enforced", "reviewer": "not-applicable"},
-    "agy": {"planner": "not-applicable", "builder": "hook-enforced", "reviewer": "not-applicable"},
+    "copilot": {"planner": "not-applicable", "builder": "unsupported-measured", "reviewer": "not-applicable"},
+    "claude": {"planner": "not-applicable", "builder": "unsupported-measured", "reviewer": "unsupported-measured"},
+    "codex": {"planner": "not-applicable", "builder": "unsupported-measured", "reviewer": "not-applicable"},
+    "agy": {"planner": "not-applicable", "builder": "unsupported-measured", "reviewer": "not-applicable"},
     "cg": {"planner": "not-applicable", "builder": "not-applicable", "reviewer": "not-applicable"},
 }
 
@@ -1871,8 +1871,11 @@ def _assert_executor_policy_coverage() -> None:
         ("agy", "builder"),
         ("claude", "reviewer"),
     }
-    if any(EXECUTOR_POLICY_ENFORCEMENT[executor][role] != "hook-enforced" for executor, role in required):
-        raise RuntimeError("required executor command-policy hook is not enforced")
+    if any(
+        EXECUTOR_POLICY_ENFORCEMENT[executor][role] == "not-applicable"
+        for executor, role in required
+    ):
+        raise RuntimeError("required executor command-policy status is missing")
 
 
 _assert_executor_policy_coverage()

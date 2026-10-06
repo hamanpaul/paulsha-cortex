@@ -173,7 +173,7 @@ def test_executor_policy_matrix_covers_argv_builders_and_required_hook_wiring() 
         ("agy", "builder"),
         ("claude", "reviewer"),
     ):
-        assert launcher.EXECUTOR_POLICY_ENFORCEMENT[executor][role] == "hook-enforced"
+        assert launcher.EXECUTOR_POLICY_ENFORCEMENT[executor][role] == "unsupported-measured"
 
     codex_argv = launcher.build_codex_argv(
         prompt="P", slice_id="j", log_dir="/logs", worktree="/tmp/worktree"

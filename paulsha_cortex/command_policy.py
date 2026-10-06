@@ -63,9 +63,26 @@ _SUDO_LONG_VALUE_OPTIONS = frozenset(
 )
 _SUDO_VALUE_OPTIONS = frozenset({"-C", "-D", "-R", "-g", "-h", "-p", "-r", "-t", "-T", "-u"})
 _SUDO_VALUE_OPTION_CHARS = frozenset(token[1:] for token in _SUDO_VALUE_OPTIONS)
-_SUPPORTED_WRAPPERS = frozenset({"command", "env", "nohup", "sudo", "timeout"})
+_SUPPORTED_WRAPPERS = frozenset(
+    {"command", "env", "eval", "nohup", "sudo", "timeout", "xargs"}
+)
 _ENV_VALUE_OPTIONS = frozenset({"-C", "-S", "-u"})
 _TIMEOUT_VALUE_OPTIONS = frozenset({"-k", "-s", "--kill-after", "--signal"})
+_XARGS_LONG_VALUE_OPTIONS = frozenset(
+    {
+        "--arg-file",
+        "--delimiter",
+        "--eof",
+        "--max-args",
+        "--max-chars",
+        "--max-lines",
+        "--max-procs",
+        "--process-slot-var",
+        "--replace",
+    }
+)
+_XARGS_SHORT_VALUE_OPTIONS = frozenset({"a", "d", "E", "I", "L", "n", "P", "s"})
+_MAX_NESTED_SHELL_DEPTH = 16
 
 
 class CommandPolicyError(ValueError):
@@ -328,18 +345,30 @@ def normalize_argv0(token: str | None) -> str:
     return name.lower()
 
 
-def unwrap_command_argv(argv: Sequence[str], *, wrappers: Sequence[str] | None = None) -> tuple[str, ...]:
+def unwrap_command_argv(
+    argv: Sequence[str],
+    *,
+    wrappers: Sequence[str] | None = None,
+    stop_before: Sequence[str] = (),
+) -> tuple[str, ...]:
     remaining = tuple(token for token in argv if token)
     active_wrappers = frozenset(token.lower() for token in (wrappers or ()))
     if not active_wrappers:
         active_wrappers = frozenset({"sudo", "env", "timeout", "command", "nohup"})
+    stop_wrappers = frozenset(token.lower() for token in stop_before)
 
     seen: set[tuple[str, ...]] = set()
     while remaining and remaining not in seen:
         seen.add(remaining)
+        assignment_end = _leading_assignment_end(remaining)
+        if assignment_end:
+            remaining = remaining[assignment_end:]
+            continue
         if not remaining:
             return ()
         argv0 = normalize_argv0(remaining[0])
+        if argv0 in stop_wrappers:
+            return remaining
         if argv0 not in active_wrappers:
             return remaining
         if argv0 == "sudo":
@@ -348,6 +377,10 @@ def unwrap_command_argv(argv: Sequence[str], *, wrappers: Sequence[str] | None =
             next_argv = _strip_env(remaining)
         elif argv0 == "timeout":
             next_argv = _strip_timeout(remaining)
+        elif argv0 == "eval":
+            next_argv = _strip_eval(remaining)
+        elif argv0 == "xargs":
+            next_argv = _strip_xargs(remaining)
         else:
             next_argv = _strip_simple_prefix_wrapper(remaining)
         if next_argv == remaining:
@@ -357,24 +390,52 @@ def unwrap_command_argv(argv: Sequence[str], *, wrappers: Sequence[str] | None =
 
 
 def evaluate_command(command: str, *, policy: CommandPolicy) -> CommandDecision:
-    current_policy = policy
+    return _evaluate_command(command, policy=policy, depth=0)
+
+
+def _evaluate_command(
+    command: str, *, policy: CommandPolicy, depth: int
+) -> CommandDecision:
+    if depth > _MAX_NESTED_SHELL_DEPTH:
+        raise CommandPolicyError("shell 巢狀命令超過解析上限")
+    nested_commands = _nested_shell_commands(command)
+    for nested_command in nested_commands:
+        nested_decision = _evaluate_command(
+            nested_command, policy=policy, depth=depth + 1
+        )
+        if nested_decision.match is not None:
+            return CommandDecision(
+                allowed=False,
+                command=command,
+                segments=split_command_segments(command),
+                match=nested_decision.match,
+            )
     segments = split_command_segments(command)
     for segment in segments:
-        match = _match_segment(segment, current_policy)
+        match = _match_segment(segment, policy, depth=depth)
         if match is not None:
             return CommandDecision(allowed=False, command=command, segments=segments, match=match)
     return CommandDecision(allowed=True, command=command, segments=segments)
 
 
-def _match_segment(segment: Sequence[str], policy: CommandPolicy) -> CommandMatch | None:
-    unwrapped = unwrap_command_argv(segment, wrappers=policy.wrappers)
+def _match_segment(
+    segment: Sequence[str], policy: CommandPolicy, *, depth: int
+) -> CommandMatch | None:
+    unwrapped = unwrap_command_argv(
+        segment, wrappers=policy.wrappers, stop_before=("eval",)
+    )
     if not unwrapped:
         return None
     argv0 = normalize_argv0(unwrapped[0])
 
+    if argv0 == "eval":
+        return _evaluate_command(
+            _eval_command_text(unwrapped), policy=policy, depth=depth + 1
+        ).match
+
     nested_command = _shell_command_payload(unwrapped)
     if argv0 in _SHELL_ARGV0 and nested_command is not None:
-        return evaluate_command(nested_command, policy=policy).match
+        return _evaluate_command(nested_command, policy=policy, depth=depth + 1).match
 
     if _rule_matches_command(policy, "protected-root-destruction", argv0) and _is_python_argv0(argv0):
         python_match = _match_python_command(unwrapped, policy)
@@ -481,6 +542,96 @@ def _strip_sudo(argv: Sequence[str]) -> tuple[str, ...]:
                 index += 2
                 continue
         index += 1
+    return ()
+
+
+def _leading_assignment_end(argv: Sequence[str]) -> int:
+    index = 0
+    while index < len(argv):
+        name, separator, _value = argv[index].partition("=")
+        if not separator or not _is_shell_identifier(name):
+            break
+        index += 1
+    return index
+
+
+def _is_shell_identifier(value: str) -> bool:
+    if not value:
+        return False
+    first = value[0]
+    if first != "_" and not (first.isascii() and first.isalpha()):
+        return False
+    return all(char.isascii() and (char.isalnum() or char == "_") for char in value[1:])
+
+
+def _strip_eval(argv: Sequence[str]) -> tuple[str, ...]:
+    return split_command(_eval_command_text(argv))
+
+
+def _eval_command_text(argv: Sequence[str]) -> str:
+    index = 1
+    if index < len(argv) and argv[index] == "--":
+        index += 1
+    if index >= len(argv):
+        return ""
+    return " ".join(argv[index:])
+
+
+def _strip_xargs(argv: Sequence[str]) -> tuple[str, ...]:
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            return tuple(argv[index + 1 :])
+        if token.startswith("--"):
+            option, separator, _value = token.partition("=")
+            if option in _XARGS_LONG_VALUE_OPTIONS:
+                if separator:
+                    index += 1
+                elif index + 1 < len(argv):
+                    index += 2
+                else:
+                    return ()
+                continue
+            if option in {
+                "--exit",
+                "--no-run-if-empty",
+                "--null",
+                "--open-tty",
+                "--show-limits",
+                "--verbose",
+            } and not separator:
+                index += 1
+                continue
+            raise CommandPolicyError(f"xargs option 無法解析: {token}")
+        if token.startswith("-") and token != "-":
+            cluster = token[1:]
+            option_index = 0
+            while option_index < len(cluster):
+                option = cluster[option_index]
+                if option in _XARGS_SHORT_VALUE_OPTIONS:
+                    if option_index + 1 < len(cluster):
+                        index += 1
+                    elif index + 1 < len(argv):
+                        index += 2
+                    else:
+                        return ()
+                    break
+                if option == "i":
+                    # GNU xargs accepts an optional replacement string for -i.
+                    if option_index + 1 < len(cluster):
+                        index += 1
+                    else:
+                        index += 1
+                    break
+                if option not in {"0", "p", "r", "t", "x"}:
+                    raise CommandPolicyError(f"xargs option 無法解析: -{option}")
+                option_index += 1
+            else:
+                index += 1
+            continue
+        return tuple(argv[index:])
+    # Without an explicit command xargs invokes echo, which is not a policy target.
     return ()
 
 
@@ -714,11 +865,21 @@ def _matches_protected_literal(token: str, protected_paths: Sequence[str]) -> bo
 
 def _normalize_protected_literal(token: str) -> str:
     text = token.strip()
+    text = _normalize_home_reference(text)
     if text.startswith("~"):
         return _normalize_tilde_path(text)
     if text.startswith("/"):
         return _normalize_anchored_path(text, anchor="/")
     return text.rstrip("/")
+
+
+def _normalize_home_reference(token: str) -> str:
+    for reference in ("${HOME}", "$HOME"):
+        if token == reference:
+            return "~"
+        if token.startswith(reference) and token[len(reference) :].startswith("/"):
+            return f"~{token[len(reference):]}"
+    return token
 
 
 def _normalize_absolute_path(token: str) -> str:
@@ -977,6 +1138,121 @@ def _normalize_anchored_path(token: str, *, anchor: str) -> str:
     if not parts:
         return anchor
     return f"{anchor}{'/'.join(parts)}"
+
+
+def _nested_shell_commands(command: str) -> tuple[str, ...]:
+    nested: list[str] = []
+    index = 0
+    quote: str | None = None
+    while index < len(command):
+        char = command[index]
+        if quote == "'":
+            if char == "'":
+                quote = None
+            index += 1
+            continue
+        if quote == '"':
+            if char == "\\":
+                index += 2
+                continue
+            if char == '"':
+                quote = None
+                index += 1
+                continue
+            if char == "`":
+                payload, index = _extract_backtick_payload(command, index)
+                nested.append(payload)
+                continue
+            if command.startswith("$(", index):
+                payload, index = _extract_parenthesized_payload(command, index + 1)
+                nested.append(payload)
+                continue
+            index += 1
+            continue
+        if char == "\\":
+            index += 2
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            index += 1
+            continue
+        if char == "`":
+            payload, index = _extract_backtick_payload(command, index)
+            nested.append(payload)
+            continue
+        if command.startswith("$(", index):
+            payload, index = _extract_parenthesized_payload(command, index + 1)
+            nested.append(payload)
+            continue
+        if char == "(":
+            payload, index = _extract_parenthesized_payload(command, index)
+            nested.append(payload)
+            continue
+        index += 1
+    return tuple(nested)
+
+
+def _extract_parenthesized_payload(command: str, opening_index: int) -> tuple[str, int]:
+    if opening_index >= len(command) or command[opening_index] != "(":
+        raise CommandPolicyError("shell 子命令括號格式錯誤")
+    depth = 1
+    index = opening_index + 1
+    quote: str | None = None
+    while index < len(command):
+        char = command[index]
+        if quote == "'":
+            if char == "'":
+                quote = None
+            index += 1
+            continue
+        if quote == '"':
+            if char == "\\":
+                index += 2
+                continue
+            if char == '"':
+                quote = None
+                index += 1
+                continue
+            if command.startswith("$(", index):
+                depth += 1
+                index += 2
+                continue
+            index += 1
+            continue
+        if char == "\\":
+            index += 2
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            index += 1
+            continue
+        if char == "`":
+            _payload, index = _extract_backtick_payload(command, index)
+            continue
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return command[opening_index + 1 : index], index + 1
+        index += 1
+    raise CommandPolicyError("shell 子命令括號未閉合")
+
+
+def _extract_backtick_payload(command: str, opening_index: int) -> tuple[str, int]:
+    index = opening_index + 1
+    payload: list[str] = []
+    while index < len(command):
+        char = command[index]
+        if char == "\\" and index + 1 < len(command):
+            payload.extend((char, command[index + 1]))
+            index += 2
+            continue
+        if char == "`":
+            return "".join(payload), index + 1
+        payload.append(char)
+        index += 1
+    raise CommandPolicyError("shell 反引號命令替換未閉合")
 
 
 def _assert_known_keys(payload: Mapping[str, object], *, allowed: frozenset[str], source: str, label: str) -> None:

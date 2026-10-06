@@ -20,6 +20,46 @@ cases:
   rule: protected-root-destruction
   expect: blocked
   command: sudo -E rm -fr ~
+- id: protected-root-blocked-leading-assignment
+  rule: protected-root-destruction
+  expect: blocked
+  command: FOO=1 rm -rf /
+- id: protected-root-blocked-subshell
+  rule: protected-root-destruction
+  expect: blocked
+  command: (rm -rf /)
+- id: protected-root-blocked-command-substitution
+  rule: protected-root-destruction
+  expect: blocked
+  command: '$(rm -rf /)'
+- id: protected-root-blocked-backtick-substitution
+  rule: protected-root-destruction
+  expect: blocked
+  command: '`rm -rf /`'
+- id: protected-root-blocked-xargs-wrapper
+  rule: protected-root-destruction
+  expect: blocked
+  command: xargs rm -rf /
+- id: protected-root-blocked-eval-wrapper
+  rule: protected-root-destruction
+  expect: blocked
+  command: "eval 'rm -rf /'"
+- id: protected-root-blocked-eval-command-substitution
+  rule: protected-root-destruction
+  expect: blocked
+  command: "eval '$(rm -rf /)'"
+- id: protected-root-blocked-xargs-eval-command-substitution
+  rule: protected-root-destruction
+  expect: blocked
+  command: "xargs eval '$(rm -rf /)'"
+- id: protected-root-blocked-home-variable
+  rule: protected-root-destruction
+  expect: blocked
+  command: rm -rf $HOME
+- id: protected-root-blocked-braced-home-variable
+  rule: protected-root-destruction
+  expect: blocked
+  command: 'rm -rf "${HOME}"'
 - id: protected-root-blocked-many-sudo
   rule: protected-root-destruction
   expect: blocked
@@ -160,6 +200,22 @@ cases:
   rule: protected-root-destruction
   expect: allowed
   command: 'echo "rm -rf /"'
+- id: protected-root-allowed-single-quoted-substitution-text
+  rule: protected-root-destruction
+  expect: allowed
+  command: "echo '$(rm -rf /)'"
+- id: protected-root-allowed-xargs-build-clean
+  rule: protected-root-destruction
+  expect: allowed
+  command: xargs rm -rf build/
+- id: protected-root-allowed-eval-echo
+  rule: protected-root-destruction
+  expect: allowed
+  command: "eval 'echo safe'"
+- id: protected-root-allowed-home-subpath
+  rule: protected-root-destruction
+  expect: allowed
+  command: 'rm -rf "${HOME}/build"'
 - id: protected-root-allowed-python-module
   rule: protected-root-destruction
   expect: allowed
