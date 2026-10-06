@@ -1625,3 +1625,51 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/workstreams/copilot-probe-reap/todo.md'
     excludes: []
+  gate-pythonpath-isolation:
+    title: 'gate-pythonpath-isolation'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1302'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/gate-pythonpath-isolation/todo.md'
+    excludes: []
+  copilot-headless-compat:
+    title: 'copilot-headless-compat'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1303'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/copilot-headless-compat/todo.md'
+    excludes: []
+  codex-readonly-sandbox:
+    title: 'codex-readonly-sandbox'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1304'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/codex-readonly-sandbox/todo.md'
+    excludes: []
+  worktree-containment-authority:
+    title: 'worktree-containment-authority'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1305'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/worktree-containment-authority/todo.md'
+    excludes: []
+  auto-retry-fallback:
+    title: 'auto-retry-fallback'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1306'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/auto-retry-fallback/todo.md'
+    excludes: []
+  async-long-requests:
+    title: 'async-long-requests'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1307'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/async-long-requests/todo.md'
+    excludes: []
