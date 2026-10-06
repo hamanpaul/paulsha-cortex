@@ -198,9 +198,10 @@ def test_system_monitor_uses_instance_repo_and_read_only_contract(
 ) -> None:
     repo_root = tmp_path / "state" / "repos" / "paulsha-cortex"
     repo_root.mkdir(parents=True)
+    operator_workspace = tmp_path / "home" / "operator" / "prj" / "paulsha-cortex"
     config_path = _write(
         tmp_path / "config" / "project-cortex.yaml",
-        "workspaces:\n  - {name: cortex, path: /home/operator/prj/paulsha-cortex}\n",
+        f"workspaces:\n  - {{name: cortex, path: {operator_workspace}}}\n",
     )
     monkeypatch.setenv("PSC_MONITOR_REPO_ROOT_ONLY", "1")
     monkeypatch.setenv("PSC_MONITOR_REPO_READONLY", "1")
