@@ -14,6 +14,11 @@ from paulsha_cortex.coordinator import spool_slot
 from paulsha_cortex.trust_root.install import InstallReceipt
 from paulsha_cortex.trust_root.install.backend import LocalInstallBackend
 
+try:
+    from qualification import legacy_fixture
+except ModuleNotFoundError:  # run as qualification/launch_authority_probe.py from a checkout
+    import legacy_fixture  # type: ignore[no-redef]
+
 
 def _read_document(path: Path) -> dict[str, object]:
     value = json.loads(path.read_text(encoding="utf-8"))
@@ -100,9 +105,10 @@ def run(plan_path: Path, receipt_path: Path) -> dict[str, object]:
         principal, provider = row.get("principal"), row.get("provider")
         if not isinstance(principal, str) or not isinstance(provider, str):
             raise ValueError("install plan credential identity is invalid")
+        check = legacy_fixture.provider_check_for_principal(principal)
         if principal == "manager":
             checked.append(
-                {"principal": principal, "provider": provider, "check": "credential"}
+                {"principal": principal, "provider": provider, "check": check}
             )
             continue
         runtime_principal = {"builder": "builder", "reviewer-planner": "reviewer"}.get(
@@ -133,7 +139,7 @@ def run(plan_path: Path, receipt_path: Path) -> dict[str, object]:
                 account=str(account["name"]),
             )
         checked.append(
-            {"principal": principal, "provider": provider, "check": "launcher"}
+            {"principal": principal, "provider": provider, "check": check}
         )
     return {"status": "passed", "providers": checked}
 

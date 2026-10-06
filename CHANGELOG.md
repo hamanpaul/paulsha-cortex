@@ -9,7 +9,7 @@
 
 ### Fixed
 
-- **#1289 Trust Root launcher authorities**：installer plan 建立並 verify builder/reviewer 的 canonical Codex controls、Manager-owned Codex/Copilot 憑證落點與 Copilot OAuth EnvironmentFile；升級時 credentials inherit 自動搬遷舊 Codex/Copilot 憑證，legacy controls 先 quarantine 再建立封存政策版本。RC 在 harness 寫入前 probe 安裝後 launcher provisioning，legacy-adoption 也必須留下 authority probe 證據（見 `changelog.d/installer-launch-authorities.md`）。
+- **#1289 Trust Root launcher authorities**：installer plan 建立並 verify builder/reviewer 的 canonical Codex controls、Manager-owned Codex/Copilot 憑證落點與 Copilot OAuth EnvironmentFile；升級時 credentials inherit 自動搬遷舊 Codex/Copilot 憑證，legacy controls 先 quarantine 再建立封存政策版本。RC 在 harness 寫入前 probe 安裝後 launcher provisioning，legacy-adoption 也必須留下 authority probe 證據；qualification probe、adoption harness、driver 與 validator 共用同一個 principal-to-check 推導（見 `changelog.d/installer-launch-authorities.md`）。
 - **cortex 進件：#1309 task-memory 逐則處置回報**：登記 work item `task-memory-disposition` 與 accepted todo，交給 cortex 派工（見 `changelog.d/cortex-intake-task-memory-disposition.md`）。
 - **cortex 進件：派工穩定性 #1302–#1307**：登記六個 work item 與 accepted todo，交給 cortex 平行派工（見 `changelog.d/cortex-intake-dispatch-stability.md`）。
 - **cortex 進件：#1282 審查後續／#1296／#1297**：登記三個 work item 與 accepted todo，交給 cortex 平行派工（見 `changelog.d/cortex-intake-batch-20261006b.md`）。

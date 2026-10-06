@@ -93,6 +93,12 @@ LEGACY_EVIDENCE_FILES = (
     "legacy-rollback.json",
 )
 
+
+def provider_check_for_principal(principal: str) -> str:
+    """Return the authority check recorded for an imported credential principal."""
+    return "credential" if principal == "manager" else "launcher"
+
+
 #: ``socket``／``fifo`` 是沒有 listener／reader 的殘留物件（#1282），以 mknod 建立。
 _ENTRY_TYPES = frozenset({"directory", "file", "symlink", "sparse", "socket", "fifo"})
 _MODE = re.compile(r"^0[0-7]{3}$")

@@ -7121,7 +7121,7 @@ def _legacy_adoption_checks(
         {
             "principal": str(row["principal"]),
             "provider": str(row["provider"]),
-            "check": "credential" if row["principal"] == "manager" else "launcher",
+            "check": legacy_fixture.provider_check_for_principal(str(row["principal"])),
         }
         for row in legacy_fixture.load_manifest()["credentials"]
     ]

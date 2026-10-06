@@ -155,7 +155,7 @@ class FakeHost:
                 {
                     "principal": str(row["principal"]),
                     "provider": str(row["provider"]),
-                    "check": "credential" if row["principal"] == "manager" else "launcher",
+                    "check": fixture.provider_check_for_principal(str(row["principal"])),
                 }
                 for row in required
             ]
@@ -328,7 +328,7 @@ def test_harness_runs_every_step_in_order_and_records_passing_evidence(tmp_path:
             {
                 "principal": str(row["principal"]),
                 "provider": str(row["provider"]),
-                "check": "credential" if row["principal"] == "manager" else "launcher",
+                "check": fixture.provider_check_for_principal(str(row["principal"])),
             }
             for row in MANIFEST["credentials"]
         ],

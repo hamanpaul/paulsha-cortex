@@ -1262,7 +1262,7 @@ def _validate_legacy_artifacts(
         {
             "principal": str(row["principal"]),
             "provider": str(row["provider"]),
-            "check": "credential" if row["principal"] == "manager" else "launcher",
+            "check": legacy_fixture.provider_check_for_principal(str(row["principal"])),
         }
         for row in manifest["credentials"]
     ]

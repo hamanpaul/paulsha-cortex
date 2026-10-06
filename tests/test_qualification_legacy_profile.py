@@ -1,6 +1,7 @@
 """RC `legacy-adoption` profile: runner, image, driver, schema, validator, redaction (#1122, PR-5)."""
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib.util
 import json
@@ -50,6 +51,32 @@ def _sha256(path: Path) -> str:
 def _write_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, sort_keys=True), encoding="utf-8")
+
+
+def test_provider_check_mapping_is_shared_across_qualification_paths() -> None:
+    assert {
+        principal: fixture.provider_check_for_principal(principal)
+        for principal in ("manager", "builder", "reviewer-planner")
+    } == {
+        "manager": "credential",
+        "builder": "launcher",
+        "reviewer-planner": "launcher",
+    }
+
+    for filename in (
+        "launch_authority_probe.py",
+        "legacy_adoption.py",
+        "validate.py",
+        "driver.py",
+    ):
+        source = (QUALIFICATION / filename).read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(QUALIFICATION / filename))
+        assert any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "provider_check_for_principal"
+            for node in ast.walk(tree)
+        ), filename
 
 
 # ---------------------------------------------------------------------------
@@ -158,9 +185,7 @@ def _legacy_adoption_document() -> dict:
                 {
                     "principal": str(row["principal"]),
                     "provider": str(row["provider"]),
-                    "check": "credential"
-                    if row["principal"] == "manager"
-                    else "launcher",
+                    "check": fixture.provider_check_for_principal(str(row["principal"])),
                 }
                 for row in MANIFEST["credentials"]
             ],

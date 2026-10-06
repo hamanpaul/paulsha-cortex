@@ -621,7 +621,7 @@ class Harness:
             {
                 "principal": str(row["principal"]),
                 "provider": str(row["provider"]),
-                "check": "credential" if row["principal"] == "manager" else "launcher",
+                "check": fixture.provider_check_for_principal(str(row["principal"])),
             }
             for row in required
             if isinstance(row, Mapping)
