@@ -88,6 +88,7 @@ from .preflight import PreflightRequest, load_preflight_command, run_preflight
 from .work_bridge import (
     current_sizing_snapshot,
     extract_model_chain_override,
+    resolve_model_chain,
     resolve_trusted_repo_root,
     workflow_status,
 )
@@ -648,6 +649,14 @@ def _intake_action(
     result = dict(claim_result)
     result["linked"] = linked
     result["link_result"] = link_result
+    run = result.get("run")
+    if result.get("action") in {"claim", "resume"} and isinstance(run, dict):
+        # T4: expose a read-only preview for the operator. Keep this separate
+        # from WorkflowRun.resolved_model_chain, which records identities only
+        # after their real workflow cards are dispatched.
+        result["resolved_model_chain"] = resolve_model_chain(
+            run.get("model_chain_override")
+        )
     return result
 
 

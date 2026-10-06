@@ -17,7 +17,8 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Callable, Iterable, Mapping
+from types import SimpleNamespace
+from typing import Any, Callable, Iterable, Mapping
 from uuid import uuid4
 
 from paulsha_cortex.config import paths
@@ -130,6 +131,82 @@ def extract_model_chain_override(args: Mapping[str, object]) -> dict[str, dict[s
             )
         override[persona] = {"executor": executor.strip(), "model_id": model_id.strip()}
     return override or None
+
+
+def resolve_model_chain(
+    model_chain_override: Mapping[str, Mapping[str, str]] | None,
+    *,
+    identity_registry: IdentityRegistry | None = None,
+) -> dict[str, dict[str, str]]:
+    """Resolve the complete planner/builder/reviewer chain with dispatch rules.
+
+    Intake uses this as an operator-facing preview. Selection is delegated to
+    the same manager resolver used at dispatch, so defaults and overrides obey
+    the existing capability and reviewer-independence checks. The returned
+    ``model`` alias keeps CLI output friendly while ``model_id`` matches the
+    durable workflow vocabulary; neither field is stored as resolved run
+    evidence here.
+    """
+
+    identities = identity_registry if identity_registry is not None else load_model_identities()
+    planning = [
+        identity
+        for identity in identities.identities
+        if "planning" in identity.capabilities
+    ]
+    if not planning:
+        raise RuntimeError("no primary planning identity configured")
+    ranked = model_resolution.rank_candidates(
+        planning,
+        role="planning",
+        context=identities.resolution_context,
+        compatibility_for=model_resolution.compatibility_checker_for("planner"),
+    )
+    if not ranked.ordered:
+        raise RuntimeError(
+            "no resolvable primary planning identity"
+            f"（{ranked.exclusion_detail()}）"
+        )
+
+    # start_canonical_workflow sets primary_domain from this same shared planner
+    # selection before workflow dispatch. Keep that preference when resolving
+    # the builder, even when the run explicitly overrides its planner.
+    primary = ranked.ordered[0]
+    run = SimpleNamespace(
+        primary_domain=primary.independence_domain,
+        steps=[],
+        sizing_band=None,
+        model_chain_override=model_chain_override,
+    )
+    from . import manager
+
+    selected: dict[str, Any] = {}
+    for persona in ("planner", "builder"):
+        selected[persona] = manager._select_workflow_identity(
+            run, SimpleNamespace(persona=persona), identities
+        )
+
+    builder = selected["builder"]
+    run.steps = [
+        SimpleNamespace(
+            phase="build",
+            gate_result="passed",
+            commit_policy=None,
+            domain=builder.independence_domain,
+        )
+    ]
+    selected["reviewer"] = manager._select_workflow_identity(
+        run, SimpleNamespace(persona="reviewer"), identities
+    )
+
+    return {
+        persona: {
+            "executor": identity.executor,
+            "model": identity.model_id,
+            "model_id": identity.model_id,
+        }
+        for persona, identity in selected.items()
+    }
 
 
 def _remote_repo(root: Path) -> str | None:

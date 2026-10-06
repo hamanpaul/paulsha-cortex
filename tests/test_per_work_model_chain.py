@@ -15,7 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from paulsha_cortex.coordinator import manager
+from paulsha_cortex.coordinator import manager, work_bridge
 from paulsha_cortex.coordinator.model_identities import IdentityRegistry
 from paulsha_cortex.coordinator.registry import JobRegistry
 from paulsha_cortex.deck.compile import compile_combo
@@ -98,6 +98,38 @@ _BUILDER_IDENTITIES = IdentityRegistry.from_rows(
         },
     ]
 )
+
+
+def test_resolve_model_chain_with_no_override() -> None:
+    """T4：沒有覆寫時，intake 預覽三段實際共用的 executor 與 model。"""
+    resolved = work_bridge.resolve_model_chain(
+        None, identity_registry=_BUILDER_IDENTITIES
+    )
+
+    assert set(resolved) == {"planner", "builder", "reviewer"}
+    for persona in ("planner", "builder", "reviewer"):
+        assert "executor" in resolved[persona]
+        assert "model" in resolved[persona]
+        assert resolved[persona]["model"]
+        assert resolved[persona]["model"] == resolved[persona]["model_id"]
+    assert resolved["planner"]["executor"] == "claude"
+    # Operator adjudication: AGY is not the builder default because its login is
+    # unavailable; use the shared resolver's codex selection.
+    assert resolved["builder"]["executor"] == "codex"
+    assert resolved["reviewer"]["executor"] == "claude"
+
+
+def test_resolve_model_chain_with_builder_override() -> None:
+    """T4：builder 覆寫生效，其餘 persona 仍由共用 resolver 回退。"""
+    override = {"builder": {"executor": "copilot", "model_id": "builder-two"}}
+    resolved = work_bridge.resolve_model_chain(
+        override, identity_registry=_BUILDER_IDENTITIES
+    )
+
+    assert resolved["builder"]["executor"] == "copilot"
+    assert resolved["builder"]["model"] == "builder-two"
+    assert resolved["planner"]["executor"] == "claude"
+    assert resolved["reviewer"]["executor"] == "claude"
 
 
 def test_override_applies_to_target_run_only() -> None:

@@ -455,6 +455,23 @@ class WorkActionFlagTests(unittest.TestCase):
         expected_override = {
             "builder": {"executor": "codex", "model_id": "gpt-6-luna"}
         }
+        resolved_chain = {
+            "planner": {
+                "executor": "claude",
+                "model": "planner-one",
+                "model_id": "planner-one",
+            },
+            "builder": {
+                "executor": "codex",
+                "model": "gpt-6-luna",
+                "model_id": "gpt-6-luna",
+            },
+            "reviewer": {
+                "executor": "claude",
+                "model": "reviewer-anthropic",
+                "model_id": "reviewer-anthropic",
+            },
+        }
 
         for action in ("start", "intake"):
             with self.subTest(action=action):
@@ -482,7 +499,10 @@ class WorkActionFlagTests(unittest.TestCase):
                     **_kwargs,
                 ):
                     run = workflow_starter(object(), "claim:v1:" + "1" * 64, None)
-                    return {"action": args["action"], "run": run.to_dict()}
+                    result = {"action": args["action"], "run": run.to_dict()}
+                    if args["action"] == "intake":
+                        result["resolved_model_chain"] = resolved_chain
+                    return result
 
                 with tempfile.TemporaryDirectory() as root:
                     registry = JobRegistry(state_path=Path(root) / "jobs.json")
@@ -535,9 +555,15 @@ class WorkActionFlagTests(unittest.TestCase):
                 self.assertEqual(
                     captured["start_kwargs"]["model_chain_override"], expected_override
                 )
+                expected_output = {
+                    "action": action,
+                    "run": {"model_chain_override": expected_override},
+                }
+                if action == "intake":
+                    expected_output["resolved_model_chain"] = resolved_chain
                 self.assertEqual(
                     json.loads(stdout.getvalue()),
-                    {"action": action, "run": {"model_chain_override": expected_override}},
+                    expected_output,
                 )
 
     def test_work_start_rejects_partial_model_chain_override(self) -> None:

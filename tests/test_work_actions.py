@@ -5694,6 +5694,15 @@ def test_intake_without_link_args_starts_using_existing_confirmed_authority(
     assert intake["result"]["link_result"] is None
     assert intake["result"]["action"] == "claim"
     assert intake["result"]["run"]["claim_key"] == expected_claim_key
+    resolved_chain = intake["result"]["resolved_model_chain"]
+    assert set(resolved_chain) == {"planner", "builder", "reviewer"}
+    for persona in ("planner", "builder", "reviewer"):
+        assert resolved_chain[persona]["executor"]
+        assert (
+            resolved_chain[persona]["model"]
+            == resolved_chain[persona]["model_id"]
+        )
+    assert intake["result"]["run"]["resolved_model_chain"] is None
     assert len(registry.list_workflow_runs()) == 1
 
     # 第二次以相同輸入重送必須幂等：同一個 run_id，不新增第二個 active run。
