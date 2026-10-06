@@ -1194,11 +1194,16 @@ available. Check the Manager journal for `system-repo-source-sync`, then compare
 
 ### Freshness, quota shadow, and project config
 
-`github_refresh_interval_seconds` must be less than `provider_stale_after_seconds`,
-and the stale threshold cannot exceed the shared 900-second claim limit. The
-default refresh interval is 300 seconds and the default stale threshold is 900
-seconds. Invalid combinations fail during Monitor config loading. These rules
-apply to system and user-level Monitor configurations.
+`github_refresh_interval_seconds` must stay below the effective freshness limit,
+which is the smaller of `provider_stale_after_seconds` and the shared 900-second
+claim limit. The default refresh interval is 300 seconds and the default stale
+threshold is 900 seconds. An existing refresh interval at or above that limit
+automatically converges to half the limit for the running Monitor; for example,
+an adopted `1800`-second value runs at `450` seconds. The saved YAML is not
+rewritten. Monitor logs one warning, and `cortex doctor` plus `cortex inspect
+status` show the effective interval and warning. A stale threshold above 900
+seconds still fails closed. These rules apply to system and user-level Monitor
+configurations.
 
 When a system Manager has no operator `quota-pools.json`, it uses an in-memory
 shadow configuration with an unknown-capacity pool bound to installed model

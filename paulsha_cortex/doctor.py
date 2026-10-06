@@ -1423,6 +1423,50 @@ def _load_runtime_monitor_socket_path(env: Mapping[str, str]) -> Path:
         return Path(load_config().socket_path).expanduser()
 
 
+def _monitor_config_probe(environment: Mapping[str, str]) -> ProbeResult:
+    """Report Monitor config normalization, including refresh interval convergence."""
+    from .monitor.config import load_config
+
+    try:
+        with patch.dict(os.environ, dict(environment), clear=True):
+            config = load_config()
+    except FileNotFoundError:
+        return _probe_result(
+            "monitor-config",
+            "warn",
+            "Monitor config is unavailable",
+            False,
+        )
+    except (OSError, ValueError) as error:
+        return _probe_result(
+            "monitor-config",
+            "fail",
+            f"Monitor config could not be loaded: {error}",
+            False,
+        )
+
+    context = {
+        "github_refresh_interval_seconds": config.github_refresh_interval_seconds,
+        "provider_stale_after_seconds": config.provider_stale_after_seconds,
+        "configuration_warnings": list(config.configuration_warnings),
+    }
+    if config.configuration_warnings:
+        return _probe_result(
+            "monitor-config",
+            "warn",
+            "; ".join(config.configuration_warnings),
+            False,
+            context=context,
+        )
+    return _probe_result(
+        "monitor-config",
+        "pass",
+        "Monitor refresh interval is within the provider freshness limit",
+        False,
+        context=context,
+    )
+
+
 def _request_runtime_monitor(socket_path: Path, payload: Mapping[str, object]) -> dict:
     """Use the production work API client; missing PR A fails closed."""
     from .monitor.work_api import MonitorSocketClient
@@ -1580,6 +1624,7 @@ def run_doctor(
         _repo_identity_probe(effective),
         _managed_path_drift_probe(effective, agents_root=agents_root, instance=instance),
         _shared_project_config_root_probe(effective, home=home_path, instance=instance),
+        _monitor_config_probe(effective),
         state_probe,
         socket_probe,
         _loaded_runtime_probe(

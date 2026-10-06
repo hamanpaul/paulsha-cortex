@@ -102,6 +102,7 @@ def _ok_status(
         "not_claimable": list(payload.get("not_claimable", [])),
         # #716：resume 沒派 job 也沒轉 needs_human 的 workflow（無聲等待的原因）。
         "workflow_waits": list(payload.get("workflow_waits", [])),
+        "monitor_config_warnings": list(payload.get("monitor_config_warnings", [])),
         "in_flight": list(payload.get("in_flight", [])),
         "recent_done": list(payload.get("recent_done", [])),
         "degraded": False,
@@ -192,6 +193,11 @@ def _degraded_status(
         "attention": list(payload.get("attention", [])) if isinstance(payload, dict) else [],
         "not_claimable": (
             list(payload.get("not_claimable", [])) if isinstance(payload, dict) else []
+        ),
+        "monitor_config_warnings": (
+            list(payload.get("monitor_config_warnings", []))
+            if isinstance(payload, dict)
+            else []
         ),
         "in_flight": [],
         "recent_done": [],

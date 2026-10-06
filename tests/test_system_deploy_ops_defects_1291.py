@@ -63,8 +63,6 @@ def test_read_only_monitor_mirror_never_fetches(git_origin) -> None:
 @pytest.mark.parametrize(
     ("monitor_values", "message"),
     [
-        ({"github_refresh_interval_seconds": 1800}, "refresh_interval_seconds"),
-        ({"github_refresh_interval_seconds": 900}, "refresh_interval_seconds"),
         ({"provider_stale_after_seconds": 901}, "provider_stale_after_seconds"),
     ],
 )
@@ -83,6 +81,115 @@ def test_monitor_refresh_and_claim_freshness_limits_are_consistent(
     )
     with pytest.raises(ValueError, match=message):
         load_config(config_path=config)
+
+
+@pytest.mark.parametrize(
+    ("configured_interval", "effective_interval"), [(1800, 450), (900, 450)]
+)
+def test_legacy_refresh_interval_converges_without_editing_saved_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    configured_interval: int,
+    effective_interval: int,
+) -> None:
+    import paulsha_cortex.monitor.config as monitor_config
+
+    monkeypatch.delenv("PSC_MONITOR_REPO_ROOT_ONLY", raising=False)
+    monkeypatch.delenv("PSC_MONITOR_REPO_READONLY", raising=False)
+    monkeypatch.setattr(monitor_config, "_WARNED_CONFIG_ADJUSTMENTS", set())
+    caplog.set_level("WARNING", logger=monitor_config.__name__)
+    source = (
+        "workspaces:\n  - {name: cortex, path: /tmp/cortex}\nmonitor:\n"
+        f"  github_refresh_interval_seconds: {configured_interval}\n"
+    )
+    config_path = _write(tmp_path / "project-cortex.yaml", source)
+
+    config = load_config(config_path=config_path)
+
+    assert config.github_refresh_interval_seconds == effective_interval
+    assert config.provider_stale_after_seconds == 900
+    assert len(config.configuration_warnings) == 1
+    assert str(configured_interval) in config.configuration_warnings[0]
+    assert f"{effective_interval} seconds" in config.configuration_warnings[0]
+    assert str(configured_interval) in caplog.text
+    assert config_path.read_text(encoding="utf-8") == source
+
+
+def test_doctor_and_status_surface_refresh_interval_adjustment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from paulsha_cortex import doctor
+    from paulsha_cortex.control import client
+    from paulsha_cortex.porcelain.inspect import _print_status
+
+    config_path = _write(
+        tmp_path / "project-cortex.yaml",
+        "workspaces:\n  - {name: cortex, path: /tmp/cortex}\n"
+        "monitor:\n  github_refresh_interval_seconds: 1800\n",
+    )
+    probe = doctor._monitor_config_probe({"PSC_MONITOR_CONFIG": str(config_path)})
+    assert probe.status == "warn"
+    assert "1800" in probe.detail
+    assert "450 seconds" in probe.detail
+
+    status = client._ok_status(
+        {
+            "monitor_config_warnings": [probe.detail],
+        },
+        "2026-10-06T12:00:00Z",
+    )
+    _print_status(status)
+    assert f"monitor_config_warning: {probe.detail}" in capsys.readouterr().out
+
+
+def test_manager_status_provider_includes_monitor_config_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = _write(
+        tmp_path / "project-cortex.yaml",
+        "workspaces:\n  - {name: cortex, path: /tmp/cortex}\n"
+        "monitor:\n  github_refresh_interval_seconds: 1800\n",
+    )
+    monkeypatch.setenv("PSC_MONITOR_CONFIG", str(config_path))
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path / "control"))
+    monkeypatch.setattr(
+        manager_daemon.candidate_base, "default_mirror_root", lambda: tmp_path
+    )
+    monkeypatch.setattr(
+        manager_daemon.candidate_base,
+        "MirrorDistanceProbe",
+        lambda **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        manager_daemon.manager, "reconcile_building_slices", lambda _registry: None
+    )
+    monkeypatch.setattr(manager_daemon, "_in_flight_status", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(manager_daemon, "_not_claimable_status", lambda _registry: [])
+
+    class Registry:
+        def list_slices(self):
+            return []
+
+        def list_workflow_runs(self):
+            return []
+
+    provider = manager_daemon.build_runtime_status_provider(
+        registry=Registry(),
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(tmp_path / "handoff"),
+        scan_specs_fn=lambda _specs_dir: [],
+        ready_units_fn=lambda _metas, _predicate: [],
+    )
+
+    status = provider()
+
+    assert len(status["monitor_config_warnings"]) == 1
+    assert "1800" in status["monitor_config_warnings"][0]
+    assert "450 seconds" in status["monitor_config_warnings"][0]
 
 
 def test_system_monitor_uses_instance_repo_and_read_only_contract(

@@ -725,6 +725,14 @@ def build_runtime_status_provider(
 
     quota_decision_store = _quota_admission_module.AdmissionDecisionStore()
     quota_decision_cache = DecisionReadCache()
+    try:
+        from paulsha_cortex.monitor.config import load_config
+
+        monitor_config_warnings = list(load_config().configuration_warnings)
+    except (FileNotFoundError, OSError, ValueError):
+        # Monitor owns config-load failures and doctor reports them. A manager
+        # status snapshot must remain available if Monitor config is absent.
+        monitor_config_warnings = []
     # #840 AC4：daemon 重啟時記憶體 last-good 已隨舊 process 消失；以上一個
     # daemon 自己寫出的 status.json 裡的 quota 投影當跨 process 種子。種子只在
     # store 讀不到且沒有記憶體 last-good 時採用，仍需通過目前 attempt 判定；
@@ -883,7 +891,7 @@ def build_runtime_status_provider(
             registry, candidate_base_probe=candidate_base_probe
         )
         attention.extend(_stale_job_attention(in_flight))
-        return {
+        snapshot = {
             "ready": ready,
             "held": held,
             "in_flight": in_flight,
@@ -896,6 +904,9 @@ def build_runtime_status_provider(
             # ——fail-loud 換 fail-silent，方向是錯的。這份清單就是那個出口。
             "not_claimable": _not_claimable_status(registry),
         }
+        if monitor_config_warnings:
+            snapshot["monitor_config_warnings"] = monitor_config_warnings
+        return snapshot
 
     return provider
 
@@ -2131,6 +2142,10 @@ def run_loop(
                 # #669：claim 判定不可 claim 而**沒有**建立 run 的 work item。
                 status_payload["not_claimable"] = list(snapshot.get("not_claimable", []))
                 status_payload["workflow_waits"] = list(last_workflow_waits)
+                if isinstance(snapshot.get("monitor_config_warnings"), list):
+                    status_payload["monitor_config_warnings"] = list(
+                        snapshot["monitor_config_warnings"]
+                    )
                 contract.atomic_write_json(constants.status_path(), status_payload)
             except Exception as exc:  # noqa: BLE001
                 _log_error(exc)

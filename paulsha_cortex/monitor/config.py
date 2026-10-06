@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import logging
 import os
-import warnings
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -15,12 +15,21 @@ ENV_CONFIG_VAR = "PAULSHACLAW_CONFIG"
 NEW_ENV_CONFIG_VAR = "PSC_MONITOR_CONFIG"
 ALLOWED_LEGACY_POLICIES = ("list-only", "hide")
 _WARNED_DEPRECATIONS: set[str] = set()
+_WARNED_CONFIG_ADJUSTMENTS: set[str] = set()
+logger = logging.getLogger(__name__)
 
 
 def _warn_deprecated_once(key: str, _message: str) -> bool:
     if key in _WARNED_DEPRECATIONS:
         return False
     return True
+
+
+def _warn_config_adjustment_once(message: str) -> None:
+    if message in _WARNED_CONFIG_ADJUSTMENTS:
+        return
+    _WARNED_CONFIG_ADJUSTMENTS.add(message)
+    logger.warning("%s", message)
 
 
 def default_config_path() -> Path:
@@ -57,6 +66,7 @@ class MonitorConfig:
     thread_count_warn_threshold: int = 200
     github_refresh_interval_seconds: int = 300
     provider_stale_after_seconds: int = 900
+    configuration_warnings: tuple[str, ...] = ()
     repo_checkout_read_only: bool = False
     legacy_policy: str = "list-only"
     socket_path: Path = field(default_factory=default_socket_path)
@@ -231,11 +241,27 @@ def _load_manual_config(resolved: Path) -> MonitorConfig:
             "config.monitor.provider_stale_after_seconds must not exceed "
             f"claim provider freshness limit {PROVIDER_MAX_AGE_SECONDS}"
         )
-    if refresh_interval >= min(stale_after, PROVIDER_MAX_AGE_SECONDS):
-        raise ValueError(
-            "config.monitor.github_refresh_interval_seconds must be less than "
-            "the provider freshness limit"
+    freshness_limit = min(stale_after, PROVIDER_MAX_AGE_SECONDS)
+    configuration_warnings: tuple[str, ...] = ()
+    if refresh_interval >= freshness_limit:
+        if freshness_limit < 2:
+            raise ValueError(
+                "config.monitor.github_refresh_interval_seconds cannot be made "
+                "less than the provider freshness limit "
+                f"({freshness_limit} second)"
+            )
+        configured_refresh_interval = refresh_interval
+        # Keep one full half-window of margin so normal scheduling jitter and
+        # a delayed refresh cannot immediately cross the claim freshness bound.
+        refresh_interval = freshness_limit // 2
+        warning = (
+            "config.monitor.github_refresh_interval_seconds="
+            f"{configured_refresh_interval} meets or exceeds the provider freshness limit "
+            f"{freshness_limit}; Monitor is using {refresh_interval} seconds "
+            "for this run without changing the saved config"
         )
+        configuration_warnings = (warning,)
+        _warn_config_adjustment_once(warning)
 
     socket_raw = monitor.get("socket_path")
     socket_path = (
@@ -255,8 +281,9 @@ def _load_manual_config(resolved: Path) -> MonitorConfig:
         rescan_interval_seconds=rescan_interval,
         watch_debounce_ms=debounce,
         thread_count_warn_threshold=intervals["thread_count_warn_threshold"],
-        github_refresh_interval_seconds=intervals["github_refresh_interval_seconds"],
+        github_refresh_interval_seconds=refresh_interval,
         provider_stale_after_seconds=intervals["provider_stale_after_seconds"],
+        configuration_warnings=configuration_warnings,
         repo_checkout_read_only=_enabled("PSC_MONITOR_REPO_READONLY"),
         legacy_policy=legacy_policy,
         socket_path=socket_path,

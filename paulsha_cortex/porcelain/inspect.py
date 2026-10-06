@@ -87,6 +87,8 @@ def doctor_summary(
 def _print_status(status: dict[str, Any]) -> None:
     sys.stdout.write(f"updated_at: {status.get('updated_at')}\n")
     sys.stdout.write(f"degraded: {status.get('degraded')}\n")
+    for warning in status.get("monitor_config_warnings", []) or []:
+        sys.stdout.write(f"monitor_config_warning: {warning}\n")
     activity = status.get("activity")
     if isinstance(activity, dict):
         activity_state = (
