@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from paulsha_cortex.control import client as control_client, contract as control_contract
@@ -499,9 +500,38 @@ class WorkActionFlagTests(unittest.TestCase):
                     **_kwargs,
                 ):
                     run = workflow_starter(object(), "claim:v1:" + "1" * 64, None)
-                    result = {"action": args["action"], "run": run.to_dict()}
-                    if args["action"] == "intake":
-                        result["resolved_model_chain"] = resolved_chain
+                    if args["action"] != "intake":
+                        return {"action": args["action"], "run": run.to_dict()}
+                    authority = SimpleNamespace(
+                        repo=args["repo"],
+                        work_id=args["work_id"],
+                        mapped_issues=(1,),
+                        mapped_todo_paths=(),
+                        confirmed_todo=None,
+                    )
+                    with (
+                        mock.patch.object(
+                            coordinator_work_actions,
+                            "_claim_action",
+                            return_value={"action": "claim", "run": run.to_dict()},
+                        ),
+                        mock.patch.object(
+                            coordinator_work_actions,
+                            "resolve_model_chain",
+                            return_value=resolved_chain,
+                        ) as resolve_model_chain,
+                    ):
+                        result = coordinator_work_actions._intake_action(
+                            args=args,
+                            authority=authority,
+                            requested_by=requested_by,
+                            now_epoch=0,
+                            state_path=Path("unused-runs.json"),
+                            snapshot_path=None,
+                            workflow_registry=workflow_registry,
+                            workflow_starter=workflow_starter,
+                        )
+                        resolve_model_chain.assert_called_once_with(expected_override)
                     return result
 
                 with tempfile.TemporaryDirectory() as root:
@@ -556,10 +586,12 @@ class WorkActionFlagTests(unittest.TestCase):
                     captured["start_kwargs"]["model_chain_override"], expected_override
                 )
                 expected_output = {
-                    "action": action,
+                    "action": "claim" if action == "intake" else action,
                     "run": {"model_chain_override": expected_override},
                 }
                 if action == "intake":
+                    expected_output["linked"] = False
+                    expected_output["link_result"] = None
                     expected_output["resolved_model_chain"] = resolved_chain
                 self.assertEqual(
                     json.loads(stdout.getvalue()),
@@ -626,6 +658,58 @@ class WorkActionFlagTests(unittest.TestCase):
             "只支援 work start／intake／rechain／supersede-attempt",
             error.getvalue(),
         )
+        parser = _build_parser()
+        root_subcommands = next(action for action in parser._actions if action.dest == "cmd")
+        work_parser = root_subcommands.choices["work"]
+        registered_flags = {
+            option
+            for action in work_parser._actions
+            for option in action.option_strings
+        }
+        expected_flags = tuple(
+            f"--{field.replace('_', '-')}" for field in cli._WORK_MODEL_CHAIN_FIELDS
+        )
+        self.assertTrue(set(expected_flags).issubset(registered_flags))
+        self.assertIn("／".join(expected_flags), error.getvalue())
+        self.assertNotIn("--planner_executor", error.getvalue())
+
+    def test_work_resume_preserves_model_chain_payload_fields(self) -> None:
+        submitted = []
+
+        with tempfile.TemporaryDirectory() as root:
+            payload = Path(root) / "payload.json"
+            payload.write_text(
+                json.dumps(
+                    {
+                        "builder_executor": "codex",
+                        "builder_model": "gpt-6-luna",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with redirect_stdout(io.StringIO()):
+                rc = cli.main(
+                    [
+                        "work",
+                        "resume",
+                        "demo",
+                        "--repo",
+                        "acme/demo",
+                        "--payload",
+                        str(payload),
+                    ],
+                    control_read_status=lambda: {"degraded": False},
+                    control_submit_request=lambda kind, args, actor: submitted.append(args)
+                    or "request-3",
+                    control_poll_done=lambda *_args, **_kwargs: {
+                        "status": "ok",
+                        "result": {"action": "resume"},
+                    },
+                )
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(submitted[0]["builder_executor"], "codex")
+        self.assertEqual(submitted[0]["builder_model"], "gpt-6-luna")
 
     def test_work_start_rejects_conflicting_model_chain_payload(self) -> None:
         submitted = []

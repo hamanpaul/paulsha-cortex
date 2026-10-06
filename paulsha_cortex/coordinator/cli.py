@@ -38,7 +38,9 @@ _WORK_MODEL_CHAIN_FIELDS = tuple(
     for persona in ("planner", "builder", "reviewer")
     for suffix in ("executor", "model")
 )
-_WORK_MODEL_CHAIN_FLAG_LABEL = "／".join(f"--{field}" for field in _WORK_MODEL_CHAIN_FIELDS)
+_WORK_MODEL_CHAIN_FLAG_LABEL = "／".join(
+    f"--{field.replace('_', '-')}" for field in _WORK_MODEL_CHAIN_FIELDS
+)
 _WORK_MODEL_CHAIN_ACTION_LABEL = "／".join(_WORK_MODEL_CHAIN_ACTIONS)
 
 
@@ -84,6 +86,12 @@ def _work_action_model_chain_args(
         value = getattr(args, field, None)
         if value is not None:
             model_chain_args[field] = value
+    if args.action not in _WORK_MODEL_CHAIN_ACTIONS:
+        if model_chain_args:
+            raise ValueError(
+                f"錯誤: {_WORK_MODEL_CHAIN_FLAG_LABEL} 只支援 work {_WORK_MODEL_CHAIN_ACTION_LABEL}。"
+            )
+        return None
     if payload is not None:
         for field in _WORK_MODEL_CHAIN_FIELDS:
             if field not in payload:
@@ -95,10 +103,6 @@ def _work_action_model_chain_args(
             model_chain_args[field] = value
     if not model_chain_args:
         return None
-    if args.action not in _WORK_MODEL_CHAIN_ACTIONS:
-        raise ValueError(
-            f"錯誤: {_WORK_MODEL_CHAIN_FLAG_LABEL} 只支援 work {_WORK_MODEL_CHAIN_ACTION_LABEL}。"
-        )
     return model_chain_args
 
 
