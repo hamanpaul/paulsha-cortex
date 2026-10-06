@@ -191,7 +191,7 @@ class FilesystemSeamBackend:
             "cgroup_v2": True,
             "acl": True,
             "disk_free_bytes": 2 * 1024 * 1024 * 1024,
-            "universal_nopasswd": False,
+            "cortex_account_universal_nopasswd": {"accounts": [], "unproven": None},
             # 安裝當下 durable registry 還不存在：由正式 reader 讀出 0。
             "in_flight_jobs": install_backend._durable_in_flight_job_count(plan),
             "services": {service: "inactive" for service in _SERVICES},

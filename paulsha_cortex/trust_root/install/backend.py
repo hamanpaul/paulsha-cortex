@@ -22,6 +22,7 @@ import tarfile
 import tempfile
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
@@ -2156,23 +2157,141 @@ def _sudoers_commands_are_universal(commands: object) -> tuple[bool, bool]:
     return True, universal
 
 
-def _sudoers_document_has_universal_noauth(document: object) -> bool:
-    """Evaluate only validated, alias-expanded cvtsudoers JSON."""
+class _SudoersUnproven(Exception):
+    """sudoers 狀態無法判定；訊息是給 operator 看的原因（一律 fail closed）。"""
+
+
+@dataclass(frozen=True)
+class _SudoersPrincipal:
+    """一個 plan 宣告的 cortex 帳號在 sudoers user-spec 裡可能被指到的所有身分。"""
+
+    name: str
+    uids: frozenset[int]
+    gids: frozenset[int]
+    # sudoers 預設 case_insensitive_user／case_insensitive_group，名稱一律 casefold 比對。
+    groups: frozenset[str]
+
+
+def _is_account_id(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _cortex_sudoers_principals(
+    desired_accounts: Sequence[object],
+    *,
+    passwd_records: Sequence[object],
+    group_records: Sequence[object],
+) -> tuple[_SudoersPrincipal, ...]:
+    """plan 的四個 principal＋service 帳號，連同 uid、primary／supplementary 群組。
+
+    帳號可能還沒建立（fresh install），所以 uid／gid 以 plan 宣告為準，再併入主機上
+    同名帳號的實際值；primary 群組名稱含帳號同名群組（installer 以此建立）與主機上
+    持有該 gid 的所有群組名，supplementary 群組取 `gr_mem` 列出該帳號者——帳號
+    建立後就會成為其成員。
+    """
+
+    principals: list[_SudoersPrincipal] = []
+    for row in desired_accounts:
+        if not isinstance(row, Mapping) or not isinstance(row.get("name"), str):
+            continue
+        name = str(row["name"])
+        uids = {value for value in (row.get("uid"),) if _is_account_id(value)}
+        gids = {value for value in (row.get("gid"),) if _is_account_id(value)}
+        for record in passwd_records:
+            if getattr(record, "pw_name", None) == name:
+                uids.add(int(getattr(record, "pw_uid")))
+                gids.add(int(getattr(record, "pw_gid")))
+        for record in group_records:
+            if name in (getattr(record, "gr_mem", None) or ()):
+                gids.add(int(getattr(record, "gr_gid")))
+        groups = {name}
+        for record in group_records:
+            if getattr(record, "gr_gid", None) in gids:
+                groups.add(str(getattr(record, "gr_name")))
+        principals.append(
+            _SudoersPrincipal(
+                name=name,
+                uids=frozenset(uids),
+                gids=frozenset(gids),
+                groups=frozenset(group.casefold() for group in groups),
+            )
+        )
+    return tuple(principals)
+
+
+_SUDOERS_USER_NAME_KEYS = ("username", "usergroup", "netgroup", "nonunixgroup", "useralias")
+_SUDOERS_USER_ID_KEYS = ("userid", "usergid", "nonunixgid")
+
+
+def _sudoers_positive_user_entries(users: object) -> list[Mapping[str, object]]:
+    """驗 cvtsudoers User_List 的形狀，回傳非否定的成員。
+
+    否定成員（`!name`）只會把人排除；保守起見不採信排除，只看正向成員——
+    寧可多拒，也不因排除語意判讀錯誤而放行 cortex 帳號。`-e` 展開 `!ALIAS`
+    時會翻轉其成員的否定，展開後的正向成員因此仍代表會被涵蓋的身分。
+    """
+
+    if not isinstance(users, list) or not users:
+        raise _SudoersUnproven("cvtsudoers JSON has a missing or empty User_List")
+    positive: list[Mapping[str, object]] = []
+    for user in users:
+        if not isinstance(user, Mapping):
+            raise _SudoersUnproven("cvtsudoers JSON has a malformed User_List entry")
+        negated = user.get("negated", False)
+        if not isinstance(negated, bool):
+            raise _SudoersUnproven("cvtsudoers JSON has a malformed User_List entry")
+        for key in _SUDOERS_USER_NAME_KEYS:
+            if key in user and not isinstance(user[key], str):
+                raise _SudoersUnproven("cvtsudoers JSON has a malformed User_List entry")
+        for key in _SUDOERS_USER_ID_KEYS:
+            if key in user and not _is_account_id(user[key]):
+                raise _SudoersUnproven("cvtsudoers JSON has a malformed User_List entry")
+        if not negated:
+            positive.append(user)
+    return positive
+
+
+def _sudoers_user_entry_matches(
+    entry: Mapping[str, object], principal: _SudoersPrincipal
+) -> bool:
+    if "username" in entry:
+        value = str(entry["username"])
+        return value == "ALL" or value.casefold() == principal.name.casefold()
+    if "userid" in entry:
+        return entry["userid"] in principal.uids
+    if "usergroup" in entry:
+        return str(entry["usergroup"]).casefold() in principal.groups
+    if "usergid" in entry:
+        return entry["usergid"] in principal.gids
+    # netgroup、nonunixgroup／nonunixgid（group plugin）、未展開的 User_Alias
+    # 或其他不認得的形式：本機無法證明不含 cortex 帳號，一律視為涵蓋。
+    return True
+
+
+def _sudoers_universal_noauth_user_entries(
+    document: object,
+) -> list[list[Mapping[str, object]]]:
+    """每條「萬用主機＋萬用指令＋免認證」規則的正向 user 成員。
+
+    只評估 visudo 驗過、cvtsudoers `-e` 已展開別名的 JSON；不認得的形狀一律
+    `_SudoersUnproven`。runas 不縮小範圍：免認證成為 root 是提權，成為另一個
+    cortex 帳號是跨 principal 橫移，兩者都不允許。
+    """
 
     if not isinstance(document, Mapping):
-        return True
+        raise _SudoersUnproven("cvtsudoers JSON is not an object")
     defaults = document.get("Defaults", [])
     specs = document.get("User_Specs", [])
     if not isinstance(defaults, list) or not isinstance(specs, list):
-        return True
+        raise _SudoersUnproven("cvtsudoers JSON has malformed Defaults or User_Specs")
 
     default_noauth = False
     for default in defaults:
         if not isinstance(default, Mapping):
-            return True
+            raise _SudoersUnproven("cvtsudoers JSON has a malformed Defaults entry")
         valid, authenticate = _sudoers_authenticate_setting(default)
         if not valid:
-            return True
+            raise _SudoersUnproven("cvtsudoers JSON has a malformed Defaults entry")
         if default.get("Binding") is None and authenticate is not None:
             default_noauth = not authenticate
         elif authenticate is False:
@@ -2180,71 +2299,144 @@ def _sudoers_document_has_universal_noauth(document: object) -> bool:
             # PASSWD tag on the command spec proves otherwise.
             default_noauth = True
 
+    universal: list[list[Mapping[str, object]]] = []
     for spec in specs:
         if not isinstance(spec, Mapping):
-            return True
+            raise _SudoersUnproven("cvtsudoers JSON has a malformed User_Specs entry")
+        users = _sudoers_positive_user_entries(spec.get("User_List"))
         valid_hosts, universal_hosts = _sudoers_host_list_is_universal(
             spec.get("Host_List")
         )
         command_specs = spec.get("Cmnd_Specs")
         if not valid_hosts or not isinstance(command_specs, list):
-            return True
+            raise _SudoersUnproven("cvtsudoers JSON has a malformed User_Specs entry")
         if not universal_hosts:
             continue
         for command_spec in command_specs:
             if not isinstance(command_spec, Mapping):
-                return True
+                raise _SudoersUnproven("cvtsudoers JSON has a malformed Cmnd_Specs entry")
             valid_commands, universal_commands = _sudoers_commands_are_universal(
                 command_spec.get("Commands")
             )
             valid_auth, authenticate = _sudoers_authenticate_setting(command_spec)
             if not valid_commands or not valid_auth:
-                return True
+                raise _SudoersUnproven("cvtsudoers JSON has a malformed Cmnd_Specs entry")
             if universal_commands and (
                 authenticate is False
                 or (authenticate is None and default_noauth)
             ):
-                return True
-    return False
+                universal.append(users)
+    return universal
 
 
-def _universal_nopasswd(sudoers: Path = Path("/etc/sudoers")) -> bool:
+def _sudoers_document_verdict(
+    document: object, principals: Sequence[_SudoersPrincipal]
+) -> dict[str, object]:
+    """``{"accounts": [...], "unproven": None | 原因}``：哪些 cortex 帳號能免認證萬用 sudo。"""
+
+    try:
+        universal = _sudoers_universal_noauth_user_entries(document)
+    except _SudoersUnproven as exc:
+        return {"accounts": [], "unproven": str(exc)}
+    offenders = sorted(
+        {
+            principal.name
+            for users in universal
+            for principal in principals
+            if any(_sudoers_user_entry_matches(user, principal) for user in users)
+        }
+    )
+    return {"accounts": offenders, "unproven": None}
+
+
+# visudo／cvtsudoers 只從這組固定的系統目錄解析，不看 process PATH：Ubuntu 的
+# visudo 在 `/usr/sbin`，而 runbook 或 service 的 PATH 常常沒有它（9900X adoption
+# 因此誤報「universal NOPASSWD」）；PATH 上的同名程式也不該左右 root 的判定。
+_SUDOERS_TOOL_DIRECTORIES: tuple[str, ...] = ("/usr/sbin", "/usr/bin", "/sbin", "/bin")
+
+
+def _sudoers_tool(name: str) -> str | None:
+    for directory in _SUDOERS_TOOL_DIRECTORIES:
+        candidate = os.path.join(directory, name)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _sudoers_tool_reason(result: subprocess.CompletedProcess[str]) -> str:
+    lines = (result.stderr or "").strip().splitlines()
+    return f" ({lines[0][:200]})" if lines else ""
+
+
+def _sudoers_policy_document(sudoers: Path) -> object:
+    """visudo -c 驗過、cvtsudoers `-f json -e` 展開別名（含 include）後的整份 policy。"""
+
     try:
         observed = sudoers.lstat()
-    except OSError:
-        return True
+    except OSError as exc:
+        raise _SudoersUnproven(f"cannot inspect {sudoers}") from exc
     if sudoers.is_symlink() or not sudoers.is_absolute() or not stat.S_ISREG(
         observed.st_mode
     ):
-        return True
-    visudo = shutil.which("visudo")
-    converter = shutil.which("cvtsudoers")
-    if visudo is None or converter is None:
-        return True
+        raise _SudoersUnproven(f"{sudoers} is not an absolute regular file")
+    searched = ", ".join(_SUDOERS_TOOL_DIRECTORIES)
+    visudo = _sudoers_tool("visudo")
+    if visudo is None:
+        raise _SudoersUnproven(f"visudo not found in {searched}")
+    converter = _sudoers_tool("cvtsudoers")
+    if converter is None:
+        raise _SudoersUnproven(f"cvtsudoers not found in {searched}")
     environment = {"LANG": "C", "LC_ALL": "C", "PATH": os.defpath}
     try:
-        validated = _run(
-            (visudo, "-c", "-f", str(sudoers)),
-            env=environment,
-        )
-    except OSError:
-        return True
+        validated = _run((visudo, "-c", "-f", str(sudoers)), env=environment)
+    except OSError as exc:
+        raise _SudoersUnproven(f"cannot run {visudo}") from exc
     if validated.returncode != 0:
-        return True
+        raise _SudoersUnproven(
+            f"visudo -c rejected {sudoers}{_sudoers_tool_reason(validated)}"
+        )
     try:
         converted = _run(
-            (converter, "-f", "json", "-e", str(sudoers)),
-            env=environment,
+            (converter, "-f", "json", "-e", str(sudoers)), env=environment
         )
-    except OSError:
-        return True
+    except OSError as exc:
+        raise _SudoersUnproven(f"cannot run {converter}") from exc
     if converted.returncode != 0:
-        return True
+        raise _SudoersUnproven(
+            f"cvtsudoers could not convert {sudoers}{_sudoers_tool_reason(converted)}"
+        )
     try:
-        document = json.loads(converted.stdout)
-    except (TypeError, json.JSONDecodeError):
-        return True
-    return _sudoers_document_has_universal_noauth(document)
+        return json.loads(converted.stdout)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise _SudoersUnproven(
+            f"cvtsudoers output for {sudoers} is not valid JSON"
+        ) from exc
+
+
+def _cortex_account_universal_nopasswd(
+    desired_accounts: Sequence[object],
+    *,
+    passwd_records: Sequence[object],
+    group_records: Sequence[object],
+    sudoers: Path = Path("/etc/sudoers"),
+) -> dict[str, object]:
+    """plan 宣告的 cortex 帳號中，哪些能免認證以萬用指令 sudo（#1122 owner 裁決）。
+
+    只有對 cortex 帳號生效的萬用免密碼規則會讓 model job 變成 root；operator 等
+    其他帳號的 `NOPASSWD: ALL` 放行。sudoers 狀態無法判定時 ``unproven`` 帶原因，
+    preflight 據此 fail closed。
+    """
+
+    principals = _cortex_sudoers_principals(
+        desired_accounts,
+        passwd_records=passwd_records,
+        group_records=group_records,
+    )
+    try:
+        document = _sudoers_policy_document(sudoers)
+    except _SudoersUnproven as exc:
+        return {"accounts": [], "unproven": str(exc)}
+    return _sudoers_document_verdict(document, principals)
 
 
 def _password_locked(name: str) -> bool | None:
@@ -3934,7 +4126,11 @@ class LocalInstallBackend:
             "cgroup_v2": Path("/sys/fs/cgroup/cgroup.controllers").is_file(),
             "acl": shutil.which("getfacl") is not None and shutil.which("setfacl") is not None,
             "disk_free_bytes": disk_free,
-            "universal_nopasswd": _universal_nopasswd(),
+            "cortex_account_universal_nopasswd": _cortex_account_universal_nopasswd(
+                desired_accounts,
+                passwd_records=passwd_records,
+                group_records=group_records,
+            ),
             "in_flight_jobs": _in_flight_process_count(desired_accounts)
             + _durable_in_flight_job_count(plan),
             "services": services,
