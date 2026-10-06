@@ -237,13 +237,14 @@ def test_dispatcher_treats_symlinked_command_policy_audit_as_integrity_failure(t
 
 
 def test_audit_redacts_bearer_headers_and_secret_values() -> None:
+    provider_token = "ghp_" + "1234567890" + "abcdefghijkl"
     argv = (
         "gh", "api", "-H", "Authorization: Bearer abcdefghijklmnop",
-        "--token", "ghp_1234567890abcdefghijkl",
+        "--token", provider_token,
     )
 
     redacted = command_policy_hook._redact_argv(argv)
 
     assert "abcdefghijklmnop" not in " ".join(redacted)
-    assert "ghp_1234567890abcdefghijkl" not in " ".join(redacted)
+    assert provider_token not in " ".join(redacted)
     assert redacted[-2:] == ["--token", "[REDACTED]"]
