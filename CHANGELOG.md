@@ -10,6 +10,9 @@
 ### Fixed
 
 - **#1306 gate／review 自動恢復**：Manager 對 gate contradiction 與 blocking review findings 以已驗證的 exact candidate 自動 retry-build，將測試摘要／review findings 帶入下一次 build，並持久記錄每 run 的重試上限、嘗試原因與 builder 轉換；預設每位 builder 可重試 2 次，可在建立 run 時以 `PSC_WORKFLOW_AUTO_RETRY_LIMIT` 設定 0–10，此設定只控制 gate／review recovery，provider-failure retry 仍維持獨立的固定上限 2。重試或獨立 builder 用盡才轉 `needs_human`；已知 permission／sandbox executor 錯誤可提前換派合格 builder。verify／review 階段 rechain 會回到 build 並重設下游檢查；`status` 與 `work show` 顯示次數、額度與換派紀錄（見 `changelog.d/auto-retry-fallback.md`）（#1306）。
+- **cortex 進件：派工穩定性第二批 #1311–#1314、#1319–#1321**：登記七個 work item 與 accepted todo，交給 cortex 平行派工（見 `changelog.d/cortex-intake-batch-20261006c.md`）。
+- **#1297 copilot 健康檢查程序逾時後連同子程序一起回收**：`paulsha_cortex/coordinator/executor_auth.py` 與 `paulsha_cortex/porcelain/bootstrap.py` 的 probe 改共用 `run_probe` runner；一律在獨立 session／process group 執行（`start_new_session=True`），逾時或發生例外時對整個 process group 先送 SIGTERM、短暫等待後送 SIGKILL 並等待回收，防止 node wrapper 終止後 native `copilot-linux-x64` 子程序殘留（見 `changelog.d/copilot-probe-reap.md`）（#1297）。
+- **cortex 進件：#1309 task-memory 逐則處置回報**：登記 work item `task-memory-disposition` 與 accepted todo，交給 cortex 派工（見 `changelog.d/cortex-intake-task-memory-disposition.md`）。
 - **cortex 進件：派工穩定性 #1302–#1307**：登記六個 work item 與 accepted todo，交給 cortex 平行派工（見 `changelog.d/cortex-intake-dispatch-stability.md`）。
 - **cortex 進件：#1282 審查後續／#1296／#1297**：登記三個 work item 與 accepted todo，交給 cortex 平行派工（見 `changelog.d/cortex-intake-batch-20261006b.md`）。
 - **撤回 v0.1.14**：該版升級會在 verify 失敗（#1295）且仍封存 agent 執行檔（#1293）；release 與 tag 已刪除，`VERSION` 與 runbook 版本字串改回 0.1.13，修完後重新發布 0.1.14（見 `changelog.d/withdraw-release-0-1-14.md`）。
