@@ -8,7 +8,7 @@ owner 裁決（2026-09-29）「union＋重試用當下 main」：
 2. main-sync stop 後的 `retry-build` 在下達當下重新取得 origin/main，把「當下的
    M」寫進新的 evidence、修復指令與 run 綁定；harvest 以 quarantine ref 驗證修復
    候選是該 M 的後代，停機 evidence 原樣保留作稽核。
-3. clean-behind 仍停在 needs_human（本票不改）。
+3. clean-behind 停止時的 retry-build fallback（本檔經共用 helper 明確停用 autosync）。
 
 全部以真 git 驗證（bare origin、bundle、merge-tree），不以假 runner 冒充。
 """

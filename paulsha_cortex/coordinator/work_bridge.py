@@ -70,7 +70,13 @@ MAIN_SYNC_RETRY_PIN_REF_PREFIX = "refs/cortex/main-sync"
 #: #1142：harvest 先把 bundle 的 branch 收進這條 run-scoped quarantine ref，驗過
 #: 「候選是 retry 當下 M 的後代」才交給 `harvest_branch()` 推進 feature ref。
 MAIN_SYNC_QUARANTINE_REF_PREFIX = "refs/cortex/main-sync-quarantine"
+MAIN_SYNC_AUTOSYNC_PIN_REF_PREFIX = "refs/cortex/main-sync-autosync"
 MAIN_SYNC_RETRY_EVIDENCE_SCHEMA = "cortex-main-sync-retry/v1"
+MAIN_SYNC_AUTOSYNC_EVIDENCE_SCHEMA = "cortex-main-sync-autosync/v1"
+MAIN_SYNC_AUTOSYNC_REASON = "main-sync-autosync-reverify"
+MAIN_SYNC_AUTOSYNC_MAX_DEFAULT = 3
+MAIN_SYNC_AUTOSYNC_MAX_BOUND = 10
+MAIN_SYNC_AUTOSYNC_TIMEOUT_SECONDS = 120.0
 _MAIN_SYNC_REF_SEGMENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 
 
@@ -1354,11 +1360,182 @@ def _main_sync_stop_result(
     }
 
 
+def _main_sync_autosync_limit() -> int:
+    raw = os.environ.get("PSC_MAIN_SYNC_AUTOSYNC_MAX")
+    if raw is None:
+        return MAIN_SYNC_AUTOSYNC_MAX_DEFAULT
+    if re.fullmatch(r"(?:0|[1-9][0-9]{0,2})", raw) is None:
+        raise ValueError("PSC_MAIN_SYNC_AUTOSYNC_MAX must be an integer from 0 to 10")
+    value = int(raw)
+    if value > MAIN_SYNC_AUTOSYNC_MAX_BOUND:
+        raise ValueError("PSC_MAIN_SYNC_AUTOSYNC_MAX must be an integer from 0 to 10")
+    return value
+
+
+def _read_main_sync_autosync_events(
+    *, state_root: Path, run_id: str, evidence_refs: Iterable[str]
+) -> list[dict[str, object]]:
+    directory = state_root.resolve() / "evidence" / "main-sync-autosync"
+    if directory.is_symlink():
+        raise RuntimeError("main-sync autosync evidence directory is a symlink")
+    events: list[dict[str, object]] = []
+    required = {
+        "schema",
+        "run_id",
+        "outcome",
+        "sync_number",
+        "candidate_before",
+        "main_head",
+        "candidate_after",
+        "review_candidate",
+        "review_evidence_ref",
+        "review_evidence_hash",
+    }
+    optional = {"failure_reason", "failure_detail", "observed_main_head", "limit"}
+    allowed_outcomes = {
+        "merged",
+        "limit-exceeded",
+        "autosync-disabled",
+        "autosync-limit-invalid",
+        "main-advanced-during-sync",
+        "merge-failed",
+        "harvest-failed",
+    }
+    for reference in evidence_refs:
+        if not isinstance(reference, str) or "/evidence/main-sync-autosync/" not in reference:
+            continue
+        path = Path(reference)
+        if (
+            not path.is_absolute()
+            or path.parent != directory
+            or path.is_symlink()
+            or not path.is_file()
+            or re.fullmatch(r"[0-9a-f]{64}\.json", path.name) is None
+        ):
+            raise RuntimeError("main-sync autosync evidence reference is invalid")
+        try:
+            envelope = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("main-sync autosync evidence is unreadable") from exc
+        payload = envelope.get("payload") if isinstance(envelope, dict) else None
+        if (
+            not isinstance(envelope, dict)
+            or set(envelope) != {"payload", "hash"}
+            or not isinstance(payload, dict)
+            or not required <= set(payload)
+            or set(payload) - required - optional
+            or payload.get("schema") != MAIN_SYNC_AUTOSYNC_EVIDENCE_SCHEMA
+            or payload.get("run_id") != run_id
+            or payload.get("outcome") not in allowed_outcomes
+            or isinstance(payload.get("sync_number"), bool)
+            or not isinstance(payload.get("sync_number"), int)
+            or payload["sync_number"] < 1
+            or not isinstance(payload.get("review_evidence_ref"), str)
+            or not payload["review_evidence_ref"]
+            or not isinstance(payload.get("review_evidence_hash"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", payload["review_evidence_hash"]) is None
+        ):
+            raise RuntimeError("main-sync autosync evidence payload is malformed")
+        for key in ("candidate_before", "review_candidate", "main_head"):
+            value = payload.get(key)
+            if not isinstance(value, str) or MAIN_SYNC_FULL_OBJECT_ID_RE.fullmatch(value) is None:
+                raise RuntimeError("main-sync autosync evidence object id is malformed")
+        after = payload.get("candidate_after")
+        if payload["outcome"] == "merged":
+            if not isinstance(after, str) or MAIN_SYNC_FULL_OBJECT_ID_RE.fullmatch(after) is None:
+                raise RuntimeError("main-sync autosync result candidate is malformed")
+        elif after is not None:
+            raise RuntimeError("failed main-sync autosync evidence has a candidate result")
+        observed = payload.get("observed_main_head")
+        if observed is not None and (
+            not isinstance(observed, str)
+            or MAIN_SYNC_FULL_OBJECT_ID_RE.fullmatch(observed) is None
+        ):
+            raise RuntimeError("main-sync autosync observed main id is malformed")
+        limit_value = payload.get("limit")
+        if limit_value is not None and (
+            isinstance(limit_value, bool)
+            or not isinstance(limit_value, int)
+            or not 0 <= limit_value <= MAIN_SYNC_AUTOSYNC_MAX_BOUND
+        ):
+            raise RuntimeError("main-sync autosync limit is malformed")
+        digest = verification.canonical_json_hash(payload)
+        if envelope.get("hash") != digest or path.stem != digest:
+            raise RuntimeError("main-sync autosync evidence hash mismatch")
+        events.append(dict(payload))
+    return events
+
+
+def _main_sync_autosync_chain(
+    *,
+    events: Iterable[Mapping[str, object]],
+    candidate: str,
+    review_ref: str,
+    review_hash: str,
+    source_repo: str | Path,
+) -> list[dict[str, object]]:
+    successful = [
+        dict(event)
+        for event in events
+        if event.get("outcome") == "merged"
+        and event.get("review_evidence_ref") == review_ref
+        and event.get("review_evidence_hash") == review_hash
+    ]
+    expected = candidate.lower()
+    reverse_chain: list[dict[str, object]] = []
+    for event in reversed(successful):
+        after = str(event["candidate_after"]).lower()
+        if after != expected:
+            if reverse_chain:
+                break
+            continue
+        reverse_chain.append(event)
+        expected = str(event["candidate_before"]).lower()
+    if not reverse_chain:
+        return []
+    chain = list(reversed(reverse_chain))
+    first = chain[0]
+    original_review_candidate = str(first["review_candidate"]).lower()
+    if (
+        str(first["candidate_before"]).lower() != original_review_candidate
+        or any(str(event["review_candidate"]).lower() != original_review_candidate for event in chain)
+        or any(
+            str(chain[index]["candidate_after"]).lower()
+            != str(chain[index + 1]["candidate_before"]).lower()
+            for index in range(len(chain) - 1)
+        )
+    ):
+        raise RuntimeError("main-sync autosync candidate chain is discontinuous")
+    repo = str(source_repo)
+    for event in chain:
+        candidate_after = str(event["candidate_after"]).lower()
+        expected_parents = [
+            candidate_after,
+            str(event["candidate_before"]).lower(),
+            str(event["main_head"]).lower(),
+        ]
+        parents = subprocess.run(
+            ["git", "-C", repo, "rev-list", "--parents", "-n", "1", candidate_after],
+            shell=False,
+            capture_output=True,
+            text=True,
+            timeout=MAIN_SYNC_PROBE_TIMEOUT_SECONDS,
+        )
+        if parents.returncode != 0 or parents.stdout.strip().lower().split() != expected_parents:
+            raise RuntimeError("main-sync autosync merge ancestry is invalid")
+    return chain
+
+
 def main_sync_run_ref(prefix: str, run_id: str) -> str:
     """#1142：main-sync 在來源樹上的 run-scoped ref 名（pin／quarantine 共用推導）。"""
 
     if (
-        prefix not in {MAIN_SYNC_RETRY_PIN_REF_PREFIX, MAIN_SYNC_QUARANTINE_REF_PREFIX}
+        prefix
+        not in {
+            MAIN_SYNC_RETRY_PIN_REF_PREFIX,
+            MAIN_SYNC_QUARANTINE_REF_PREFIX,
+            MAIN_SYNC_AUTOSYNC_PIN_REF_PREFIX,
+        }
         or not isinstance(run_id, str)
         or _MAIN_SYNC_REF_SEGMENT_RE.fullmatch(run_id) is None
     ):
@@ -1608,6 +1785,23 @@ def _builder_binding(
 
     from . import review
 
+    autosync_events = _read_main_sync_autosync_events(
+        state_root=state_root,
+        run_id=run.run_id,
+        evidence_refs=getattr(run, "evidence_refs", ()),
+    )
+    autosync_chain = _main_sync_autosync_chain(
+        events=autosync_events,
+        candidate=candidate,
+        review_ref=foreign_ref.ref,
+        review_hash=foreign_ref.sha256,
+        source_repo=run.workspace_root,
+    )
+    review_candidate = (
+        str(autosync_chain[0]["review_candidate"]).lower()
+        if autosync_chain
+        else candidate
+    )
     review_payload, review_job = _workflow_evidence_payload(
         registry=registry,
         state_root=state_root,
@@ -1615,12 +1809,13 @@ def _builder_binding(
         phase="review",
         expected_ref=foreign_ref.ref,
         expected_hash=foreign_ref.sha256,
+        expected_candidate=review_candidate,
     )
     evaluation = review.validate_gate_evaluation(review_payload)
     builder_job_id = evaluation.get("builder_job_id")
     if (
         evaluation.get("state") != "passed"
-        or evaluation.get("candidate") != candidate
+        or evaluation.get("candidate") != review_candidate
         or evaluation.get("reviewer_job_id") != review_job.get("job_id")
         or not isinstance(builder_job_id, str)
     ):
@@ -1644,7 +1839,7 @@ def _builder_binding(
         or not (normal_builder or manager_archive)
         or row.get("status") != "exited"
         or row.get("exit_code") != 0
-        or row.get("subject_head") != candidate
+        or row.get("subject_head") != review_candidate
     ):
         raise RuntimeError("delivery requires the reviewed exact-candidate builder job")
     branch = row.get("branch")
@@ -2459,6 +2654,7 @@ def _workflow_evidence_envelope(
     phase: str,
     expected_ref: str | None = None,
     expected_hash: str | None = None,
+    expected_candidate: str | None = None,
 ) -> tuple[dict, dict]:
     rows = [
         row
@@ -2470,7 +2666,9 @@ def _workflow_evidence_envelope(
         and isinstance(row.get("workflow_evidence"), dict)
         and (
             phase not in {"verify", "review"}
-            or row.get("subject_head") == run.candidate_head
+            or row.get("subject_head") == (
+                run.candidate_head if expected_candidate is None else expected_candidate
+            )
         )
     ]
     if expected_ref is not None:
@@ -2538,6 +2736,7 @@ def _workflow_evidence_payload(
     phase: str,
     expected_ref: str | None = None,
     expected_hash: str | None = None,
+    expected_candidate: str | None = None,
 ) -> tuple[dict, dict]:
     envelope, job = _workflow_evidence_envelope(
         registry=registry,
@@ -2546,6 +2745,7 @@ def _workflow_evidence_payload(
         phase=phase,
         expected_ref=expected_ref,
         expected_hash=expected_hash,
+        expected_candidate=expected_candidate,
     )
     payload = envelope["payload"]
     payload = dict(payload)
@@ -2893,6 +3093,7 @@ def build_production_ship_validator(
     """
 
     state_root = Path(coordinator_root).resolve()
+    autosync_contexts: dict[tuple[str, str], dict[str, object]] = {}
 
     def validate(*, run, candidate: str | None) -> dict[str, object]:
         terminal_refresh = (
@@ -2939,6 +3140,19 @@ def build_production_ship_validator(
             candidate=candidate,
             creator=workspace_creator,
         )
+
+        def main_sync_stop(probe):
+            stopped = _main_sync_stop_result(state_root=state_root, probe=probe)
+            if isinstance(probe, MainSyncProbe) and probe.relation == "clean-behind":
+                autosync_contexts[(run.run_id, candidate)] = {
+                    "probe": probe,
+                    "worktree": worktree,
+                    "branch": branch,
+                    "probe_evidence_ref": stopped["ref"],
+                    "probe_evidence_hash": stopped["hash"],
+                }
+            return stopped
+
         change = authority.mapped_openspec[0] if len(authority.mapped_openspec) == 1 else None
         active_change = worktree / "openspec" / "changes" / str(change) if change else None
         archive_applied = _manager_archive_applied(run, registry=registry)
@@ -3027,7 +3241,7 @@ def build_production_ship_validator(
                 timeout_seconds=probe_timeout_seconds,
             )
             if isinstance(probe, MainSyncProbeFailure) or probe.relation != "in-sync":
-                return _main_sync_stop_result(state_root=state_root, probe=probe)
+                return main_sync_stop(probe)
 
         def post_preflight_main_sync() -> dict[str, object] | None:
             probe = _probe_main_sync(
@@ -3037,7 +3251,7 @@ def build_production_ship_validator(
                 timeout_seconds=probe_timeout_seconds,
             )
             if isinstance(probe, MainSyncProbeFailure) or probe.relation != "in-sync":
-                return _main_sync_stop_result(state_root=state_root, probe=probe)
+                return main_sync_stop(probe)
             return None
 
         pr_numbers = []
@@ -3313,4 +3527,343 @@ def build_production_ship_validator(
             }
         return result
 
+    def main_sync_autosync(*, run, candidate: str, stop: Mapping[str, object]):
+        context_key = (str(run.run_id), candidate)
+        context = autosync_contexts.pop(context_key, None)
+        if not isinstance(context, dict):
+            return None
+        probe = context.get("probe")
+        worktree = context.get("worktree")
+        branch = context.get("branch")
+        if (
+            not isinstance(probe, MainSyncProbe)
+            or probe.relation != "clean-behind"
+            or probe.candidate.lower() != candidate.lower()
+            or not isinstance(worktree, Path)
+            or not isinstance(branch, str)
+            or not branch
+        ):
+            return None
+        foreign_refs = [ref for ref in run.gate_refs if ref.kind == "foreign-review"]
+        if len(foreign_refs) != 1 or not foreign_refs[0].sha256:
+            return None
+        foreign_ref = foreign_refs[0]
+        current = registry.get_workflow_run(run.run_id)
+        if (
+            current.current_phase != "review"
+            or current.candidate_head != candidate
+            or current.updated_at != run.updated_at
+        ):
+            return None
+
+        events = _read_main_sync_autosync_events(
+            state_root=state_root,
+            run_id=run.run_id,
+            evidence_refs=getattr(run, "evidence_refs", ()),
+        )
+        chain = _main_sync_autosync_chain(
+            events=events,
+            candidate=candidate,
+            review_ref=foreign_ref.ref,
+            review_hash=foreign_ref.sha256,
+            source_repo=run.workspace_root,
+        )
+        completed_count = sum(event.get("outcome") == "merged" for event in events)
+        review_candidate = (
+            str(chain[0]["review_candidate"]).lower() if chain else candidate.lower()
+        )
+
+        def write_attempt(
+            *,
+            outcome: str,
+            reason: str,
+            limit: int | None,
+            candidate_after: str | None = None,
+            observed_main_head: str | None = None,
+            failure_detail: str | None = None,
+        ) -> dict[str, object]:
+            payload: dict[str, object] = {
+                "schema": MAIN_SYNC_AUTOSYNC_EVIDENCE_SCHEMA,
+                "run_id": run.run_id,
+                "outcome": outcome,
+                "sync_number": completed_count + 1,
+                "candidate_before": candidate.lower(),
+                "main_head": probe.main_head.lower(),
+                "candidate_after": candidate_after,
+                "review_candidate": review_candidate,
+                "review_evidence_ref": foreign_ref.ref,
+                "review_evidence_hash": foreign_ref.sha256,
+                "failure_reason": reason,
+            }
+            if limit is not None:
+                payload["limit"] = limit
+            if observed_main_head is not None:
+                payload["observed_main_head"] = observed_main_head.lower()
+            if failure_detail:
+                payload["failure_detail"] = failure_detail[:500]
+            evidence = _write_json_evidence(
+                state_root,
+                "main-sync-autosync",
+                payload,
+            )
+            result: dict[str, object] = {
+                "outcome": outcome,
+                "reason": reason,
+                "count": completed_count,
+                "main_head": probe.main_head.lower(),
+                "candidate_before": candidate.lower(),
+                "review_candidate": review_candidate,
+                "review_evidence_ref": foreign_ref.ref,
+                "review_evidence_hash": foreign_ref.sha256,
+                "probe_evidence_ref": context.get("probe_evidence_ref"),
+                "probe_evidence_hash": context.get("probe_evidence_hash"),
+                "evidence_ref": evidence["ref"],
+                "evidence_hash": evidence["hash"],
+            }
+            if limit is not None:
+                result["limit"] = limit
+            if candidate_after is not None:
+                result["candidate_after"] = candidate_after.lower()
+                result["count"] = completed_count + 1
+            if observed_main_head is not None:
+                result["observed_main_head"] = observed_main_head.lower()
+            if failure_detail:
+                result["failure_detail"] = failure_detail[:500]
+            return result
+
+        try:
+            limit = _main_sync_autosync_limit()
+        except ValueError as exc:
+            result = write_attempt(
+                outcome="autosync-limit-invalid",
+                reason="candidate-behind-main",
+                limit=None,
+                failure_detail=str(exc),
+            )
+            return result
+        if limit == 0:
+            return write_attempt(
+                outcome="autosync-disabled",
+                reason="candidate-behind-main",
+                limit=limit,
+            )
+        if completed_count >= limit:
+            return write_attempt(
+                outcome="limit-exceeded",
+                reason="main-moving-too-fast",
+                limit=limit,
+            )
+
+        source_repo = Path(run.workspace_root)
+        pin_ref = main_sync_run_ref(MAIN_SYNC_AUTOSYNC_PIN_REF_PREFIX, run.run_id)
+
+        def run_git(args: list[str]):
+            return probe_runner(
+                [
+                    "git",
+                    "-c",
+                    "core.attributesFile=/dev/null",
+                    "-C",
+                    str(worktree),
+                    *args,
+                ],
+                shell=False,
+                capture_output=True,
+                text=True,
+                timeout=MAIN_SYNC_AUTOSYNC_TIMEOUT_SECONDS,
+                env=_main_sync_isolated_git_env(),
+            )
+
+        def clean_workspace() -> bool:
+            try:
+                return _reset_ship_workspace(worktree, branch=branch, candidate=candidate)
+            except Exception:
+                return False
+
+        fetch = None
+        observed_main = None
+        try:
+            _require_pristine_ship_workspace(
+                worktree,
+                branch=branch,
+                candidate=candidate,
+            )
+            fetch = run_git(
+                [
+                    "fetch",
+                    "--quiet",
+                    "--no-tags",
+                    "--no-write-fetch-head",
+                    "--refmap=",
+                    "origin",
+                    f"+refs/heads/main:{pin_ref}",
+                ]
+            )
+            if fetch.returncode != 0:
+                return write_attempt(
+                    outcome="merge-failed",
+                    reason="candidate-behind-main",
+                    limit=limit,
+                    failure_detail=(fetch.stderr or fetch.stdout or "main fetch failed"),
+                )
+            resolved = run_git(["rev-parse", "--verify", "--quiet", f"{pin_ref}^{{commit}}"])
+            observed_main = _main_sync_object_id(resolved.stdout)
+            if resolved.returncode != 0 or observed_main is None:
+                return write_attempt(
+                    outcome="merge-failed",
+                    reason="candidate-behind-main",
+                    limit=limit,
+                    failure_detail="fetched origin/main did not resolve to a full commit id",
+                )
+            if observed_main != probe.main_head.lower():
+                return write_attempt(
+                    outcome="main-advanced-during-sync",
+                    reason="candidate-behind-main",
+                    limit=limit,
+                    observed_main_head=observed_main,
+                    failure_detail="origin/main advanced after the clean-behind probe",
+                )
+            merged = run_git(
+                ["merge", "--no-edit", "--no-ff", "--no-stat", probe.main_head.lower()]
+            )
+            if merged.returncode != 0:
+                clean = clean_workspace()
+                detail = (merged.stderr or merged.stdout or "git merge failed").strip()
+                if not clean:
+                    detail = f"{detail}; ship workspace reset failed"
+                return write_attempt(
+                    outcome="merge-failed",
+                    reason="candidate-behind-main",
+                    limit=limit,
+                    failure_detail=detail,
+                )
+            head = run_git(["rev-parse", "HEAD"])
+            candidate_after = _main_sync_object_id(head.stdout)
+            parents = run_git(["rev-list", "--parents", "-n", "1", "HEAD"])
+            expected_parents = [
+                candidate_after,
+                candidate.lower(),
+                probe.main_head.lower(),
+            ]
+            if (
+                head.returncode != 0
+                or candidate_after is None
+                or parents.returncode != 0
+                or parents.stdout.strip().lower().split() != expected_parents
+            ):
+                clean = clean_workspace()
+                detail = "Manager merge did not produce the expected exact two-parent Candidate"
+                if not clean:
+                    detail += "; ship workspace reset failed"
+                return write_attempt(
+                    outcome="merge-failed",
+                    reason="candidate-behind-main",
+                    limit=limit,
+                    failure_detail=detail,
+                )
+
+            success_payload: dict[str, object] = {
+                "schema": MAIN_SYNC_AUTOSYNC_EVIDENCE_SCHEMA,
+                "run_id": run.run_id,
+                "outcome": "merged",
+                "sync_number": completed_count + 1,
+                "candidate_before": candidate.lower(),
+                "main_head": probe.main_head.lower(),
+                "candidate_after": candidate_after,
+                "review_candidate": review_candidate,
+                "review_evidence_ref": foreign_ref.ref,
+                "review_evidence_hash": foreign_ref.sha256,
+                "limit": limit,
+            }
+            success_evidence = _write_json_evidence(
+                state_root,
+                "main-sync-autosync",
+                success_payload,
+            )
+            job_id = registry.reserve_job_id(
+                _manager_ship_job_task(run=run, card="main-sync-autosync")
+            )
+            try:
+                _harvest_manager_ship_commit(
+                    state_root=state_root,
+                    run=run,
+                    worktree=worktree,
+                    branch=branch,
+                    spool_key=job_id,
+                    baseline=candidate,
+                    new_head=candidate_after,
+                )
+                _record_manager_ship_job(
+                    registry=registry,
+                    state_root=state_root,
+                    run=run,
+                    worktree=worktree,
+                    branch=branch,
+                    card="main-sync-autosync",
+                    old_head=candidate,
+                    new_head=candidate_after,
+                    job_id=job_id,
+                )
+            except Exception as exc:
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(source_repo),
+                        "update-ref",
+                        f"refs/heads/{branch}",
+                        candidate.lower(),
+                        candidate_after,
+                    ],
+                    shell=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=MAIN_SYNC_PROBE_TIMEOUT_SECONDS,
+                    env=_main_sync_isolated_git_env(),
+                )
+                clean = clean_workspace()
+                detail = f"main-sync Candidate harvest failed: {type(exc).__name__}: {exc}"
+                if not clean:
+                    detail += "; ship workspace reset failed"
+                return write_attempt(
+                    outcome="harvest-failed",
+                    reason="candidate-behind-main",
+                    limit=limit,
+                    failure_detail=detail,
+                )
+            return {
+                "outcome": "merged",
+                "reason": MAIN_SYNC_AUTOSYNC_REASON,
+                "count": completed_count + 1,
+                "limit": limit,
+                "main_head": probe.main_head.lower(),
+                "candidate_before": candidate.lower(),
+                "candidate_after": candidate_after,
+                "review_candidate": review_candidate,
+                "review_evidence_ref": foreign_ref.ref,
+                "review_evidence_hash": foreign_ref.sha256,
+                "probe_evidence_ref": context.get("probe_evidence_ref"),
+                "probe_evidence_hash": context.get("probe_evidence_hash"),
+                "evidence_ref": success_evidence["ref"],
+                "evidence_hash": success_evidence["hash"],
+            }
+        except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
+            clean = clean_workspace()
+            detail = f"{type(exc).__name__}: {exc}"
+            if not clean:
+                detail += "; ship workspace reset failed"
+            return write_attempt(
+                outcome="merge-failed",
+                reason="candidate-behind-main",
+                limit=limit,
+                observed_main_head=observed_main,
+                failure_detail=detail,
+            )
+        finally:
+            try:
+                run_git(["update-ref", "-d", pin_ref])
+            except Exception:
+                pass
+
+    setattr(validate, "main_sync_autosync", main_sync_autosync)
     return validate
