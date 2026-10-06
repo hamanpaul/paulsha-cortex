@@ -132,6 +132,75 @@ def test_resolve_model_chain_with_builder_override() -> None:
     assert resolved["reviewer"]["executor"] == "claude"
 
 
+def test_intake_preview_and_dispatch_share_primary_planner_and_domain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preview = work_bridge.resolve_model_chain(
+        None, identity_registry=_BUILDER_IDENTITIES
+    )
+    preview_planner = next(
+        identity
+        for identity in _BUILDER_IDENTITIES.identities
+        if identity.executor == preview["planner"]["executor"]
+        and identity.model_id == preview["planner"]["model_id"]
+    )
+    captured: dict[str, object] = {}
+
+    authority = SimpleNamespace(
+        repo="owner/repo",
+        work_id="intake-model-flags",
+        mapped_openspec=("per-work-model-chain",),
+        mapped_issues=(1296,),
+        mapped_prs=(),
+    )
+    registry = SimpleNamespace(get_workflow_run=lambda _run_id: "started-run")
+    manifest = SimpleNamespace(combo="feature-oneshot", steps=())
+
+    monkeypatch.setattr(work_bridge, "_claimable_existing_runs", lambda *_args: [])
+    monkeypatch.setattr(work_bridge, "_other_owner_ongoing_runs", lambda *_args: [])
+    monkeypatch.setattr(
+        work_bridge, "resolve_trusted_repo_root", lambda *_args, **_kwargs: tmp_path
+    )
+    monkeypatch.setattr(work_bridge, "load_cards", lambda *_args: object())
+    monkeypatch.setattr(work_bridge, "_combo_catalog", lambda *_args: object())
+    monkeypatch.setattr(work_bridge, "load_task_types", lambda **_kwargs: object())
+    monkeypatch.setattr(work_bridge, "mapped_issue_titles", lambda _authority: ())
+    monkeypatch.setattr(
+        work_bridge,
+        "select_combo",
+        lambda *_args, **_kwargs: SimpleNamespace(combo_id="feature-oneshot"),
+    )
+    monkeypatch.setattr(
+        work_bridge, "default_workflow_manifest", lambda *_args, **_kwargs: manifest
+    )
+    monkeypatch.setattr(work_bridge, "work_authority_digest", lambda _authority: "digest")
+    monkeypatch.setattr(work_bridge, "_artifact_rows", lambda *_args: [])
+    monkeypatch.setattr(
+        work_bridge, "current_sizing_snapshot", lambda **_kwargs: (None, None)
+    )
+    monkeypatch.setattr(work_bridge, "_write_manifest", lambda *_args: tmp_path / "manifest.json")
+    monkeypatch.setattr(work_bridge, "_combo_selection_payload", lambda _selection: {})
+
+    def apply_workflow_action(_registry, *, args, **_kwargs):
+        captured.update(args)
+        return {"run_id": "run-1"}
+
+    monkeypatch.setattr(manager, "apply_workflow_action", apply_workflow_action)
+
+    result = work_bridge.start_canonical_workflow(
+        registry=registry,
+        authority=authority,
+        claim_key="claim-key",
+        coordinator_root=tmp_path,
+        identity_registry=_BUILDER_IDENTITIES,
+    )
+
+    assert result == "started-run"
+    assert captured["primary_executor"] == preview["planner"]["executor"]
+    assert captured["primary_model"] == preview["planner"]["model_id"]
+    assert captured["primary_domain"] == preview_planner.independence_domain
+
+
 def test_override_applies_to_target_run_only() -> None:
     """R1：為某 run 指定 builder 模型後，其他 active run 尚未派出的 card 選擇
     結果不變（跟一份完全沒有覆寫的 identities 選出來的結果一致）。"""

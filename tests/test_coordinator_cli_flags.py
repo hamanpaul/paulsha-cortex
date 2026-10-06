@@ -19,6 +19,7 @@ from paulsha_cortex.coordinator import (
 )
 from paulsha_cortex.coordinator.cli import _build_parser, _refuse_unsafe_fanout, _resolve_launcher
 from paulsha_cortex.coordinator.launcher import SubprocessLauncher
+from paulsha_cortex.coordinator.model_identities import IdentityRegistry
 from paulsha_cortex.coordinator.registry import JobRegistry
 
 
@@ -473,6 +474,46 @@ class WorkActionFlagTests(unittest.TestCase):
                 "model_id": "reviewer-anthropic",
             },
         }
+        identity_registry = IdentityRegistry.from_rows(
+            [
+                {
+                    "executor": "codex",
+                    "model_id": "spark",
+                    "independence_domain": "openai",
+                    "capabilities": ["build"],
+                },
+                {
+                    "executor": "codex",
+                    "model_id": "gpt-6-luna",
+                    "independence_domain": "openai",
+                    "capabilities": ["build"],
+                },
+                {
+                    "executor": "copilot",
+                    "model_id": "builder-two",
+                    "independence_domain": "microsoft",
+                    "capabilities": ["build"],
+                },
+                {
+                    "executor": "claude",
+                    "model_id": "planner-one",
+                    "independence_domain": "anthropic",
+                    "capabilities": ["planning"],
+                },
+                {
+                    "executor": "claude",
+                    "model_id": "reviewer-anthropic",
+                    "independence_domain": "anthropic",
+                    "capabilities": ["review"],
+                },
+                {
+                    "executor": "agy",
+                    "model_id": "reviewer-google",
+                    "independence_domain": "google",
+                    "capabilities": ["review"],
+                },
+            ]
+        )
 
         for action in ("start", "intake"):
             with self.subTest(action=action):
@@ -516,10 +557,10 @@ class WorkActionFlagTests(unittest.TestCase):
                             return_value={"action": "claim", "run": run.to_dict()},
                         ),
                         mock.patch.object(
-                            coordinator_work_actions,
-                            "resolve_model_chain",
-                            return_value=resolved_chain,
-                        ) as resolve_model_chain,
+                            work_bridge,
+                            "load_model_identities",
+                            return_value=identity_registry,
+                        ),
                     ):
                         result = coordinator_work_actions._intake_action(
                             args=args,
@@ -531,7 +572,6 @@ class WorkActionFlagTests(unittest.TestCase):
                             workflow_registry=workflow_registry,
                             workflow_starter=workflow_starter,
                         )
-                        resolve_model_chain.assert_called_once_with(expected_override)
                     return result
 
                 with tempfile.TemporaryDirectory() as root:
@@ -654,9 +694,11 @@ class WorkActionFlagTests(unittest.TestCase):
 
         self.assertEqual(rc, 2)
         self.assertEqual(submitted, [])
-        self.assertIn(
-            "只支援 work start／intake／rechain／supersede-attempt",
+        self.assertEqual(
             error.getvalue(),
+            "錯誤: --planner-executor／--planner-model／--builder-executor／--builder-model／"
+            "--reviewer-executor／--reviewer-model 只支援 work start／intake／rechain／"
+            "supersede-attempt。\n",
         )
         parser = _build_parser()
         root_subcommands = next(action for action in parser._actions if action.dest == "cmd")

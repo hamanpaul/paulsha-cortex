@@ -89,7 +89,7 @@ def _work_action_model_chain_args(
     if args.action not in _WORK_MODEL_CHAIN_ACTIONS:
         if model_chain_args:
             raise ValueError(
-                f"錯誤: {_WORK_MODEL_CHAIN_FLAG_LABEL} 只支援 work {_WORK_MODEL_CHAIN_ACTION_LABEL}。"
+                f"{_WORK_MODEL_CHAIN_FLAG_LABEL} 只支援 work {_WORK_MODEL_CHAIN_ACTION_LABEL}。"
             )
         return None
     if payload is not None:

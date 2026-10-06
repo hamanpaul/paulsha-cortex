@@ -133,22 +133,9 @@ def extract_model_chain_override(args: Mapping[str, object]) -> dict[str, dict[s
     return override or None
 
 
-def resolve_model_chain(
-    model_chain_override: Mapping[str, Mapping[str, str]] | None,
-    *,
-    identity_registry: IdentityRegistry | None = None,
-) -> dict[str, dict[str, str]]:
-    """Resolve the complete planner/builder/reviewer chain with dispatch rules.
+def _resolve_primary_planner(identities: IdentityRegistry):
+    """Select the primary planner shared by intake previews and dispatch."""
 
-    Intake uses this as an operator-facing preview. Selection is delegated to
-    the same manager resolver used at dispatch, so defaults and overrides obey
-    the existing capability and reviewer-independence checks. The returned
-    ``model`` alias keeps CLI output friendly while ``model_id`` matches the
-    durable workflow vocabulary; neither field is stored as resolved run
-    evidence here.
-    """
-
-    identities = identity_registry if identity_registry is not None else load_model_identities()
     planning = [
         identity
         for identity in identities.identities
@@ -167,11 +154,29 @@ def resolve_model_chain(
             "no resolvable primary planning identity"
             f"（{ranked.exclusion_detail()}）"
         )
+    return ranked.ordered[0]
 
+
+def resolve_model_chain(
+    model_chain_override: Mapping[str, Mapping[str, str]] | None,
+    *,
+    identity_registry: IdentityRegistry | None = None,
+) -> dict[str, dict[str, str]]:
+    """Resolve the complete planner/builder/reviewer chain with dispatch rules.
+
+    Intake uses this as an operator-facing preview. Selection is delegated to
+    the same manager resolver used at dispatch, so defaults and overrides obey
+    the existing capability and reviewer-independence checks. The returned
+    ``model`` alias keeps CLI output friendly while ``model_id`` matches the
+    durable workflow vocabulary; neither field is stored as resolved run
+    evidence here.
+    """
+
+    identities = identity_registry if identity_registry is not None else load_model_identities()
     # start_canonical_workflow sets primary_domain from this same shared planner
     # selection before workflow dispatch. Keep that preference when resolving
     # the builder, even when the run explicitly overrides its planner.
-    primary = ranked.ordered[0]
+    primary = _resolve_primary_planner(identities)
     run = SimpleNamespace(
         primary_domain=primary.independence_domain,
         steps=[],
@@ -634,24 +639,10 @@ def start_canonical_workflow(
         return run
     manifest_path = _write_manifest(Path(coordinator_root), claim_key, manifest)
     identities = identity_registry or load_model_identities()
-    planning = [identity for identity in identities.identities if "planning" in identity.capabilities]
-    if not planning:
-        raise RuntimeError("no primary planning identity configured")
     # #534：primary planner 改依三層解析鏈挑（operator overlay → 評估合格清單 →
     # packaged fallback）。舊實作寫死 executor 順序 ("codex", "claude", "agy")，
     # 與 operator 在 host overlay 宣告的順序無關——人工指定形同不存在。
-    ranked = model_resolution.rank_candidates(
-        planning,
-        role="planning",
-        context=identities.resolution_context,
-        compatibility_for=model_resolution.compatibility_checker_for("planner"),
-    )
-    if not ranked.ordered:
-        raise RuntimeError(
-            "no resolvable primary planning identity"
-            f"（{ranked.exclusion_detail()}）"
-        )
-    primary = ranked.ordered[0]
+    primary = _resolve_primary_planner(identities)
     from . import manager
 
     result = manager.apply_workflow_action(
