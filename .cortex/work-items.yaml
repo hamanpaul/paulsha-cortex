@@ -1601,3 +1601,27 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/workstreams/upgrade-venv-umask/todo.md'
     excludes: []
+  adoption-review-followups:
+    title: 'adoption-review-followups'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1282'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/adoption-review-followups/todo.md'
+    excludes: []
+  intake-model-flags:
+    title: 'intake-model-flags'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1296'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/intake-model-flags/todo.md'
+    excludes: []
+  copilot-probe-reap:
+    title: 'copilot-probe-reap'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1297'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/copilot-probe-reap/todo.md'
+    excludes: []
