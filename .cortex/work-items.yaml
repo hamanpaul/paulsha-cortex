@@ -1593,3 +1593,11 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/workstreams/dangerous-command-blocklist/todo.md'
     excludes: []
+  upgrade-venv-umask:
+    title: 'upgrade-venv-umask'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1295'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/upgrade-venv-umask/todo.md'
+    excludes: []
