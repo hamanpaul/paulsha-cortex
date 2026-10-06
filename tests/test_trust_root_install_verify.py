@@ -814,6 +814,36 @@ def test_verify_fails_when_live_service_is_inactive_despite_receipt_flag(
     )
 
 
+def test_verify_records_the_inactive_service_journal_reason(
+    tmp_path: Path,
+) -> None:
+    plan, receipt = _activated_receipt()
+    observed = _service_identities(active_state="activating")
+    observed["cortex-manager.service"]["failure_detail"] = (
+        "sub_state=activating; result=exit-code; exec_main_status=203; "
+        "journal=Failed to execute /opt/cortex/venv/bin/cortex: Permission denied"
+    )
+
+    result = verify_receipt(
+        receipt,
+        plan=plan,
+        expected_inventory=_inventory(),
+        installed_inventory=_inventory(),
+        service_identities=observed,
+        evidence_path=tmp_path / "activating.json",
+    )
+
+    assert not result.ok
+    failure = next(
+        row
+        for row in result.report.to_dict()["failures"]
+        if row["code"] == "service_not_active"
+        and row["artifact"] == "cortex-manager.service"
+    )
+    assert "Permission denied" in failure["detail"]
+    assert "exec_main_status=203" in failure["detail"]
+
+
 def test_verify_fails_closed_when_live_active_state_is_missing(tmp_path: Path) -> None:
     plan, receipt = _activated_receipt()
     observed = _service_identities()

@@ -8660,13 +8660,15 @@ def verify_receipt(
                 }
             )
         if identity.get("active_state") != "active":
-            identity_failures.append(
-                {
-                    "code": "service_not_active",
-                    "artifact": service,
-                    "installed": identity.get("active_state"),
-                }
-            )
+            failure = {
+                "code": "service_not_active",
+                "artifact": service,
+                "installed": identity.get("active_state"),
+            }
+            detail = identity.get("failure_detail")
+            if isinstance(detail, str) and detail:
+                failure["detail"] = detail
+            identity_failures.append(failure)
     if identity_failures:
         report = AttestationReport(
             report.warnings, (*report.failures, *identity_failures)

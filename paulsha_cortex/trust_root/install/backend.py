@@ -92,6 +92,7 @@ def _run(
     start_new_session: bool = False,
     cwd: str | os.PathLike[str] | None = None,
     timeout: float | None = None,
+    umask: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run one typed argv.  Shell text is never accepted by this backend.
 
@@ -123,6 +124,9 @@ def _run(
         if input_text is not None:
             raise InstallPlanError("stdin and input_text are mutually exclusive")
         redirected["stdin"] = stdin
+    process_config: dict[str, object] = {}
+    if umask is not None:
+        process_config["umask"] = umask
     if start_new_session:
         process = subprocess.Popen(
             list(argv),
@@ -135,6 +139,7 @@ def _run(
             start_new_session=True,
             cwd=cwd,
             **identity,
+            **process_config,
         )
         with process:
             try:
@@ -158,6 +163,7 @@ def _run(
             timeout=timeout,
             **redirected,
             **identity,
+            **process_config,
         )
     if check and result.returncode != 0:
         detail = (result.stderr or result.stdout or "command failed").strip()
@@ -266,6 +272,134 @@ def _tree_sha256(root: Path) -> str:
     return digest.hexdigest()
 
 
+def _venv_expected_mode(path: Path, observed: os.stat_result) -> int:
+    if stat.S_ISDIR(observed.st_mode):
+        return 0o755
+    if stat.S_ISREG(observed.st_mode):
+        return 0o755 if stat.S_IMODE(observed.st_mode) & 0o111 else 0o644
+    raise InstallDriftError(f"venv contains unsupported filesystem object: {path}")
+
+
+def _venv_permissions_match(slot: Path, *, uid: int, gid: int) -> bool:
+    for path in [slot, *sorted(slot.rglob("*"), key=lambda row: row.relative_to(slot).as_posix())]:
+        observed = path.lstat()
+        if stat.S_ISLNK(observed.st_mode):
+            continue
+        if observed.st_uid != uid or observed.st_gid != gid:
+            return False
+        if stat.S_IMODE(observed.st_mode) != _venv_expected_mode(path, observed):
+            return False
+    return True
+
+
+def _normalize_venv_permissions(slot: Path, *, uid: int, gid: int) -> None:
+    for path in [slot, *sorted(slot.rglob("*"), key=lambda row: row.relative_to(slot).as_posix())]:
+        observed = path.lstat()
+        if stat.S_ISLNK(observed.st_mode):
+            continue
+        os.chown(path, uid, gid, follow_symlinks=False)
+        os.chmod(path, _venv_expected_mode(path, observed))
+
+
+def _venv_repair_marker_path(slot: Path) -> Path:
+    return slot.with_name(f".{slot.name}.cortex-repair")
+
+
+def _read_venv_repair_marker(slot: Path) -> str | None:
+    marker = _venv_repair_marker_path(slot)
+    try:
+        observed = marker.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(observed.st_mode) or stat.S_ISLNK(observed.st_mode) or observed.st_nlink != 1:
+        raise InstallDriftError("candidate venv repair marker is unsafe")
+    value = marker.read_text(encoding="ascii").strip()
+    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise InstallDriftError("candidate venv repair marker is invalid")
+    return value
+
+
+def _write_venv_repair_marker(slot: Path, tree_sha256: str, *, uid: int, gid: int) -> None:
+    marker = _venv_repair_marker_path(slot)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{marker.name}.",
+        dir=marker.parent,
+        text=True,
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchown(descriptor, uid, gid)
+        os.fchmod(descriptor, 0o644)
+        with os.fdopen(descriptor, "w", encoding="ascii") as stream:
+            descriptor = -1
+            stream.write(tree_sha256 + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, marker)
+        parent_fd = os.open(marker.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+
+
+def _clear_venv_repair_marker(slot: Path) -> None:
+    _venv_repair_marker_path(slot).unlink(missing_ok=True)
+
+
+def _venv_slot_repair_incomplete(slot: Path, expected: str) -> bool:
+    marker = _read_venv_repair_marker(slot)
+    if marker is None:
+        return False
+    wheel_marker = slot / ".cortex-wheel.sha256"
+    tree_marker = slot / ".cortex-tree.sha256"
+    if (
+        not slot.is_dir()
+        or slot.is_symlink()
+        or not wheel_marker.is_file()
+        or wheel_marker.is_symlink()
+        or wheel_marker.read_text(encoding="ascii").strip() != expected
+        or not tree_marker.is_file()
+        or tree_marker.is_symlink()
+        or not (slot / "bin/python").is_file()
+    ):
+        raise InstallDriftError("candidate venv slot is not attestable")
+    return tree_marker.read_text(encoding="ascii").strip() == marker
+
+
+def _repair_venv_slot_permissions(slot: Path, expected: str) -> str:
+    tree_sha256 = _tree_sha256(slot)
+    slot_ready = _venv_slot_matches(slot, expected, tree_sha256=tree_sha256)
+    repair_incomplete = _venv_slot_repair_incomplete(slot, expected)
+    if not slot_ready and not repair_incomplete:
+        raise InstallDriftError("candidate venv slot is not attestable")
+    uid = os.geteuid()
+    gid = os.getegid()
+    if _venv_permissions_match(slot, uid=uid, gid=gid):
+        if not slot_ready:
+            tree_marker = slot / ".cortex-tree.sha256"
+            tree_marker.write_text(tree_sha256 + "\n", encoding="ascii")
+            os.chown(tree_marker, uid, gid, follow_symlinks=False)
+            os.chmod(tree_marker, 0o644)
+        if repair_incomplete or _read_venv_repair_marker(slot) is not None:
+            _clear_venv_repair_marker(slot)
+        return tree_sha256
+    if not repair_incomplete:
+        _write_venv_repair_marker(slot, tree_sha256, uid=uid, gid=gid)
+    _normalize_venv_permissions(slot, uid=uid, gid=gid)
+    tree_sha256 = _tree_sha256(slot)
+    tree_marker = slot / ".cortex-tree.sha256"
+    tree_marker.write_text(tree_sha256 + "\n", encoding="ascii")
+    os.chown(tree_marker, uid, gid, follow_symlinks=False)
+    os.chmod(tree_marker, 0o644)
+    _clear_venv_repair_marker(slot)
+    return tree_sha256
+
+
 def _copy_verified_file(source: Path, destination: Path, expected: str) -> None:
     """Copy one locked artifact from a no-follow descriptor and verify in-flight."""
 
@@ -368,6 +502,9 @@ def _venv_state(step: Mapping[str, object]) -> dict[str, object]:
         return {"exists": True, "installed_sha256": None, "path": str(slot)}
     tree_sha256 = _tree_sha256(slot)
     slot_matches = _venv_slot_matches(slot, expected, tree_sha256=tree_sha256)
+    slot_permissions_ok = slot_matches and _venv_permissions_match(
+        slot, uid=os.geteuid(), gid=os.getegid()
+    )
     try:
         link_target = active.readlink()
     except (OSError, ValueError):
@@ -375,6 +512,7 @@ def _venv_state(step: Mapping[str, object]) -> dict[str, object]:
             "exists": True,
             "installed_sha256": None,
             "slot_sha256": expected if slot_matches else None,
+            "slot_permissions_ok": slot_permissions_ok,
             "path": str(slot),
             "tree_sha256": tree_sha256,
         }
@@ -384,13 +522,15 @@ def _venv_state(step: Mapping[str, object]) -> dict[str, object]:
             "exists": True,
             "installed_sha256": None,
             "slot_sha256": expected if slot_matches else None,
+            "slot_permissions_ok": slot_permissions_ok,
             "path": str(slot),
             "tree_sha256": tree_sha256,
         }
     return {
         "exists": True,
-        "installed_sha256": expected,
+        "installed_sha256": expected if slot_permissions_ok else None,
         "slot_sha256": expected,
+        "slot_permissions_ok": slot_permissions_ok,
         "path": str(slot),
         "tree_sha256": tree_sha256,
         "link_target": str(link_target),
@@ -4781,14 +4921,24 @@ class LocalInstallBackend:
             ):
                 raise InstallPlanError("wheelhouse does not contain the candidate wheel")
             slot_ready = _venv_slot_matches(slot, expected)
-            if (slot.exists() or slot.is_symlink()) and not slot_ready:
+            slot_repair_incomplete = False
+            if (
+                not slot_ready
+                and slot.exists()
+                and not slot.is_symlink()
+                and slot.is_dir()
+            ):
+                slot_repair_incomplete = _venv_slot_repair_incomplete(slot, expected)
+            if (slot.exists() or slot.is_symlink()) and not (
+                slot_ready or slot_repair_incomplete
+            ):
                 raise InstallDriftError(f"existing candidate slot is not attestable: {slot}")
             if active.exists() and not active.is_symlink():
                 raise InstallDriftError(f"active venv path is not a managed symlink: {active}")
             prior_link: dict[str, object] = {"exists": active.is_symlink()}
             if active.is_symlink():
                 prior_link["link_target"] = str(active.readlink())
-            if not slot_ready:
+            if not slot_ready and not slot_repair_incomplete:
                 slot.parent.mkdir(parents=True, exist_ok=True)
                 _reject_symlink_ancestors(slot, label="candidate venv")
                 temporary = _venv_staging_path(slot)
@@ -4868,10 +5018,21 @@ class LocalInstallBackend:
                     (temporary / ".cortex-wheel.sha256").write_text(
                         expected + "\n", encoding="ascii"
                     )
-                    os.chmod(temporary, 0o755)
+                    _normalize_venv_permissions(
+                        temporary,
+                        uid=os.geteuid(),
+                        gid=os.getegid(),
+                    )
                     (temporary / ".cortex-tree.sha256").write_text(
                         _tree_sha256(temporary) + "\n", encoding="ascii"
                     )
+                    os.chown(
+                        temporary / ".cortex-tree.sha256",
+                        os.geteuid(),
+                        os.getegid(),
+                        follow_symlinks=False,
+                    )
+                    os.chmod(temporary / ".cortex-tree.sha256", 0o644)
                     slot_tree = _tree_sha256(temporary)
                     if creation_checkpoint is not None:
                         # The complete tree and its inode are durable receipt
@@ -4894,6 +5055,8 @@ class LocalInstallBackend:
                     if temporary_created:
                         shutil.rmtree(temporary, ignore_errors=True)
                     raise
+            else:
+                slot_tree = _repair_venv_slot_permissions(slot, expected)
             slot_state = _venv_state(step)
             slot_tree = slot_state.get("tree_sha256")
             if (
@@ -5995,6 +6158,10 @@ class LocalInstallBackend:
                     "--property=User",
                     "--property=ExecStart",
                     "--property=ActiveState",
+                    "--property=SubState",
+                    "--property=Result",
+                    "--property=ExecMainCode",
+                    "--property=ExecMainStatus",
                     "--no-pager",
                 )
             )
@@ -6015,6 +6182,11 @@ class LocalInstallBackend:
                 "user": values.get("User", ""),
                 "exec_path": exec_path,
                 "active_state": values.get("ActiveState", ""),
+                "sub_state": values.get("SubState", ""),
+                "result": values.get("Result", ""),
+                "exec_main_code": values.get("ExecMainCode", ""),
+                "exec_main_status": values.get("ExecMainStatus", ""),
+                "failure_detail": _service_failure_detail(name, values),
                 "exec_sha256": (
                     _sha256_file(executable.resolve(strict=True))
                     if exec_path
@@ -6026,6 +6198,58 @@ class LocalInstallBackend:
                 ),
             }
         return identities
+
+
+_SERVICE_FAILURE_DETAIL_LIMIT = 400
+
+
+def _preferred_journal_line(lines: Sequence[str]) -> str:
+    best = ""
+    for raw in reversed(lines):
+        line = raw.strip()
+        if not line:
+            continue
+        if not best:
+            best = line
+        if any(token in line for token in ("Permission denied", "Failed", "failed", "203/EXEC")):
+            return line
+    return best
+
+
+def _service_failure_detail(service: str, values: Mapping[str, str]) -> str:
+    if values.get("ActiveState") == "active":
+        return ""
+    detail: list[str] = []
+    for key, label in (
+        ("SubState", "sub_state"),
+        ("Result", "result"),
+        ("ExecMainCode", "exec_main_code"),
+        ("ExecMainStatus", "exec_main_status"),
+    ):
+        value = values.get(key, "").strip()
+        if value:
+            detail.append(f"{label}={value}")
+    result = _run(
+        (
+            "journalctl",
+            "-u",
+            service,
+            "-n",
+            "20",
+            "--no-pager",
+            "--output=cat",
+        )
+    )
+    journal = (
+        _preferred_journal_line(result.stdout.splitlines())
+        if result.returncode == 0
+        else ""
+    )
+    if journal:
+        if len(journal) > _SERVICE_FAILURE_DETAIL_LIMIT:
+            journal = "…" + journal[-_SERVICE_FAILURE_DETAIL_LIMIT + 1 :]
+        detail.append(f"journal={journal}")
+    return "; ".join(detail)
 
 
 SystemInstallBackend = LocalInstallBackend

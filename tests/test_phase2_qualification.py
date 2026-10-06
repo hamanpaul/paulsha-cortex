@@ -796,9 +796,10 @@ def test_release_harness_drives_one_command_upgrade_drill_then_full_upgrade() ->
     drift = runner.index('chmod 0640 "$builder_codex_credential"')
     drill = runner.index('sh "$upgrade_drill_report" "${upgrade_cli[@]}"')
     restore = runner.index('chmod 0600 "$builder_codex_credential"')
+    fresh = runner.index('docker exec "$container_name" rm -rf "$upgrade_slot"')
     full = runner.index('sh "$upgrade_report" "${upgrade_cli[@]}"')
     driver = runner.index("driver_profile_args+=(\n    --prior-receipt")
-    assert source < overlay < drift < drill < restore < full < driver
+    assert source < overlay < drift < drill < restore < fresh < full < driver
     assert runner.count("--env PSC_UPGRADE_QUALIFICATION=1") == 2
     for fragment in (
         '/opt/cortex/venv/bin/cortex upgrade "$upgrade_version"',
@@ -812,6 +813,46 @@ def test_release_harness_drives_one_command_upgrade_drill_then_full_upgrade() ->
     ):
         assert fragment in runner
     assert '"--install-receipt"' in _required_text(DRIVER)
+
+
+def test_release_harness_installs_a_different_same_version_prior_before_the_upgrade() -> None:
+    runner = _required_text(RUNNER)
+    prior_root = runner.index("prior_artifact_root=/run/cortex-prior-artifacts")
+    verify_prior = runner.index('/usr/local/libexec/cortex-qualification-verify-bundle \\\n    --bundle "$prior_bundle_path"')
+    plan = runner.index('cortex install trust-root plan \\')
+    upgrade_source = runner.index("/usr/local/libexec/cortex-qualification-release-source")
+
+    assert prior_root < verify_prior < plan < upgrade_source
+    for fragment in (
+        'prior_bundle_path=$prior_artifact_root/bundle.json',
+        'prior_config_path=$prior_artifact_root/install-config.yaml',
+        'synthetic prior wheel SHA must differ from the candidate wheel SHA',
+        "import zipfile",
+        'archive.comment = b"qualification-prior-same-version\\n"',
+        "shutil.copyfile(dist_wheel, wheelhouse_wheel)",
+        '--config "$prior_config_path"',
+        '--bundle "$prior_bundle_path"',
+        '--env "CORTEX_QUALIFICATION_WHEEL_SHA256=$prior_wheel_sha"',
+        '--env "CORTEX_QUALIFICATION_BUNDLE_SHA256=$prior_bundle_sha"',
+    ):
+        assert fragment in runner
+    assert "qualification prior wheel for" not in runner
+
+
+def test_release_harness_runs_same_version_upgrade_under_umask_077_and_exec_checks() -> None:
+    runner = _required_text(RUNNER)
+
+    assert runner.count("umask 077; out=$1; shift; \"$@\" >\"$out\"") == 2
+    for fragment in (
+        'upgrade_slot=/opt/cortex/venvs/$expected_wheel_sha',
+        'die "upgrade drill did not create the candidate venv slot"',
+        'docker exec "$container_name" rm -rf "$upgrade_slot"',
+        'die "upgrade drill candidate venv slot was not removed"',
+        "for upgrade_account in cortex-egress-proxy cortex-manager; do",
+        'die "upgraded venv is not executable as $upgrade_account"',
+        "test -x /opt/cortex/venv/bin/cortex; /opt/cortex/venv/bin/cortex --help >/dev/null",
+    ):
+        assert fragment in runner
 
 
 def test_release_harness_refreshes_the_builder_credential_before_the_full_upgrade() -> None:
@@ -909,7 +950,8 @@ def test_release_harness_prints_upgrade_diagnostics_before_dying() -> None:
     )
     full_call = (
         'if ! docker exec --env PSC_UPGRADE_QUALIFICATION=1 "$container_name" \\\n'
-        "    sh -eu -c 'out=$1; shift; \"$@\" >\"$out\"' sh \"$upgrade_report\" "
+        "    sh -eu -c 'umask 077; out=$1; shift; \"$@\" >\"$out\"' \\\n"
+        '    sh "$upgrade_report" '
         '"${upgrade_cli[@]}"; then'
     )
     guarded(full_call, "one-command upgrade failed", "$upgrade_report")
@@ -1227,15 +1269,14 @@ def test_full_suite_validator_accepts_distinct_candidate_identities(tmp_path: Pa
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
-def test_full_suite_validator_rejects_rollback_evidence_for_another_candidate(
+def test_full_suite_validator_accepts_rollback_evidence_for_a_different_prior_wheel(
     tmp_path: Path,
 ) -> None:
-    """#1224：rollback 證據的 expected 必須是本次 candidate，不能是任意 wheel。"""
+    """#1295：same-version upgrade 先裝不同 wheel 的 qualified prior，再升到 candidate。"""
     payload = _valid_full_qualification(tmp_path, rollback_expected_wheel="9" * 64)
 
     completed = _run_full_validator(tmp_path, payload)
-    assert completed.returncode != 0, completed.stdout + completed.stderr
-    assert "expected receipt is not this candidate" in completed.stderr
+    assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 def test_full_suite_validator_rejects_unlisted_evidence_files(tmp_path: Path) -> None:

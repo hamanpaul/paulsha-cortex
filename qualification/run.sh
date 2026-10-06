@@ -127,6 +127,58 @@ docker exec "$container_name" /usr/local/libexec/cortex-qualification-verify-bun
 docker exec "$container_name" sh -eu -c \
     'python3 -m pip install --break-system-packages --no-index --no-deps /artifacts/wheelhouse/*.whl'
 
+prior_artifact_root=/run/cortex-prior-artifacts
+prior_bundle_path=$prior_artifact_root/bundle.json
+prior_config_path=$prior_artifact_root/install-config.yaml
+readarray -t prior_artifact_digests < <(docker exec "$container_name" python3 - \
+    "$wheel_name" "$candidate_sha" <<'PY'
+import hashlib
+import json
+import shutil
+import sys
+import zipfile
+from pathlib import Path
+
+root = Path("/run/cortex-prior-artifacts")
+wheel_name = sys.argv[1]
+candidate_sha = sys.argv[2]
+
+if root.exists() or root.is_symlink():
+    raise SystemExit("prior artifact root already exists")
+shutil.copytree("/artifacts", root, symlinks=False)
+
+dist_wheel = root / "dist" / wheel_name
+wheelhouse_wheel = root / "wheelhouse" / wheel_name
+with zipfile.ZipFile(dist_wheel, "a") as archive:
+    archive.comment = b"qualification-prior-same-version\n"
+shutil.copyfile(dist_wheel, wheelhouse_wheel)
+
+bundle_path = root / "bundle.json"
+document = json.loads(bundle_path.read_text(encoding="utf-8"))
+document["candidate_sha"] = candidate_sha
+document["wheel"]["sha256"] = hashlib.sha256(dist_wheel.read_bytes()).hexdigest()
+for row in document["wheelhouse"]:
+    if row.get("path") == f"wheelhouse/{wheel_name}":
+        row["sha256"] = hashlib.sha256(wheelhouse_wheel.read_bytes()).hexdigest()
+for row in document.get("source_repositories", []):
+    if isinstance(row, dict) and row.get("slug") == "paulsha-cortex":
+        row["commit"] = candidate_sha
+bundle_path.write_text(json.dumps(document, sort_keys=True), encoding="utf-8")
+
+print(hashlib.sha256(dist_wheel.read_bytes()).hexdigest())
+print(hashlib.sha256(bundle_path.read_bytes()).hexdigest())
+PY
+)
+prior_wheel_sha=${prior_artifact_digests[0]-}
+prior_bundle_sha=${prior_artifact_digests[1]-}
+[[ "$prior_wheel_sha" =~ ^[0-9a-f]{64}$ && "$prior_wheel_sha" != "$expected_wheel_sha" ]] || \
+    die "synthetic prior wheel SHA must differ from the candidate wheel SHA"
+[[ "$prior_bundle_sha" =~ ^[0-9a-f]{64}$ ]] || die "synthetic prior bundle SHA is invalid"
+docker exec "$container_name" /usr/local/libexec/cortex-qualification-verify-bundle \
+    --bundle "$prior_bundle_path" \
+    --candidate-sha "$candidate_sha" \
+    --wheel-sha256 "$prior_wheel_sha"
+
 plan_path=/run/cortex-install/install-plan.json
 receipt_path=/run/cortex-install/install-receipt.json
 qualification_root=/qualification-output
@@ -190,8 +242,8 @@ if [[ "$profile" == legacy-adoption ]]; then
     exit 0
 fi
 docker exec "$container_name" cortex install trust-root plan \
-    --config /artifacts/install-config.yaml \
-    --bundle /artifacts/bundle.json \
+    --config "$prior_config_path" \
+    --bundle "$prior_bundle_path" \
     --output "$plan_path"
 plan_sha=$(docker exec "$container_name" sha256sum "$plan_path" | awk '{print $1}')
 
@@ -383,8 +435,8 @@ docker exec "$container_name" cortex install trust-root activate --receipt "$rec
 install_evidence_path=$qualification_root/install-verification.json
 docker exec \
     --env "CORTEX_QUALIFICATION_CANDIDATE_SHA=$candidate_sha" \
-    --env "CORTEX_QUALIFICATION_WHEEL_SHA256=$expected_wheel_sha" \
-    --env "CORTEX_QUALIFICATION_BUNDLE_SHA256=$expected_bundle_sha" \
+    --env "CORTEX_QUALIFICATION_WHEEL_SHA256=$prior_wheel_sha" \
+    --env "CORTEX_QUALIFICATION_BUNDLE_SHA256=$prior_bundle_sha" \
     --env "CORTEX_QUALIFICATION_IMAGE_DIGEST=$image_digest" \
     "$container_name" cortex install trust-root verify \
     --receipt "$receipt_path" --json --evidence "$install_evidence_path"
@@ -406,6 +458,7 @@ upgrade_report=/run/cortex-install/upgrade-report.json
 upgrade_durable_report=/var/lib/cortex-installer/$upgrade_version/upgrade-report.json
 upgrade_status_report=/run/cortex-install/upgrade-status.json
 builder_codex_credential=/var/lib/cortex-builder/.codex/auth.json
+upgrade_slot=/opt/cortex/venvs/$expected_wheel_sha
 # `--json` 只把 report 寫進容器內的檔案，而 `trap cleanup EXIT` 會刪掉容器：每個失敗的
 # `cortex upgrade` 檢查在 die 之前，先把 `--json` 輸出、durable report 與它指向的 verify
 # evidence 印到 stderr，live RC 失敗時才留得下診斷。這次執行若在發布 report 之前就被拒
@@ -464,7 +517,8 @@ upgrade_cli=(
 # handoff 拒絕繼承 → 工具自動 rollback 新 receipt，並把原本 active 的服務啟動回來。
 docker exec "$container_name" chmod 0640 "$builder_codex_credential"
 if docker exec --env PSC_UPGRADE_QUALIFICATION=1 "$container_name" \
-    sh -eu -c 'out=$1; shift; "$@" >"$out"' sh "$upgrade_drill_report" "${upgrade_cli[@]}"; then
+    sh -eu -c 'umask 077; out=$1; shift; "$@" >"$out"' \
+    sh "$upgrade_drill_report" "${upgrade_cli[@]}"; then
     upgrade_diagnostics "$upgrade_drill_report"
     die "one-command upgrade accepted a drifted inherited credential"
 fi
@@ -482,6 +536,15 @@ for upgrade_service in cortex-egress-proxy.service cortex-manager.service cortex
     docker exec "$container_name" systemctl is-active --quiet "$upgrade_service" || \
         die "upgrade drill did not restore $upgrade_service"
 done
+# credentials 步驟前失敗的 drill 也會先跑 apply；rollback 只還原 active link，內容位址的
+# candidate slot 仍留在磁碟上。完整升級要驗「新 wheel SHA 在 umask 077 下 fresh create
+# 的 slot 可執行」，因此在 disposable container 先把 drill 留下的 slot 刪掉，再跑一次
+# 同版升級。
+docker exec "$container_name" test -d "$upgrade_slot" || \
+    die "upgrade drill did not create the candidate venv slot"
+docker exec "$container_name" rm -rf "$upgrade_slot"
+docker exec "$container_name" test ! -e "$upgrade_slot" || \
+    die "upgrade drill candidate venv slot was not removed"
 # 模擬 executor 自行刷新登入檔（#1275）：codex 以 builder 帳號身分就地改寫 auth.json。
 # 這裡同樣以 cortex-builder（driver 跑 job 帳號指令用的 `/usr/sbin/runuser -u`）在檔尾附加
 # 一個換行（JSON 尾端空白，憑證語意不變，內容不讀出也不印出），inode、owner、group、mode、
@@ -511,7 +574,8 @@ builder_codex_refreshed_sha=${builder_codex_refreshed_sha%% *}
     die "credential refresh drill did not change the builder credential digest"
 # 完整升級：apply → 繼承 prior 憑證 → activate → verify → loaded↔installed 一致。
 if ! docker exec --env PSC_UPGRADE_QUALIFICATION=1 "$container_name" \
-    sh -eu -c 'out=$1; shift; "$@" >"$out"' sh "$upgrade_report" "${upgrade_cli[@]}"; then
+    sh -eu -c 'umask 077; out=$1; shift; "$@" >"$out"' \
+    sh "$upgrade_report" "${upgrade_cli[@]}"; then
     upgrade_diagnostics "$upgrade_report"
     die "one-command upgrade failed"
 fi
@@ -554,6 +618,12 @@ if ! docker exec "$container_name" jq -e --slurpfile report "$upgrade_report" \
     docker exec "$container_name" cat "$upgrade_status_report" >&2 || true
     die "cortex upgrade --status does not show the upgraded receipt in force"
 fi
+for upgrade_account in cortex-egress-proxy cortex-manager; do
+    if ! docker exec "$container_name" /usr/sbin/runuser -u "$upgrade_account" -- \
+        sh -eu -c 'test -x /opt/cortex/venv/bin/cortex; /opt/cortex/venv/bin/cortex --help >/dev/null'; then
+        die "upgraded venv is not executable as $upgrade_account"
+    fi
+done
 
 # A fixed harness installed in the reference image always runs the five attack
 # families and negative controls. Only deployment-canary mode adds provider

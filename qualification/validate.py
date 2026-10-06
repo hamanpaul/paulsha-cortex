@@ -1439,13 +1439,10 @@ def validate(
                 or rollback_receipt["parent_receipt_id"] != expected["receipt_id"]
             ):
                 _fail("rollback receipt is not bound to the qualified prior receipt")
-            # same-artifact 情境：prior receipt 就是本次 candidate 的安裝，expected 必須
-            # 綁回 qualification 自己的 candidate，不能是任意 wheel／commit。
-            if (
-                expected["wheel_sha256"] != evidence_wheel_sha
-                or expected["candidate_commit"] != evidence_sha
-            ):
-                _fail("rollback loaded-runtime expected receipt is not this candidate")
+            # RC 先安裝 qualified prior，再以 `cortex upgrade` 升到本次 candidate；
+            # prior 的 wheel/commit 因此可以不同。rollback 證據只需證明 drill 的
+            # loaded runtime 回到了它宣告的 qualified prior；是否升到本次 candidate
+            # 由後續 `one-command-upgrade.json` 再驗。
             _require_loaded_runtime_match(
                 rollback_status.get("service_status"), expected, label="rollback"
             )
