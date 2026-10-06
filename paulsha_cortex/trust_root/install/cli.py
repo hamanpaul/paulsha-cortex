@@ -4,9 +4,11 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import fcntl
+import grp
 import hashlib
 import json
 import os
+import pwd
 import secrets
 import stat
 import subprocess
@@ -34,6 +36,7 @@ from .legacy import (
     validate_host_overlay,
 )
 from .core import (
+    HostAccounts,
     InstallError,
     InstallPlanError,
     InstallReceipt,
@@ -41,6 +44,7 @@ from .core import (
     _open_receipt_parent_directory,
     _rename_noreplace_at,
     _write_all,
+    account_id_summary,
     activate_receipt,
     apply_plan,
     atomic_write_json,
@@ -825,6 +829,19 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _host_account_snapshot() -> HostAccounts:
+    """passwd/group as plan resolves undeclared account ids against (#1286).
+
+    Read through NSS like apply's ``preflight_facts``; both databases are
+    world-readable, so the unprivileged plan account sees the same rows.
+    """
+
+    return HostAccounts(
+        users=tuple((row.pw_name, row.pw_uid, row.pw_gid) for row in pwd.getpwall()),
+        groups=tuple((row.gr_name, row.gr_gid) for row in grp.getgrall()),
+    )
+
+
 def _bound_plan_from_config(
     config: Mapping[str, object], bundle: Path
 ) -> dict[str, object]:
@@ -843,6 +860,7 @@ def _bound_plan_from_config(
         config=config,
         candidate_wheel=Path(str(wheel["resolved_path"])),
         bundle=Path(str(manifest["manifest_path"])),
+        host_accounts=_host_account_snapshot,
     )
     plan = bind_bundle_artifacts(plan, manifest)
     candidate = plan.get("candidate")
@@ -949,7 +967,12 @@ def _plan_command(args: argparse.Namespace) -> int:
     )
     output = Path(args.output).expanduser().absolute()
     atomic_write_json(output, plan, mode=0o600)
-    payload: dict[str, object] = {"output": str(output), "plan_sha256": plan_sha256(plan)}
+    payload: dict[str, object] = {
+        "output": str(output),
+        "plan_sha256": plan_sha256(plan),
+        # #1286：每個帳號的號碼與來源（overlay／config／existing／allocated），供審核。
+        "account_ids": account_id_summary(plan),
+    }
     if "host_overlay_sha256" in plan:
         payload["host_overlay_sha256"] = plan["host_overlay_sha256"]
     legacy_block = plan.get("legacy_adoption")

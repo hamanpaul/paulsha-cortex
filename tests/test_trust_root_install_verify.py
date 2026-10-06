@@ -875,3 +875,79 @@ def test_verify_failure_records_service_that_could_not_be_stopped(
     assert document["verification_stop_failures"] == [
         "cortex-manager.service"
     ]
+
+
+def test_verify_evidence_records_the_planned_account_ids_and_sources(
+    tmp_path: Path,
+) -> None:
+    # #1286：號碼在 plan 時才決定；verify evidence 帶出 plan 實際配的號碼與來源，
+    # RC validator 拿它對照 service 的 uid／gid，不再寫死 991。
+    plan, _receipt = _activated_receipt()
+    plan = deepcopy(plan)
+    plan["accounts"] = [
+        {
+            "name": "cortex-manager",
+            "uid": 986,
+            "gid": 986,
+            "home": "/var/lib/cortex-manager",
+            "shell": "/usr/sbin/nologin",
+        }
+    ]
+    plan["service_accounts"] = [
+        {
+            "name": "cortex-egress",
+            "uid": 984,
+            "gid": 985,
+            "home": "/var/lib/cortex-egress",
+            "shell": "/usr/sbin/nologin",
+        }
+    ]
+    plan["account_id_sources"] = {
+        "cortex-manager": {"uid": "allocated", "gid": "allocated"},
+        "cortex-egress": {"uid": "overlay", "gid": "config"},
+    }
+    backend = VerifyBackend()
+    receipt = new_install_receipt(plan)
+    apply_plan(plan, confirm_sha256=plan_sha256(plan), receipt=receipt, backend=backend)
+    activate_receipt(receipt, backend=backend)
+
+    result = verify_receipt(
+        receipt,
+        plan=plan,
+        expected_inventory=_inventory(),
+        installed_inventory=_inventory(),
+        service_identities=_service_identities(),
+        evidence_path=tmp_path / "install-verification.json",
+    )
+
+    assert result.ok
+    assert result.evidence["account_ids"] == {
+        "cortex-manager": {
+            "uid": 986,
+            "gid": 986,
+            "uid_source": "allocated",
+            "gid_source": "allocated",
+        },
+        "cortex-egress": {
+            "uid": 984,
+            "gid": 985,
+            "uid_source": "overlay",
+            "gid_source": "config",
+        },
+    }
+
+
+def test_verify_evidence_of_a_pre_1286_plan_names_no_id_source(tmp_path: Path) -> None:
+    plan, receipt = _activated_receipt()
+
+    result = verify_receipt(
+        receipt,
+        plan=plan,
+        expected_inventory=_inventory(),
+        installed_inventory=_inventory(),
+        service_identities=_service_identities(),
+        evidence_path=tmp_path / "install-verification.json",
+    )
+
+    assert result.ok
+    assert result.evidence["account_ids"] == {}

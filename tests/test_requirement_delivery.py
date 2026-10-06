@@ -1326,8 +1326,8 @@ def _qualification_payload(*, candidate_sha: str, wheel_sha256: str, status: str
         "bundle": {"sha256": "b" * 64},
         "image": {"digest": "sha256:" + "c" * 64},
         "services": [
-            {"name": "cortex-manager.service", "uid": 991, "gid": 991, "active": True},
-            {"name": "cortex-monitor.service", "uid": 991, "gid": 991, "active": True},
+            {"name": "cortex-manager.service", "uid": 986, "gid": 986, "active": True},
+            {"name": "cortex-monitor.service", "uid": 986, "gid": 986, "active": True},
             {"name": "cortex-egress-proxy.service", "uid": 950, "gid": 950, "active": True},
         ],
         "providers": providers,
@@ -1391,8 +1391,8 @@ def _full_canary_qualification(
         "image": {"digest": "sha256:" + "d" * 64},
         "services": [
             {"name": "cortex-egress-proxy.service", "uid": 950, "gid": 950, "active": True},
-            {"name": "cortex-manager.service", "uid": 991, "gid": 991, "active": True},
-            {"name": "cortex-monitor.service", "uid": 991, "gid": 991, "active": True},
+            {"name": "cortex-manager.service", "uid": 986, "gid": 986, "active": True},
+            {"name": "cortex-monitor.service", "uid": 986, "gid": 986, "active": True},
         ],
         "providers": providers,
         "tests": [
@@ -1419,6 +1419,17 @@ def _full_canary_qualification(
         "attestation": attestation,
         "artifact_hashes": {"units/cortex-manager.service": "1" * 64},
         "service_identities": {"cortex-manager.service": {"user": "cortex-manager"}},
+        # #1286：plan 實際配的號碼；升級沿用（existing），service 身分對照它。
+        "account_ids": {
+            name: {"uid": number, "gid": number, "uid_source": "existing", "gid_source": "existing"}
+            for name, number in (
+                ("cortex-builder", 988),
+                ("cortex-gate", 987),
+                ("cortex-manager", 986),
+                ("cortex-reviewer-planner", 985),
+                ("cortex-egress", 950),
+            )
+        },
     }
     generated = {
         "schema_version": 1,

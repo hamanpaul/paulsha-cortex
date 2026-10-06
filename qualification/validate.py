@@ -70,6 +70,17 @@ REQUIRED_RELEASE_SERVICES = {
     "cortex-manager.service",
     "cortex-monitor.service",
 }
+#: #1286：plan 實際配給五個帳號的號碼，由 install verification 帶出。
+PLANNED_ACCOUNTS = {
+    "cortex-manager",
+    "cortex-reviewer-planner",
+    "cortex-builder",
+    "cortex-gate",
+    "cortex-egress",
+}
+#: 發行版慣用的 system 帳號號段；RC 容器先以模擬的 Ubuntu 身分占用 991–995，plan
+#: 的自動配號也避開整段，所以 release／canary 的帳號號碼不得落在這裡。
+DISTRO_RESERVED_IDS = range(990, 1000)
 REQUIRED_RELEASE_ARTIFACTS = {
     "evidence/install-verification.json",
     "evidence/generated-installed-attestation.json",
@@ -403,7 +414,7 @@ def _validate_evidence_file_set(
 
 def _validate_install_attestation(
     *, qualification: dict[str, Any], evidence_root: Path
-) -> None:
+) -> dict[str, Any]:
     """The installer's own verify evidence and its generated-installed attestation."""
 
     install = _artifact_json(evidence_root, "evidence/install-verification.json")
@@ -463,6 +474,68 @@ def _validate_install_attestation(
         _fail("generated-installed artifact hash inventory drifted")
     if generated["service_identities"] != install["service_identities"]:
         _fail("generated-installed service identity inventory drifted")
+    return install
+
+
+def _validate_planned_account_ids(
+    *, qualification: dict[str, Any], install: dict[str, Any]
+) -> None:
+    """Service identities are the ids the plan actually allocated (#1286).
+
+    The qualified receipt is the one-command upgrade's: its plan must have
+    reused every account the fresh install created (``existing``) without a
+    host overlay pinning ids, and none of them may sit in the distro band the
+    container occupies before the first plan.
+    """
+
+    planned = _mapping(
+        install.get("account_ids"), "install-verification.account_ids", PLANNED_ACCOUNTS
+    )
+    ids: dict[str, tuple[int, int]] = {}
+    for name in sorted(PLANNED_ACCOUNTS):
+        row = _mapping(
+            planned[name],
+            f"install-verification.account_ids.{name}",
+            {"uid", "gid", "uid_source", "gid_source"},
+        )
+        for key in ("uid", "gid"):
+            value = row[key]
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                _fail(f"install-verification.account_ids.{name}.{key} must be a positive integer")
+            if value in DISTRO_RESERVED_IDS:
+                _fail(
+                    f"planned {name} {key} {value} is inside the distro-reserved 990-999 "
+                    "band; the plan must allocate around the occupied system ids"
+                )
+        if row["uid_source"] != "existing" or row["gid_source"] != "existing":
+            _fail(
+                f"the upgrade plan did not reuse the installed {name} ids "
+                f"(uid_source={row['uid_source']}, gid_source={row['gid_source']}); "
+                "expected existing"
+            )
+        ids[name] = (row["uid"], row["gid"])
+    services = {
+        service["name"]: (service["uid"], service["gid"])
+        for service in qualification["services"]
+    }
+    manager = ids["cortex-manager"]
+    egress = ids["cortex-egress"]
+    for service, label in (
+        ("cortex-manager.service", "Manager"),
+        ("cortex-monitor.service", "Monitor"),
+    ):
+        if services.get(service) != manager:
+            _fail(
+                f"{label} service identity must be the planned cortex-manager "
+                f"uid={manager[0]} gid={manager[1]}"
+            )
+    if services.get("cortex-egress-proxy.service") != egress:
+        _fail(
+            "egress proxy identity must be the planned cortex-egress "
+            f"uid={egress[0]} gid={egress[1]}"
+        )
+    if egress[0] == manager[0] or egress[1] == manager[1]:
+        _fail("egress proxy must not share the Manager uid or gid")
 
 
 def _validate_profile_artifacts(
@@ -477,7 +550,10 @@ def _validate_profile_artifacts(
 ) -> None:
     """Validate evidence semantics, not merely candidate-supplied filenames and hashes."""
 
-    _validate_install_attestation(qualification=qualification, evidence_root=evidence_root)
+    install = _validate_install_attestation(
+        qualification=qualification, evidence_root=evidence_root
+    )
+    _validate_planned_account_ids(qualification=qualification, install=install)
 
     attack = _mapping(
         _artifact_json(evidence_root, "evidence/attack-matrix.json"),
@@ -1271,20 +1347,12 @@ def validate(
                     f"uid={uid} gid={gid}"
                 )
     elif require_profile_suite:
+        # The exact ids are plan-time decisions (#1286): `_validate_planned_account_ids`
+        # binds every service to the ids install verification reports.
         services_by_name = {service["name"]: service for service in root["services"]}
-        manager = services_by_name["cortex-manager.service"]
-        monitor = services_by_name["cortex-monitor.service"]
         egress = services_by_name["cortex-egress-proxy.service"]
-        if (manager["uid"], manager["gid"]) != (991, 991):
-            _fail("Manager service identity must be uid=991 gid=991")
-        if (monitor["uid"], monitor["gid"]) != (991, 991):
-            _fail("Monitor service identity must be uid=991 gid=991")
         if egress["uid"] == 0 or egress["gid"] == 0:
             _fail("egress proxy must run as a non-root uid and gid")
-        if egress["uid"] == 991 or egress["gid"] == 991:
-            _fail("egress proxy must not share the Manager uid or gid")
-        if egress["uid"] != egress["gid"]:
-            _fail("egress proxy must use its dedicated same-numbered uid and gid")
 
     provider_names: set[str] = set()
     provider_keys = {

@@ -568,10 +568,46 @@ PY
 cortex_plan_path=$cortex_durable_plan_path
 ```
 
-人工 review 至少確認 candidate SHA／wheel hash、四個 service accounts、所有目標路徑、
+人工 review 至少確認 candidate SHA／wheel hash、四個 service accounts 與
+`plan-result.json` 的 `account_ids`（每個帳號的 uid／gid 與來源，見下方）、所有目標路徑、
 systemd units、polkit 規則、toolchain artifacts、required credentials、canonical receipt
 parent 與本次隨機且不存在的 effective receipt path 都符合本次變更。不要只把畫面上的 SHA
 複製回 prompt；確認值代表 operator 已閱讀 plan 並接受其完整 mutation set。
+
+### 帳號 uid／gid 的來源（#1286）
+
+release 的 install config 不寫死帳號號碼。plan 對五個帳號（`cortex-manager`、
+`cortex-reviewer-planner`、`cortex-builder`、`cortex-gate`、`cortex-egress`）的 uid 與 gid
+逐一決定，優先順序：
+
+1. host overlay（`--host-overlay`）宣告的號碼，來源記為 `overlay`；手寫的 install config
+   自己宣告的號碼記為 `config`。
+2. 主機已有同名帳號／群組：沿用現有號碼，來源 `existing`。升級與重跑 plan 都走這條，
+   不需要 overlay。
+3. 都沒有：自動配號，來源 `allocated`。從 989 往下找第一個 uid 與 gid 都空著的號碼，
+   uid＝gid；沒有同號可用時 uid、gid 分開配。範圍限 system 範圍 100–989，避開發行版
+   慣用的 990–999（Ubuntu 的 `systemd-resolve` 與 udev 的 `render`／`kvm`／`sgx`／`input`
+   等都在這段）。同一份 passwd／group，plan 兩次得到同一組號碼，plan sha 不變。
+
+plan 經 NSS 讀 passwd／group（非 root 也讀得到），與 apply preflight 看到的是同一份。
+host overlay 只在要**指定**號碼時才需要，例如多台主機要統一號碼：
+
+```yaml
+accounts:
+  cortex-builder: {uid: 1500, gid: 1500}
+```
+
+要用 overlay 時，先以 `/usr/bin/sudo /usr/bin/install -o root -g root -m 0644` 存成
+`/var/lib/cortex-installer/host-overlay.yaml`，上面的 plan 指令再加
+`--host-overlay /var/lib/cortex-installer/host-overlay.yaml`。之後 `cortex upgrade` 會讀同一份
+檔案，並要求它的 digest 與上一次 plan 相同，所以 overlay 一旦用了就保留原檔。
+
+`account_ids` 以帳號名為 key，列出 `uid`、`gid`、`uid_source`、`gid_source`；審核時用
+`/usr/bin/python3 -I -S -m json.tool "$cortex_plan_result"` 檢視。apply preflight 在任何變更
+之前重新確認：`allocated` 的號碼仍沒有被其他帳號或群組占用，`existing` 的號碼仍屬同名
+帳號。plan 之後主機帳號有變動（例如期間裝了會建 system 帳號的套件）時，apply 在任何變更
+前 fail closed 並要求重新產生 plan，回到本節重跑 plan 與三方確認即可。overlay 指定的號碼
+被占用時照舊報錯，要改 overlay。
 
 ## 3. Stop services and apply exact plan
 

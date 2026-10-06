@@ -377,7 +377,9 @@ _INSTALL_CONFIG_KEYS = frozenset(
     }
 )
 _REPO_IDENTITY_KEYS = frozenset({"remote", "commit"})
-_ACCOUNT_CONFIG_KEYS = frozenset({"uid", "gid", "home", "shell"})
+_ACCOUNT_CONFIG_KEYS = frozenset({"home", "shell"})
+# #1286：uid／gid 可省略，省略時由 plan 依主機 passwd／group 決定；宣告了就照宣告。
+_ACCOUNT_CONFIG_ID_KEYS = frozenset({"uid", "gid"})
 _ROOT_CONFIG_KEYS = frozenset({"deploy", "state", "systemd", "polkit"})
 _PROVIDER_KEYS = frozenset({"builder", "reviewer-planner", "manager"})
 _PROVIDER_ALLOWLIST = {
@@ -482,6 +484,7 @@ def _validate_install_config_schema(config: Mapping[str, object]) -> None:
             row,
             label=f"accounts.{name}",
             required=_ACCOUNT_CONFIG_KEYS,
+            optional=_ACCOUNT_CONFIG_ID_KEYS,
         )
 
     service_accounts = config.get("service_accounts")
@@ -492,6 +495,7 @@ def _validate_install_config_schema(config: Mapping[str, object]) -> None:
             row,
             label=f"service_accounts.{name}",
             required=_ACCOUNT_CONFIG_KEYS,
+            optional=_ACCOUNT_CONFIG_ID_KEYS,
         )
 
     _require_exact_keys(
@@ -610,6 +614,173 @@ def _configured_scheme(config: Mapping[str, object]) -> permgen.UidScheme:
     )
 
 
+#: 每個帳號 uid／gid 的來源（#1286），依優先順序：host overlay 宣告、install config
+#: 自己宣告、主機上已有的同名帳號／群組、plan 自動配號。
+ACCOUNT_ID_SOURCES = ("overlay", "config", "existing", "allocated")
+#: 自動配號的範圍：Debian／Ubuntu login.defs 的 system 範圍 100–999，扣掉發行版慣用的
+#: 990–999（`useradd --system` 與 systemd-sysusers 由 999 往下配，udev 的 render／kvm／
+#: sgx／input 也落在這裡）。由大往小找，同一份快照一定得到同一組號碼。
+_ALLOCATABLE_IDS = tuple(range(989, 99, -1))
+_ALLOCATABLE_ID_SET = frozenset(_ALLOCATABLE_IDS)
+
+
+@dataclass(frozen=True)
+class HostAccounts:
+    """The passwd/group snapshot plan-time id resolution reads (#1286).
+
+    ``users`` rows are ``(name, uid, primary gid)`` and ``groups`` rows are
+    ``(name, gid)``.  Only the set of rows matters: the same snapshot in any
+    order resolves to the same ids, so the plan sha stays stable.  Planning
+    stays pure -- the CLI reads the host and passes the snapshot in.
+    """
+
+    users: tuple[tuple[str, int, int], ...] = ()
+    groups: tuple[tuple[str, int], ...] = ()
+
+
+def _snapshot_id(value: object) -> int:
+    if type(value) is not int or value < 0:
+        raise InstallPlanError("host passwd/group snapshot ids must be non-negative integers")
+    return value
+
+
+def _snapshot_rows(
+    snapshot: HostAccounts,
+) -> tuple[list[tuple[str, int, int]], list[tuple[str, int]]]:
+    users: list[tuple[str, int, int]] = []
+    for row in snapshot.users:
+        if not isinstance(row, (tuple, list)) or len(row) != 3 or not isinstance(row[0], str):
+            raise InstallPlanError("host passwd snapshot rows must be (name, uid, gid)")
+        users.append((row[0], _snapshot_id(row[1]), _snapshot_id(row[2])))
+    groups: list[tuple[str, int]] = []
+    for row in snapshot.groups:
+        if not isinstance(row, (tuple, list)) or len(row) != 2 or not isinstance(row[0], str):
+            raise InstallPlanError("host group snapshot rows must be (name, gid)")
+        groups.append((row[0], _snapshot_id(row[1])))
+    return sorted(set(users)), sorted(set(groups))
+
+
+def _first_free_id(taken: set[int], *, name: str, field: str) -> int:
+    for candidate in _ALLOCATABLE_IDS:
+        if candidate not in taken:
+            return candidate
+    raise InstallPlanError(
+        f"account {name}: no free system {field} in "
+        f"{_ALLOCATABLE_IDS[-1]}-{_ALLOCATABLE_IDS[0]}; pin one in the host overlay"
+    )
+
+
+def _resolve_account_ids(
+    rows: Sequence[dict[str, object]],
+    host_accounts: "HostAccounts | Callable[[], HostAccounts] | None",
+) -> dict[str, dict[str, str]]:
+    """Fill every undeclared uid/gid in place; return each field's source.
+
+    A declared id is kept as is (``config``; the overlay relabels its own).  An
+    undeclared one reuses the same-name account or group on the host
+    (``existing`` -- upgrades and re-plans land here), else takes the highest
+    allocatable id that is free (``allocated``): uid and gid both free and
+    equal when possible.  The snapshot is read only when something is
+    undeclared, so a fully declared config never depends on the host.
+    """
+
+    sources: dict[str, dict[str, str]] = {
+        str(row["name"]): {
+            field: "config" for field in ("uid", "gid") if row.get(field) is not None
+        }
+        for row in rows
+    }
+    if all(row.get("uid") is not None and row.get("gid") is not None for row in rows):
+        return sources
+    snapshot = host_accounts() if callable(host_accounts) else host_accounts
+    if not isinstance(snapshot, HostAccounts):
+        undeclared = sorted(
+            str(row["name"])
+            for row in rows
+            if row.get("uid") is None or row.get("gid") is None
+        )
+        raise InstallPlanError(
+            "accounts without a declared uid/gid need the host passwd/group snapshot: "
+            + ", ".join(undeclared)
+        )
+    users, groups = _snapshot_rows(snapshot)
+    planned = {str(row["name"]) for row in rows}
+    users_by_name: dict[str, tuple[int, int]] = {}
+    for name, uid, gid in users:
+        if name in planned and users_by_name.setdefault(name, (uid, gid)) != (uid, gid):
+            raise InstallPlanError(f"host passwd lists {name} more than once with different ids")
+    groups_by_name: dict[str, int] = {}
+    for name, gid in groups:
+        if name in planned and groups_by_name.setdefault(name, gid) != gid:
+            raise InstallPlanError(f"host group lists {name} more than once with different ids")
+    taken_uids = {uid for _name, uid, _gid in users}
+    # A primary gid held only through passwd is still taken: preflight refuses
+    # a gid that is any foreign account's primary group.
+    taken_gids = {gid for _name, gid in groups} | {gid for _name, _uid, gid in users}
+
+    for row in rows:
+        name = str(row["name"])
+        user = users_by_name.get(name)
+        if row.get("uid") is None and user is not None:
+            row["uid"] = user[0]
+            sources[name]["uid"] = "existing"
+        if row.get("gid") is None:
+            existing_gid = user[1] if user is not None else groups_by_name.get(name)
+            if existing_gid is not None:
+                row["gid"] = existing_gid
+                sources[name]["gid"] = "existing"
+    taken_uids.update(int(row["uid"]) for row in rows if row.get("uid") is not None)
+    taken_gids.update(int(row["gid"]) for row in rows if row.get("gid") is not None)
+
+    for row in rows:
+        name = str(row["name"])
+        uid = row.get("uid")
+        gid = row.get("gid")
+        if uid is None and gid is None:
+            paired = next(
+                (
+                    candidate
+                    for candidate in _ALLOCATABLE_IDS
+                    if candidate not in taken_uids and candidate not in taken_gids
+                ),
+                None,
+            )
+            if paired is not None:
+                uid = gid = paired
+            else:
+                uid = _first_free_id(taken_uids, name=name, field="uid")
+                gid = _first_free_id(taken_gids, name=name, field="gid")
+            sources[name].update(uid="allocated", gid="allocated")
+        elif uid is None:
+            uid = (
+                gid
+                if gid in _ALLOCATABLE_ID_SET and gid not in taken_uids
+                else _first_free_id(taken_uids, name=name, field="uid")
+            )
+            sources[name]["uid"] = "allocated"
+        elif gid is None:
+            gid = (
+                uid
+                if uid in _ALLOCATABLE_ID_SET and uid not in taken_gids
+                else _first_free_id(taken_gids, name=name, field="gid")
+            )
+            sources[name]["gid"] = "allocated"
+        row["uid"] = uid
+        row["gid"] = gid
+        taken_uids.add(int(uid))
+        taken_gids.add(int(gid))
+    return sources
+
+
+def _declared_id(raw: Mapping[str, object], field: str, *, label: str) -> int | None:
+    value = raw.get(field)
+    if value is None and field not in raw:
+        return None
+    if type(value) is not int or value <= 0:
+        raise InstallPlanError(f"{label} has an invalid {field}")
+    return value
+
+
 def _account_rows(config: Mapping[str, object], scheme: permgen.UidScheme) -> list[dict[str, object]]:
     raw_accounts = config.get("accounts")
     if not isinstance(raw_accounts, Mapping):
@@ -629,26 +800,48 @@ def _account_rows(config: Mapping[str, object], scheme: permgen.UidScheme) -> li
             f"four-way accounts must be exactly {sorted(required)}"
         )
     rows: list[dict[str, object]] = []
-    seen_uids: set[int] = set()
-    seen_gids: set[int] = set()
     for name in sorted(required):
         raw = raw_accounts.get(name)
         if not isinstance(raw, Mapping):
             raise InstallPlanError(f"account {name} must be an object")
-        uid = raw.get("uid")
-        gid = raw.get("gid")
+        uid = _declared_id(raw, "uid", label=f"account {name}")
+        gid = _declared_id(raw, "gid", label=f"account {name}")
         shell = raw.get("shell")
-        if not isinstance(uid, int) or uid <= 0 or uid in seen_uids:
-            raise InstallPlanError(f"account {name} has an invalid or duplicate uid")
-        if not isinstance(gid, int) or gid <= 0 or gid in seen_gids:
-            raise InstallPlanError(f"account {name} has an invalid or duplicate gid")
         if not isinstance(shell, str) or not shell.startswith("/"):
             raise InstallPlanError(f"account {name} shell must be absolute")
         home = _validate_absolute_path(raw.get("home"), label=f"accounts.{name}.home")
         rows.append({"name": name, "uid": uid, "gid": gid, "home": home, "shell": shell})
-        seen_uids.add(uid)
-        seen_gids.add(gid)
     return rows
+
+
+def _check_account_ids(
+    accounts: Sequence[Mapping[str, object]],
+    service_accounts: Sequence[Mapping[str, object]],
+) -> None:
+    """Every resolved id is positive, principal ids are unique, and the service
+    account's are dedicated.  An ``existing`` id comes from the host, so this
+    runs after resolution."""
+
+    seen_uids: set[int] = set()
+    seen_gids: set[int] = set()
+    for row in (*accounts, *service_accounts):
+        for field in ("uid", "gid"):
+            value = row[field]
+            if type(value) is not int or value <= 0:
+                raise InstallPlanError(f"account {row['name']} has an invalid {field}: {value!r}")
+    for row in accounts:
+        name = row["name"]
+        if row["uid"] in seen_uids:
+            raise InstallPlanError(f"account {name} has an invalid or duplicate uid")
+        if row["gid"] in seen_gids:
+            raise InstallPlanError(f"account {name} has an invalid or duplicate gid")
+        seen_uids.add(int(row["uid"]))  # type: ignore[arg-type]
+        seen_gids.add(int(row["gid"]))  # type: ignore[arg-type]
+    for row in service_accounts:
+        if row["uid"] in seen_uids or row["gid"] in seen_gids:
+            raise InstallPlanError(
+                f"service account {row['name']} must use a dedicated uid and gid"
+            )
 
 
 def _service_account_rows(config: Mapping[str, object]) -> list[dict[str, object]]:
@@ -663,17 +856,41 @@ def _service_account_rows(config: Mapping[str, object]) -> list[dict[str, object
     raw = raw_accounts[name]
     if not isinstance(raw, Mapping):
         raise InstallPlanError(f"service account {name} must be an object")
-    uid = raw.get("uid")
-    gid = raw.get("gid")
+    uid = _declared_id(raw, "uid", label=f"service account {name}")
+    gid = _declared_id(raw, "gid", label=f"service account {name}")
     shell = raw.get("shell")
-    if not isinstance(uid, int) or uid <= 0:
-        raise InstallPlanError(f"service account {name} has an invalid uid")
-    if not isinstance(gid, int) or gid <= 0:
-        raise InstallPlanError(f"service account {name} has an invalid gid")
     if not isinstance(shell, str) or not shell.startswith("/"):
         raise InstallPlanError(f"service account {name} shell must be absolute")
     home = _validate_absolute_path(raw.get("home"), label=f"service_accounts.{name}.home")
     return [{"name": name, "uid": uid, "gid": gid, "home": home, "shell": shell}]
+
+
+def account_id_summary(plan: Mapping[str, object]) -> dict[str, dict[str, object]]:
+    """Every planned account's uid/gid and where each came from (#1286).
+
+    The plan review summary and verify evidence both carry it.  A plan made
+    before #1286 has no ``account_id_sources``; its sources read ``None``.
+    """
+
+    sources = plan.get("account_id_sources")
+    if not isinstance(sources, Mapping):
+        sources = {}
+    summary: dict[str, dict[str, object]] = {}
+    for section in ("accounts", "service_accounts"):
+        rows = plan.get(section)
+        for row in rows if isinstance(rows, list) else ():
+            if not isinstance(row, Mapping) or not isinstance(row.get("name"), str):
+                continue
+            source = sources.get(row["name"])
+            if not isinstance(source, Mapping):
+                source = {}
+            summary[str(row["name"])] = {
+                "uid": row.get("uid"),
+                "gid": row.get("gid"),
+                "uid_source": source.get("uid"),
+                "gid_source": source.get("gid"),
+            }
+    return summary
 
 
 def _layout_from_config(config: Mapping[str, object], accounts: Sequence[Mapping[str, object]]) -> tuple[permgen.PathLayout, dict[str, str]]:
@@ -1380,9 +1597,17 @@ def _validate_canonical_receipt_path(plan: Mapping[str, object]) -> None:
 
 
 def build_install_plan(
-    *, config: Mapping[str, object], candidate_wheel: Path, bundle: Path
+    *,
+    config: Mapping[str, object],
+    candidate_wheel: Path,
+    bundle: Path,
+    host_accounts: "HostAccounts | Callable[[], HostAccounts] | None" = None,
 ) -> dict[str, object]:
-    """Build a pure, exact-artifact-bound four-way desired-state plan."""
+    """Build a pure, exact-artifact-bound four-way desired-state plan.
+
+    ``host_accounts`` (a snapshot, or a callable producing one) resolves every
+    uid/gid the config leaves undeclared (#1286); it is consulted only then.
+    """
 
     _validate_install_config_schema(config)
     if config.get("schema_version") != 1:
@@ -1393,13 +1618,10 @@ def build_install_plan(
     scheme = _configured_scheme(config)
     accounts = _account_rows(config, scheme)
     service_accounts = _service_account_rows(config)
-    principal_uids = {int(row["uid"]) for row in accounts}
-    principal_gids = {int(row["gid"]) for row in accounts}
-    for row in service_accounts:
-        if int(row["uid"]) in principal_uids or int(row["gid"]) in principal_gids:
-            raise InstallPlanError(
-                f"service account {row['name']} must use a dedicated uid and gid"
-            )
+    account_id_sources = _resolve_account_ids(
+        [*accounts, *service_accounts], host_accounts
+    )
+    _check_account_ids(accounts, service_accounts)
     layout, roots = _layout_from_config(config, accounts)
     permission_plan = permgen.generate_plan(scheme)
     permgen.assert_principals_resolved(permission_plan, scheme)
@@ -1479,6 +1701,7 @@ def build_install_plan(
         "legacy_policy": legacy_policy,
         "accounts": accounts,
         "service_accounts": service_accounts,
+        "account_id_sources": account_id_sources,
         "roots": roots,
         "source_repositories": list(layout.source_repo_slugs),
         "scaffolds": scaffolds,
@@ -2334,6 +2557,85 @@ def _legacy_account_row_problems(
     return problems
 
 
+def _account_id_source_problems(
+    plan: Mapping[str, object],
+    *,
+    desired_accounts: Sequence[object],
+    observed_accounts: Mapping[object, object],
+    observed_uids: Mapping[object, object],
+    observed_gids: Mapping[object, object],
+    observed_groups: Mapping[object, object],
+    group_names_by_gid: Mapping[object, object],
+    primary_gid_users: Mapping[object, object],
+) -> list[str]:
+    """Which plan-time id decisions (#1286) the host no longer supports.
+
+    An ``allocated`` id must still be free of every *other* identity -- the
+    same-name account holding it is a replay of this plan and is left to the
+    receipt provenance checks.  An ``existing`` id must still belong to the
+    same-name account (or, for a gid reused from a group alone, that group).
+    Declared ids keep their usual collision checks.  A plan without the record
+    (written before #1286) is not re-verified here.
+    """
+
+    sources = plan.get("account_id_sources")
+    if not isinstance(sources, Mapping):
+        return []
+    problems: list[str] = []
+    for desired in desired_accounts:
+        if not isinstance(desired, Mapping) or not isinstance(desired.get("name"), str):
+            continue
+        name = str(desired["name"])
+        source = sources.get(name)
+        if not isinstance(source, Mapping):
+            continue
+        uid = desired.get("uid")
+        gid = desired.get("gid")
+        account = observed_accounts.get(name)
+        if source.get("uid") == "allocated":
+            owner = observed_uids.get(uid)
+            if owner is not None and owner != name:
+                problems.append(f"{name}: allocated uid {uid} is now held by {owner}")
+        if source.get("gid") == "allocated":
+            holders: set[str] = set()
+            for value in (
+                group_names_by_gid.get(gid),
+                primary_gid_users.get(gid),
+            ):
+                if isinstance(value, list):
+                    holders.update(str(item) for item in value)
+            if observed_gids.get(gid) is not None:
+                holders.add(str(observed_gids[gid]))
+            holders.discard(name)
+            if holders:
+                problems.append(
+                    f"{name}: allocated gid {gid} is now held by {', '.join(sorted(holders))}"
+                )
+        if source.get("uid") == "existing":
+            if not isinstance(account, Mapping):
+                problems.append(
+                    f"{name}: the existing account whose uid {uid} this plan reuses is gone"
+                )
+            elif account.get("uid") != uid:
+                problems.append(
+                    f"{name}: the existing account now has uid {account.get('uid')}, "
+                    f"this plan reuses uid {uid}"
+                )
+        if source.get("gid") == "existing":
+            group = observed_groups.get(name)
+            if isinstance(account, Mapping):
+                if account.get("gid") != gid:
+                    problems.append(
+                        f"{name}: the existing account now has gid {account.get('gid')}, "
+                        f"this plan reuses gid {gid}"
+                    )
+            elif not isinstance(group, Mapping) or group.get("gid") != gid:
+                problems.append(
+                    f"{name}: the existing group whose gid {gid} this plan reuses is gone or changed"
+                )
+    return problems
+
+
 def _covered_by(path: object, covered: Sequence[str]) -> bool:
     return isinstance(path, str) and any(
         path == root or path.startswith(root.rstrip("/") + "/") for root in covered
@@ -2397,6 +2699,23 @@ def validate_preflight(
         for key in ("accounts", "service_accounts")
         for row in plan.get(key, [])
     ]
+    changed_ids = _account_id_source_problems(
+        plan,
+        desired_accounts=desired_accounts,
+        observed_accounts=observed_accounts,
+        observed_uids=observed_uids,
+        observed_gids=observed_gids,
+        observed_groups=observed_groups,
+        group_names_by_gid=observed_group_names_by_gid,
+        primary_gid_users=observed_primary_gid_users,
+    )
+    if changed_ids:
+        raise AccountCollisionError(
+            "account ids changed after this plan was generated: "
+            + "; ".join(changed_ids)
+            + "; generate a new plan (`cortex install trust-root plan`, or rerun "
+            "`cortex upgrade`) before apply"
+        )
     for desired in desired_accounts:
         if not isinstance(desired, Mapping) or not isinstance(desired.get("name"), str):
             raise InstallPlanError("plan account entries must be typed objects")
@@ -4035,6 +4354,38 @@ def _validate_apply_account_inventories(
     return inventory
 
 
+def _validate_account_id_sources(plan: Mapping[str, object]) -> None:
+    """A #1286 plan records one uid and one gid source per planned account.
+
+    The record is optional so plans and receipts written before #1286 stay
+    appliable and readable; once present it must be exact, because apply
+    preflight re-verifies ``allocated`` and ``existing`` ids from it.
+    """
+
+    if "account_id_sources" not in plan:
+        return
+    sources = plan.get("account_id_sources")
+    names = {
+        row.get("name")
+        for section in ("accounts", "service_accounts")
+        for row in (plan.get(section) if isinstance(plan.get(section), list) else [])
+        if isinstance(row, Mapping)
+    }
+    if not isinstance(sources, Mapping) or set(sources) != names:
+        raise InstallPlanError(
+            "plan account_id_sources must name exactly the planned accounts"
+        )
+    for name, row in sources.items():
+        if (
+            not isinstance(row, Mapping)
+            or set(row) != {"uid", "gid"}
+            or any(row[field] not in ACCOUNT_ID_SOURCES for field in ("uid", "gid"))
+        ):
+            raise InstallPlanError(
+                f"plan account_id_sources.{name} must record one known uid and gid source"
+            )
+
+
 def _validate_account_step_bijection(
     inventory: Mapping[str, Mapping[str, object]],
     steps: Sequence[Mapping[str, object]],
@@ -4371,6 +4722,7 @@ def _validate_apply_plan_schema(plan: Mapping[str, object]) -> list[Mapping[str,
         typed_steps.append(step)
     _validate_candidate_venv(plan, typed_steps)
     _validate_account_step_bijection(account_inventory, typed_steps)
+    _validate_account_id_sources(plan)
     _validate_repository_step_bijection(plan, typed_steps, repo_identity)
     if "host_overlay_sha256" in plan and not _valid_sha256(
         plan.get("host_overlay_sha256")
@@ -8638,6 +8990,7 @@ def verify_receipt(
         "receipt_id": receipt._document["receipt_id"],
         "candidate": deepcopy(plan.get("candidate", {})),
         "service_identities": deepcopy(dict(service_identities)),
+        "account_ids": account_id_summary(plan),
         "artifact_hashes": artifact_hashes,
         "attestation": report.to_dict(),
     }
