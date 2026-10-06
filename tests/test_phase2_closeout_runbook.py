@@ -321,9 +321,16 @@ def test_general_upgrade_documents_interrupts_and_attempt_directory_cleanup() ->
     current = (ROOT / CURRENT).read_text(encoding="utf-8")
 
     section = current[current.index("## 一般升級") : current.index("## 邊界")]
-    # #1270: an interrupt waits for the running installer step; a second one stops it.
+    # #1270: an interrupt waits for the running installer step; SIGHUP (an SSH
+    # drop sends two) never forces a stop, a later INT/TERM stops the step's
+    # whole process group.
     assert "等正在執行的那一步結束" in section
-    assert "再送一次" in section
+    assert "SIGHUP 永遠不會強制中止" in section
+    assert "至少 1 秒後再送一次 INT 或 TERM" in section
+    assert "整個 process group" in section
+    # #1270 review: a moved release-asset host is refused before the window.
+    assert "release asset 的下載 host" in section
+    assert "§1–§5 手動流程" in section
     # #1270: attempt directories are kept; the runbook says which ones may go.
     assert "attempt-*" in section
     assert "不會自動清理" in section

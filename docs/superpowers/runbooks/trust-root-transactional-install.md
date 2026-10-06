@@ -24,8 +24,10 @@ refs:
 
 經 SSH 升級時，一律在 `tmux` 或 `screen` 裡執行 `cortex upgrade`：斷線送出的 SIGHUP 雖會自動
 rollback，但升級本身就此中止，終端機上的摘要也會跟著消失。maintenance window 內的 INT／TERM／HUP
-不會殺掉正在執行的 installer 子程序：工具會等正在執行的那一步結束，再 rollback；同一步還在跑時
-再送一次訊號，才會立即中止該步（之後由 installer 的 journal crash recovery 收拾）。
+不會殺掉正在執行的 installer 子程序：工具在 stderr 印一行提示，等正在執行的那一步結束，再
+rollback。SSH 斷線會連續送出兩個 SIGHUP，因此 SIGHUP 永遠不會強制中止；要立即中止還在跑的那一步，
+在第一個訊號至少 1 秒後再送一次 INT 或 TERM，工具會以 SIGKILL 結束該步的整個 process group（含它
+啟動的子程序）再 rollback，之後由 installer 的 journal crash recovery 收拾。
 
 工具依序執行下列 §1–§5：以 GitHub Releases REST metadata 取得 annotated tag 的 commit target
 與三個 asset digest，驗過 qualification manifest、archive topology 與 bundle 每一個檔案後，
@@ -41,6 +43,10 @@ receipt 一致。生效中的 receipt 由 receipt chain 判定，不看檔名或
 `/var/lib/cortex-installer/<版本>/upgrade-report.json`，終端機印出摘要（`--json` 改印完整報告）。
 
 - 只升不降：目標版本必須高於生效中的 receipt；降版改用 installer `rollback` 或下列手動流程。
+- 下載只跟隨 GitHub 允許清單內的 HTTPS redirect（目前 asset 由 `github.com` 302 到
+  `release-assets.githubusercontent.com`）。若 GitHub 改變 release asset 的下載 host，ingress 會
+  在下載前拒絕該 redirect；這發生在 maintenance window 之前，主機沒有任何改變。此時改照下列
+  §1–§5 手動流程升級，並回報以更新允許清單。
 - 有在飛 job 時預設直接拒絕；`--wait-idle <秒>` 會等到 idle 或逾時。
 - activate 之前的失敗（ingress、plan、apply、credential handoff）會自動 rollback 並恢復原本
   active 的服務。activate 之後的失敗若 rollback 回報 `restore_safe=false`，服務維持停止、

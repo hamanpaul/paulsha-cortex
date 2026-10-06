@@ -15,10 +15,12 @@ import posixpath
 import pwd
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import tarfile
 import tempfile
+import time
 import uuid
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
@@ -45,6 +47,37 @@ from .core import (
 )
 
 
+#: After an interrupted own-session child's process group is killed, how long
+#: to wait for every member to be gone (a member in uninterruptible sleep
+#: dies only when it leaves the kernel).
+_SESSION_DRAIN_SECONDS = 5.0
+
+
+def _stop_session(process: subprocess.Popen[str]) -> None:
+    """SIGKILL an own-session child's whole process group, then reap it.
+
+    With ``start_new_session`` the child is its process group's leader
+    (pgid == pid), and everything it started without leaving that group --
+    venv/pip, useradd, setfacl, git -- is a member.  Killing only the child
+    would leave those running as root while the caller already rolls back.
+    """
+
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        process.kill()
+    process.wait()
+    deadline = time.monotonic() + _SESSION_DRAIN_SECONDS
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(process.pid, 0)
+        except OSError:
+            return
+        time.sleep(0.02)
+
+
 def _run(
     argv: Sequence[str],
     *,
@@ -65,6 +98,9 @@ def _run(
     ``start_new_session``, ``cwd`` and ``timeout`` are opt-in; the defaults keep
     the inherited stdin, session and working directory, and wait without limit.
     A timeout raises ``subprocess.TimeoutExpired`` after the child is killed.
+    When anything interrupts the wait for an own-session child (a timeout, an
+    exception raised by a signal handler), its whole process group is killed
+    and reaped before the exception propagates (``_stop_session``).
     """
 
     if not argv or not all(isinstance(part, str) and part for part in argv):
@@ -86,20 +122,42 @@ def _run(
         if input_text is not None:
             raise InstallPlanError("stdin and input_text are mutually exclusive")
         redirected["stdin"] = stdin
-    result = subprocess.run(
-        list(argv),
-        check=False,
-        capture_output=True,
-        text=True,
-        input=input_text,
-        pass_fds=tuple(pass_fds),
-        env=None if env is None else dict(env),
-        start_new_session=start_new_session,
-        cwd=cwd,
-        timeout=timeout,
-        **redirected,
-        **identity,
-    )
+    if start_new_session:
+        process = subprocess.Popen(
+            list(argv),
+            stdin=subprocess.PIPE if input_text is not None else stdin,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            pass_fds=tuple(pass_fds),
+            env=None if env is None else dict(env),
+            start_new_session=True,
+            cwd=cwd,
+            **identity,
+        )
+        with process:
+            try:
+                stdout, stderr = process.communicate(input_text, timeout=timeout)
+            except BaseException:
+                _stop_session(process)
+                raise
+            returncode = process.poll()
+        assert returncode is not None
+        result = subprocess.CompletedProcess(process.args, returncode, stdout, stderr)
+    else:
+        result = subprocess.run(
+            list(argv),
+            check=False,
+            capture_output=True,
+            text=True,
+            input=input_text,
+            pass_fds=tuple(pass_fds),
+            env=None if env is None else dict(env),
+            cwd=cwd,
+            timeout=timeout,
+            **redirected,
+            **identity,
+        )
     if check and result.returncode != 0:
         detail = (result.stderr or result.stdout or "command failed").strip()
         raise InstallError(f"{argv[0]} failed ({result.returncode}): {detail}")

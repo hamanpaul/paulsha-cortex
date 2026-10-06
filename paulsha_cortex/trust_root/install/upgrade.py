@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from subprocess import CompletedProcess, TimeoutExpired
-from typing import Iterator, Mapping
+from typing import Callable, Iterator, Mapping
 
 from . import cli as install_cli
 from .backend import JOB_ACCOUNT_NAMES, _run
@@ -655,7 +655,10 @@ def produce_plan(
     output = work / "install-plan.json"
     sealed.assert_unchanged()
     # No root stdin, controlling terminal or working directory reaches the
-    # unprivileged plan child (#1270).
+    # unprivileged plan child (#1270).  CPython changes into `cwd` as root,
+    # before it drops to the plan uid (child_exec: chdir, setsid, setgroups,
+    # setregid, setreuid); that is safe because `<attempt>` is root-owned, so
+    # the plan account cannot replace the `plan` directory being entered.
     result = _run(
         (
             str(sealed.cli),
@@ -730,12 +733,29 @@ _ROLLBACK_ERROR_LIMIT = 4000
 
 
 class UpgradeInterrupted(BaseException):
-    """INT/TERM/HUP inside the maintenance window; handled like any step failure."""
+    """INT/TERM/HUP inside the maintenance window; handled like any step failure.
+
+    ``completed`` is the candidate child's result when the signal was held
+    until that step ended; ``detail`` then names how a failed step ended.
+    """
+
+    def __init__(
+        self, signal_name: str, *, completed: CompletedProcess[str] | None = None
+    ) -> None:
+        super().__init__(signal_name)
+        self.completed = completed
+        self.detail: str | None = None
 
 
 # SIGHUP is here because production upgrades run over SSH: a dropped session
 # must roll back and report, not kill the coordinator mid-window.
 _INTERRUPT_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+# A held interrupt escalates to "stop the step now" only for an INT/TERM that
+# arrives at least this long after the first signal (#1270).
+_ESCALATION_MIN_SECONDS = 1.0
+# Where the one-line notice on the first held signal goes; a raw descriptor
+# write, never buffered IO, because it runs inside a signal handler.
+_STDERR_FD = 2
 
 
 @dataclass
@@ -743,44 +763,78 @@ class _InterruptDeferral:
     """While a candidate child mutates the host, the first interrupt waits for it.
 
     Candidate children run in their own session, so the terminal's INT/HUP reach
-    only this coordinator.  Raising inside ``subprocess.run`` would SIGKILL the
-    root child mid-mutation; instead the first signal is held until the child's
-    step ends and is raised right after it.  A second signal while the same
-    child still runs is raised at once: ``subprocess.run`` then stops the child
-    (SIGKILL) and the installer's journal crash recovery covers that step, as it
-    did before #1270.
+    only this coordinator.  Raising inside the wait would kill the root child
+    mid-mutation; instead the first signal is held, one line on stderr says so,
+    and it is raised right after the child's step ends.
+
+    An SSH drop delivers two SIGHUPs about 0.2 ms apart (the shell's hangup to
+    its jobs, then the kernel's to the old foreground process group), so a
+    SIGHUP never escalates.  Only an INT/TERM at least
+    ``_ESCALATION_MIN_SECONDS`` after the first signal stops the step at once:
+    interrupts are ignored from then on and the wait is abandoned, which kills
+    the child's whole process group (``backend._run``) before ``_abort`` rolls
+    back; the installer's journal crash recovery covers the stopped step.
     """
 
     active: bool = False
     pending: str | None = None
+    pending_at: float = 0.0
+    step: str = ""
+
+
+@dataclass
+class _HeldInterrupt:
+    signal: str | None = None
 
 
 _DEFERRAL = _InterruptDeferral()
 
 
+def _say(text: str) -> None:
+    """Best-effort stderr line; after an SSH drop the terminal may answer EIO."""
+
+    try:
+        os.write(_STDERR_FD, text.encode("utf-8", "replace"))
+    except OSError:
+        pass
+
+
 def _interrupt(signum: int, _frame: object) -> None:
     name = signal.Signals(signum).name
-    if _DEFERRAL.active and _DEFERRAL.pending is None:
-        _DEFERRAL.pending = name
-        return
+    if _DEFERRAL.active:
+        if _DEFERRAL.pending is None:
+            _DEFERRAL.pending = name
+            _DEFERRAL.pending_at = time.monotonic()
+            _say(
+                f"cortex upgrade: {name} received; finishing {_DEFERRAL.step}, then "
+                "rolling back; send INT/TERM again to stop now\n"
+            )
+            return
+        if (
+            signum == signal.SIGHUP
+            or time.monotonic() - _DEFERRAL.pending_at < _ESCALATION_MIN_SECONDS
+        ):
+            return
+        # Close the window before `_abort` ignores signals itself.
+        _ignore_interrupts()
     raise UpgradeInterrupted(name)
 
 
 @contextmanager
-def _interrupts_deferred() -> Iterator[None]:
-    """Hold the first interrupt until the enclosed child returns, then raise it."""
+def _interrupts_deferred(step: str) -> Iterator[_HeldInterrupt]:
+    """Hold the first interrupt while the enclosed child runs; report it after."""
 
+    held = _HeldInterrupt()
     # Ordered so a signal between two stores is never lost: ``pending`` is
     # cleared before deferral starts, and deferral ends before it is read.
     _DEFERRAL.pending = None
+    _DEFERRAL.step = step
     _DEFERRAL.active = True
     try:
-        yield
+        yield held
     finally:
         _DEFERRAL.active = False
-        pending, _DEFERRAL.pending = _DEFERRAL.pending, None
-    if pending is not None:
-        raise UpgradeInterrupted(pending)
+        held.signal, _DEFERRAL.pending = _DEFERRAL.pending, None
 
 
 @contextmanager
@@ -804,7 +858,8 @@ def _now() -> str:
 
 def _describe(error: BaseException) -> str:
     if isinstance(error, UpgradeInterrupted):
-        return f"interrupted by {error}"
+        detail = f" ({error.detail})" if error.detail else ""
+        return f"interrupted by {error}{detail}"
     return str(error) or type(error).__name__
 
 
@@ -844,30 +899,72 @@ def _candidate(sealed: SealedCandidate, *arguments: str) -> CompletedProcess[str
 
     The child runs in its own session without root's stdin, so an interrupt
     reaches only this coordinator, which lets the running step finish before it
-    rolls back (see ``_InterruptDeferral``).
+    rolls back (see ``_InterruptDeferral``).  A held interrupt is raised right
+    after the child returns and carries its result (``completed``).
     """
 
     sealed.assert_unchanged()
-    with _interrupts_deferred():
-        return _run(
+    label = " ".join(arguments[:2]) if arguments[:1] == ("credentials",) else arguments[0]
+    with _interrupts_deferred(label) as held:
+        result = _run(
             (str(sealed.cli), "install", "trust-root", *arguments),
             env={**_CANDIDATE_ENV, "PATH": f"{sealed.venv}/bin:{_CANDIDATE_SYSTEM_PATH}"},
             stdin=subprocess.DEVNULL,
             start_new_session=True,
         )
+    if held.signal is not None:
+        raise UpgradeInterrupted(held.signal, completed=result)
+    return result
 
 
-def _candidate_json(sealed: SealedCandidate, step: str, *arguments: str) -> dict[str, object]:
-    result = _candidate(sealed, *arguments)
+def _json_object(stdout: str) -> dict[str, object] | None:
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _candidate_json(
+    sealed: SealedCandidate,
+    step: str,
+    *arguments: str,
+    record: Callable[[dict[str, object]], None] | None = None,
+) -> dict[str, object]:
+    """A candidate step's JSON result; ``record`` keeps it in the report.
+
+    When an interrupt was held until the step ended, the step's outcome is still
+    recorded before the interrupt propagates: ``record`` for a step that
+    succeeded, the failure tail as the interrupt's ``detail`` otherwise.
+    """
+
+    try:
+        result = _candidate(sealed, *arguments)
+    except UpgradeInterrupted as interrupted:
+        completed = interrupted.completed
+        if completed is not None:
+            if completed.returncode != 0:
+                interrupted.detail = f"{step} failed: {_output_tail(completed)}"
+            elif record is not None:
+                finished = _json_object(completed.stdout)
+                if finished is not None:
+                    record(finished)
+        raise
     if result.returncode != 0:
         raise UpgradeError(f"{step} failed: {_output_tail(result)}")
-    try:
-        payload = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise UpgradeError(f"{step} returned invalid JSON") from exc
-    if not isinstance(payload, dict):
+    payload = _json_object(result.stdout)
+    if payload is None:
         raise UpgradeError(f"{step} returned invalid JSON")
+    if record is not None:
+        record(payload)
     return payload
+
+
+def _verify_failure(result: CompletedProcess[str]) -> str:
+    # Refusals reach only stderr and a FAIL result is the JSON on stdout;
+    # without them the report could not say why verify failed.
+    detail = f": {_output_tail(result)}" if _has_output(result) else " with no output"
+    return f"verify did not PASS (exit {result.returncode}){detail}"
 
 
 def _advance(
@@ -889,10 +986,16 @@ def _advance(
         # Likewise set before the child starts, with the id still unknown: a
         # halted or rolled-back report must still name the receipt holding any
         # retained state even when the child never returned (interrupted, or
-        # exited non-zero after writing the file). The success assignment below
-        # overwrites this with the real receipt_id once apply actually returns.
+        # exited non-zero after writing the file). `record_apply` overwrites
+        # this with the real receipt_id once apply returns -- also when an
+        # interrupt was held until it did.
+
+        def record_apply(applied: dict[str, object]) -> None:
+            state.receipt_id = str(applied.get("receipt_id"))
+            report["receipt"] = {"path": receipt, "receipt_id": state.receipt_id}
+
         report["receipt"] = {"path": receipt, "receipt_id": None}
-        applied = _candidate_json(
+        _candidate_json(
             sealed,
             "apply",
             "apply",
@@ -906,9 +1009,8 @@ def _advance(
             str(prior.path),
             "--maintenance-token",
             token,
+            record=record_apply,
         )
-        state.receipt_id = str(applied.get("receipt_id"))
-        report["receipt"] = {"path": receipt, "receipt_id": state.receipt_id}
     with steps.step("credentials"):
         # Called exactly once per transaction attempt — never retried here.
         # `inherit_prior_credentials` (Task 2) refuses a second run against the
@@ -916,7 +1018,11 @@ def _advance(
         # authority`), so a retry loop around this step would not recover;
         # recovery of a transaction that failed after this step belongs to
         # Task 10's `--recover`, not to a loop inside this function.
-        inherited = _candidate_json(
+
+        def record_inherited(inherited: dict[str, object]) -> None:
+            report["inherited_credentials"] = inherited.get("inherited", [])
+
+        _candidate_json(
             sealed,
             "credential inheritance",
             "credentials",
@@ -927,8 +1033,8 @@ def _advance(
             str(prior.path),
             "--maintenance-token",
             token,
+            record=record_inherited,
         )
-        report["inherited_credentials"] = inherited.get("inherited", [])
     with steps.step("activate"):
         state.activation_attempted = True
         _candidate_json(
@@ -937,22 +1043,24 @@ def _advance(
     with steps.step("verify"):
         evidence = sealed.attempt_dir / "install-verification.json"
         report["verify_evidence"] = str(evidence)
-        verified = _candidate(
-            sealed,
-            "verify",
-            "--receipt",
-            receipt,
-            "--json",
-            "--evidence",
-            str(evidence),
-            "--maintenance-token",
-            token,
-        )
+        try:
+            verified = _candidate(
+                sealed,
+                "verify",
+                "--receipt",
+                receipt,
+                "--json",
+                "--evidence",
+                str(evidence),
+                "--maintenance-token",
+                token,
+            )
+        except UpgradeInterrupted as interrupted:
+            if interrupted.completed is not None and interrupted.completed.returncode != 0:
+                interrupted.detail = _verify_failure(interrupted.completed)
+            raise
         if verified.returncode != 0:
-            # Refusals reach only stderr and a FAIL result is the JSON on stdout;
-            # without them the report could not say why verify failed.
-            detail = f": {_output_tail(verified)}" if _has_output(verified) else " with no output"
-            raise UpgradeError(f"verify did not PASS (exit {verified.returncode}){detail}")
+            raise UpgradeError(_verify_failure(verified))
         inactive = [
             service
             for service in install_cli._MAINTENANCE_SERVICES

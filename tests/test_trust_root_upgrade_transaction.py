@@ -8,6 +8,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -484,41 +485,76 @@ def test_candidate_children_run_in_their_own_session_without_the_callers_stdin(
 
 
 _SIGNAL_PARENT = (
-    "import os, signal, sys, time\n"
-    "for _ in range(int(sys.argv[2])):\n"
-    "    os.kill(os.getppid(), signal.SIGTERM)\n"
-    "    time.sleep(0.3)\n"
-    "time.sleep(float(sys.argv[3]))\n"
-    "open(sys.argv[1], 'w').write('finished')\n"
+    "import os, signal, subprocess, sys, time\n"
+    "marker, plan, linger, grandchild = sys.argv[1:5]\n"
+    "if grandchild != '-':\n"
+    "    subprocess.Popen(['sh', '-c', 'sleep 1.5; touch ' + grandchild])\n"
+    "for step in plan.split(','):\n"
+    "    name, gap = step.split(':')\n"
+    "    os.kill(os.getppid(), getattr(signal, 'SIG' + name))\n"
+    "    time.sleep(float(gap))\n"
+    "time.sleep(float(linger))\n"
+    "open(marker, 'w').write('finished')\n"
 )
 
 
 def _apply_child_signals_the_coordinator(
-    harness, monkeypatch: pytest.MonkeyPatch, marker: Path, *, signals: int, linger: float
+    harness,
+    monkeypatch: pytest.MonkeyPatch,
+    marker: Path,
+    *,
+    plan: str,
+    linger: float,
+    grandchild: Path | None = None,
 ) -> None:
-    """Run a real child for `apply` that sends SIGTERM to the coordinator mid-step."""
+    """Run a real child for `apply` that signals the coordinator mid-step.
+
+    ``plan`` is ``NAME:gap[,NAME:gap...]``: each signal is sent to the
+    coordinator, then the child sleeps ``gap`` seconds.
+    """
 
     candidate = harness.cli
 
     def run(argv, **kwargs):
         if tuple(argv)[3:4] == ("apply",):
-            child = install_backend._run(
-                (sys.executable, "-c", _SIGNAL_PARENT, str(marker), str(signals), str(linger)),
+            install_backend._run(
+                (
+                    sys.executable,
+                    "-c",
+                    _SIGNAL_PARENT,
+                    str(marker),
+                    plan,
+                    str(linger),
+                    str(grandchild) if grandchild is not None else "-",
+                ),
                 **kwargs,
             )
-            assert child.returncode == 0, child.stderr
         return candidate(argv, **kwargs)
 
     monkeypatch.setattr(upgrade, "_run", run)
 
 
+@contextmanager
+def _recording_handlers(*signums: int) -> Iterator[list[int]]:
+    received: list[int] = []
+    previous = {
+        signum: signal.signal(signum, lambda number, _frame: received.append(number))
+        for signum in signums
+    }
+    try:
+        yield received
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
 def test_a_real_sigterm_lets_the_running_installer_step_finish_then_rolls_back(
-    harness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    harness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capfd: pytest.CaptureFixture[str]
 ) -> None:
     # #1270: a signal while a root child mutates the host must not SIGKILL that
     # child; the coordinator waits for the step to end, then rolls back.
     marker = tmp_path / "apply-child"
-    _apply_child_signals_the_coordinator(harness, monkeypatch, marker, signals=1, linger=0.5)
+    _apply_child_signals_the_coordinator(harness, monkeypatch, marker, plan="TERM:0", linger=0.5)
 
     with _recording_handler(signal.SIGTERM) as received:
         code, report = _run_transaction(harness)
@@ -528,37 +564,144 @@ def test_a_real_sigterm_lets_the_running_installer_step_finish_then_rolls_back(
     assert code == 1
     assert report["failed_step"] == "apply"
     assert report["error"] == "interrupted by SIGTERM"
+    # The step finished before the held signal was raised: its result is kept.
+    assert report["receipt"] == {
+        "path": str(harness.bound.receipt_path),
+        "receipt_id": "new-receipt",
+    }
     assert report["result"] == "rolled-back"
     assert "rollback" in harness.cli.commands()
     assert "credentials inherit" not in harness.cli.commands()
     assert harness.systemd.active == set(fx.SERVICES)
+    # One line tells the operator what happens and how to stop now.
+    assert capfd.readouterr().err.count(
+        "SIGTERM received; finishing apply, then rolling back; "
+        "send INT/TERM again to stop now"
+    ) == 1
 
 
-def test_a_second_signal_stops_a_running_installer_step_at_once(
+def test_a_held_signal_after_a_failed_step_reports_the_failure_too(
     harness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    # An operator who signals again does not wait for a hung step: the child is
-    # stopped (journal crash recovery covers it) and the upgrade rolls back.
-    marker = tmp_path / "apply-child"
+    harness.cli.fail["apply"] = "preflight failed: boom"
+    _apply_child_signals_the_coordinator(
+        harness, monkeypatch, tmp_path / "apply-child", plan="TERM:0", linger=0.3
+    )
 
-    def run(argv, **kwargs):
-        if tuple(argv)[3:4] == ("apply",):
-            install_backend._run(
-                (sys.executable, "-c", _SIGNAL_PARENT, str(marker), "2", "60"), **kwargs
-            )
-        return harness.cli(argv, **kwargs)
-
-    monkeypatch.setattr(upgrade, "_run", run)
-
-    with _recording_handler(signal.SIGTERM) as received:
+    with _recording_handler(signal.SIGTERM):
         code, report = _run_transaction(harness)
 
+    assert code == 1
+    assert report["error"] == (
+        "interrupted by SIGTERM (apply failed: trust-root install failed: preflight failed: boom)"
+    )
+    assert report["result"] == "rolled-back"
+
+
+def test_the_first_signal_notice_survives_a_dead_terminal(
+    harness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # After an SSH drop stderr may fail with EIO; the notice must not turn into
+    # an exception inside the signal handler.
+    read_end, write_end = os.pipe()
+    os.close(read_end)
+    monkeypatch.setattr(upgrade, "_STDERR_FD", write_end)
+    marker = tmp_path / "apply-child"
+    _apply_child_signals_the_coordinator(harness, monkeypatch, marker, plan="HUP:0", linger=0.3)
+    try:
+        with _recording_handler(signal.SIGHUP):
+            code, report = _run_transaction(harness)
+    finally:
+        os.close(write_end)
+
+    assert marker.read_text() == "finished"
+    assert report["error"] == "interrupted by SIGHUP"
+    assert report["result"] == "rolled-back"
+
+
+@pytest.mark.parametrize("gap", ["0", "0.4"], ids=["back-to-back", "spaced"])
+def test_two_sighups_from_an_ssh_drop_never_stop_the_running_step(
+    harness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, gap: str
+) -> None:
+    # #1270 review: an SSH drop delivers two SIGHUPs (the shell's hangup to its
+    # jobs and the kernel's to the old foreground group).  The second one must
+    # not escalate to "stop now", however late it comes.
+    monkeypatch.setattr(upgrade, "_ESCALATION_MIN_SECONDS", 0.1)
+    marker = tmp_path / "apply-child"
+    grandchild = tmp_path / "apply-grandchild"
+    _apply_child_signals_the_coordinator(
+        harness, monkeypatch, marker, plan=f"HUP:{gap},HUP:0", linger=1.5, grandchild=grandchild
+    )
+
+    with _recording_handler(signal.SIGHUP) as received:
+        code, report = _run_transaction(harness)
+
+    assert marker.read_text() == "finished"
+    assert grandchild.exists()
+    assert received == []
+    assert code == 1
+    assert report["error"] == "interrupted by SIGHUP"
+    assert report["result"] == "rolled-back"
+
+
+def test_a_second_interrupt_within_the_escalation_delay_is_ignored(
+    harness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    assert upgrade._ESCALATION_MIN_SECONDS >= 1.0
+    marker = tmp_path / "apply-child"
+    _apply_child_signals_the_coordinator(
+        harness, monkeypatch, marker, plan="TERM:0.3,INT:0", linger=0.3
+    )
+
+    with _recording_handlers(signal.SIGTERM, signal.SIGINT) as received:
+        code, report = _run_transaction(harness)
+
+    assert marker.read_text() == "finished"
+    assert received == []
+    assert report["error"] == "interrupted by SIGTERM"
+    assert report["result"] == "rolled-back"
+
+
+def test_a_later_interrupt_stops_the_step_and_its_whole_process_group(
+    harness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # An operator who signals again does not wait for a hung step.  The child
+    # and everything it started (its own process group) are killed before the
+    # rollback runs; nothing it spawned may touch the host afterwards.
+    monkeypatch.setattr(upgrade, "_ESCALATION_MIN_SECONDS", 0.2)
+    marker = tmp_path / "apply-child"
+    grandchild = tmp_path / "apply-grandchild"
+    _apply_child_signals_the_coordinator(
+        harness, monkeypatch, marker, plan="HUP:0.5,TERM:0", linger=60, grandchild=grandchild
+    )
+
+    with _recording_handlers(signal.SIGHUP, signal.SIGTERM) as received:
+        code, report = _run_transaction(harness)
+    time.sleep(2.0)
+
     assert not marker.exists()
+    assert not grandchild.exists()
     assert received == []
     assert code == 1
     assert report["failed_step"] == "apply"
     assert report["error"] == "interrupted by SIGTERM"
     assert report["result"] == "rolled-back"
+
+
+def test_escalation_ignores_further_interrupts_before_it_raises() -> None:
+    # #1270 review: no window between the escalation and `_abort` ignoring signals.
+    before = {signum: signal.getsignal(signum) for signum in upgrade._INTERRUPT_SIGNALS}
+    with upgrade._signals_raise():
+        with upgrade._interrupts_deferred("apply"):
+            upgrade._DEFERRAL.pending = "SIGTERM"
+            upgrade._DEFERRAL.pending_at = time.monotonic() - 60
+            with pytest.raises(upgrade.UpgradeInterrupted, match="SIGINT"):
+                upgrade._interrupt(signal.SIGINT, None)
+            assert all(
+                signal.getsignal(signum) == signal.SIG_IGN
+                for signum in upgrade._INTERRUPT_SIGNALS
+            )
+    assert {signum: signal.getsignal(signum) for signum in upgrade._INTERRUPT_SIGNALS} == before
 
 
 def test_a_hung_service_status_probe_times_out_as_unavailable(

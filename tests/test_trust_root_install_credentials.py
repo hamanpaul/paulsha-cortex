@@ -1855,3 +1855,19 @@ def test_live_validation_hashes_at_most_the_credential_size_cap(
     monkeypatch.setattr(install_backend, "_CREDENTIAL_MAX_BYTES", len(content) - 1)
 
     assert backend.validate_credentials(prior) == ("builder/codex unavailable",)
+
+
+def test_credential_import_refuses_a_fifo_destination_without_blocking(tmp_path: Path) -> None:
+    # #1270 review: `credentials import` opens an existing destination (and a
+    # fallback temp) in an account-owned directory; a FIFO there must be
+    # refused, not block the root importer in open().
+    fifo = tmp_path / "auth.json"
+    os.mkfifo(fifo, 0o600)
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(CredentialImportError, match="not a safe regular file"):
+            upgrade_fixtures.call_without_blocking_on(
+                fifo, lambda: install_core._open_regular_at(parent_fd, "auth.json")
+            )
+    finally:
+        os.close(parent_fd)

@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import tarfile
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Mapping
@@ -3059,3 +3060,43 @@ def test_run_enforces_an_optional_timeout() -> None:
         backend_module._run(
             (sys.executable, "-c", "import time; time.sleep(30)"), timeout=0.2
         )
+
+
+def test_an_interrupted_own_session_child_is_stopped_with_its_whole_process_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #1270 review: with start_new_session the child's own children share its
+    # new process group; stopping only the direct child let a grandchild keep
+    # mutating the host as root while rollback ran.
+    marker = tmp_path / "grandchild"
+    started = tmp_path / "started"
+    script = (
+        "import pathlib, subprocess, sys, time\n"
+        f"subprocess.Popen(['sh', '-c', 'sleep 1; touch {marker}'])\n"
+        f"pathlib.Path({str(started)!r}).write_text('x')\n"
+        "time.sleep(30)\n"
+    )
+
+    class Stop(BaseException):
+        pass
+
+    real_communicate = subprocess.Popen.communicate
+
+    def communicate_then_stop(self, *args, **kwargs):
+        deadline = time.monotonic() + 10
+        while not started.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        raise Stop
+
+    monkeypatch.setattr(subprocess.Popen, "communicate", communicate_then_stop)
+    with pytest.raises(Stop):
+        backend_module._run(
+            (sys.executable, "-c", script),
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    monkeypatch.setattr(subprocess.Popen, "communicate", real_communicate)
+
+    time.sleep(1.5)
+    assert started.exists()
+    assert not marker.exists()
