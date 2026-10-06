@@ -73,12 +73,14 @@ def _assert_in_flight_shape(rows: list[dict]) -> None:
 
 class FakeRegistry:
     def __init__(self, jobs: list[dict] | None = None) -> None:
+        self._lock = threading.RLock()
         self._jobs = list(jobs or [])
         self._seq = len(self._jobs)
         self._slices: list[dict] = []
 
     def list_jobs(self) -> list[dict]:
-        return [dict(job) for job in self._jobs]
+        with self._lock:
+            return [dict(job) for job in self._jobs]
 
     def create_job(
         self,
@@ -127,7 +129,8 @@ class FakeRegistry:
             "verification_hash": verification_hash,
             "workflow_repo": workflow_repo,
         }
-        self._jobs.append(job)
+        with self._lock:
+            self._jobs.append(job)
         return dict(job)
 
     def attach_launch_handle(
@@ -141,23 +144,25 @@ class FakeRegistry:
         log_path: str | None = None,
         template_instance: str | None = None,
     ) -> dict:
-        for job in self._jobs:
-            if job["job_id"] == job_id:
-                job["executor"] = executor
-                if model_id is not None:
-                    job["model_id"] = model_id
-                job["session_name"] = session_name
-                job["pid"] = pid
-                job["log_path"] = log_path
-                job["template_instance"] = template_instance
-                return dict(job)
+        with self._lock:
+            for job in self._jobs:
+                if job["job_id"] == job_id:
+                    job["executor"] = executor
+                    if model_id is not None:
+                        job["model_id"] = model_id
+                    job["session_name"] = session_name
+                    job["pid"] = pid
+                    job["log_path"] = log_path
+                    job["template_instance"] = template_instance
+                    return dict(job)
         raise KeyError(job_id)
 
     def update_status(self, job_id: str, status: str) -> dict:
-        for job in self._jobs:
-            if job["job_id"] == job_id:
-                job["status"] = status
-                return dict(job)
+        with self._lock:
+            for job in self._jobs:
+                if job["job_id"] == job_id:
+                    job["status"] = status
+                    return dict(job)
         raise KeyError(job_id)
 
     def create_slice(
@@ -771,6 +776,252 @@ def test_long_request_background_execution_preserves_status_and_serializes_reque
     done2 = contract.read_json(constants.done_dir() / f"{req2_id}.json")
     assert done1 is not None and done1["status"] == "ok"
     assert done2 is not None and done2["status"] == "ok"
+
+
+def test_job_registry_concurrent_mutation_and_read_is_thread_safe(tmp_path):
+    from paulsha_cortex.coordinator.registry import JobRegistry
+
+    state_path = tmp_path / "coordinator_state.json"
+    registry = JobRegistry(state_path=state_path)
+
+    stop_event = threading.Event()
+    errors: list[Exception] = []
+
+    def writer():
+        seq = 0
+        while not stop_event.is_set() and seq < 80:
+            seq += 1
+            try:
+                task_id = f"slice-{seq % 5}"
+                job = registry.create_job(
+                    task=task_id,
+                    persona="builder",
+                    branch=f"branch-{seq}",
+                    pane=f"pane-{seq}",
+                    worktree=str(tmp_path / f"wt-{seq}"),
+                )
+                registry.update_status(job["job_id"], "running")
+                registry.update_status(job["job_id"], "exited")
+            except Exception as exc:
+                errors.append(exc)
+                break
+
+    def reader():
+        while not stop_event.is_set():
+            try:
+                jobs = registry.list_jobs()
+                slices = registry.list_slices()
+                runs = registry.list_workflow_runs()
+                assert isinstance(jobs, list)
+                assert isinstance(slices, list)
+                assert isinstance(runs, list)
+                for job in jobs:
+                    _ = job.get("status")
+            except Exception as exc:
+                errors.append(exc)
+                break
+
+    writer_thread = threading.Thread(target=writer, daemon=True)
+    reader_threads = [threading.Thread(target=reader, daemon=True) for _ in range(4)]
+
+    for t in reader_threads:
+        t.start()
+    writer_thread.start()
+
+    writer_thread.join(timeout=10)
+    stop_event.set()
+    for t in reader_threads:
+        t.join(timeout=5)
+
+    assert not errors, f"Concurrent registry access raised errors: {errors}"
+
+
+def test_long_request_background_execution_allows_periodic_tick_and_job_reaping(monkeypatch, tmp_path):
+    from paulsha_cortex.control import client
+
+    control_root = tmp_path / "control"
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(control_root))
+    monkeypatch.setattr(client.os, "kill", lambda pid, sig: None)
+
+    gate_started = threading.Event()
+    gate_proceed = threading.Event()
+    reaped_event = threading.Event()
+
+    def fake_work_action(args, requested_by):
+        action = args.get("action")
+        if action == "regenerate-gates":
+            gate_started.set()
+            assert gate_proceed.wait(timeout=5)
+            return {"action": "regenerate-gates", "regenerated": True}
+        return {"action": action}
+
+    registry = FakeRegistry([
+        {
+            "job_id": "slice-a-1",
+            "task": "slice-a",
+            "persona": "builder",
+            "status": "running",
+            "branch": "b-1",
+            "pane": "p-1",
+            "worktree": str(tmp_path / "wt-1"),
+        }
+    ])
+
+    reaper_called = []
+
+    def fake_reaper():
+        reaper_called.append(True)
+        registry.update_status("slice-a-1", "exited")
+        reaped_event.set()
+        return {"reaped": ["slice-a-1"]}
+
+    dispatcher = SimpleNamespace(_registry=registry)
+    executor = manager_daemon.build_request_executor(
+        dispatcher=dispatcher,
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(tmp_path / "handoff"),
+        scan_specs_fn=lambda _: [],
+        work_action_fn=fake_work_action,
+    )
+
+    req_id = "req-1-long"
+    _write_request(
+        req_id,
+        type="work-action",
+        args={
+            "action": "regenerate-gates",
+            "repo": "acme/demo",
+            "work_id": "demo",
+            "expected_run_id": "workflow-0123456789abcdef0123",
+        },
+    )
+
+    tick_calls = []
+
+    def fake_periodic_tick_runner():
+        tick_calls.append(True)
+        fake_reaper()
+        return {"dispatch_skipped": False, "reaped": ["slice-a-1"]}
+
+    simulated_monotonic = [0.0]
+
+    def monotonic_fn():
+        return simulated_monotonic[0]
+
+    def sleep_fn(_interval):
+        simulated_monotonic[0] += 10.0
+        time.sleep(0.01)
+
+    runner = threading.Thread(
+        target=manager_daemon.run_loop,
+        kwargs={
+            "request_executor": executor,
+            "status_provider": lambda: {
+                "ready": [],
+                "in_flight": [j for j in registry.list_jobs() if j.get("status") in {"dispatched", "running"}],
+                "recent_done": [j for j in registry.list_jobs() if j.get("status") in {"exited", "failed"}],
+            },
+            "periodic_tick_runner": fake_periodic_tick_runner,
+            "poll_interval": 0.01,
+            "tick_interval": 5.0,
+            "now_fn": lambda: datetime.now(timezone.utc).isoformat(),
+            "monotonic_fn": monotonic_fn,
+            "sleep_fn": sleep_fn,
+            "pid": 5678,
+            "max_rounds": 50,
+            "registry": registry,
+        },
+        daemon=True,
+    )
+    runner.start()
+
+    assert gate_started.wait(timeout=5)
+    assert reaped_event.wait(timeout=5)
+    assert len(tick_calls) >= 1
+
+    status = None
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        s = client.read_status()
+        if s.get("busy") and s.get("in_flight") == []:
+            status = s
+            break
+        time.sleep(0.02)
+
+    assert status is not None
+    assert status["busy"] is True
+    assert status["activity"]["action"] == "regenerate-gates"
+    assert status["in_flight"] == []
+    assert len(status["recent_done"]) == 1
+    assert status["recent_done"][0]["job_id"] == "slice-a-1"
+
+    gate_proceed.set()
+    runner.join(timeout=5)
+
+    done = contract.read_json(constants.done_dir() / f"{req_id}.json")
+    assert done is not None and done["status"] == "ok"
+
+
+def test_periodic_tick_skips_resuming_active_background_workflow_run(tmp_path):
+    class FakeRun:
+        def __init__(self, run_id, repo, work_id, phase="build"):
+            self.run_id = run_id
+            self.repo = repo
+            self.work_id = work_id
+            self.status = "ongoing"
+            self.facets = ()
+            self.current_phase = phase
+            self.source_revision = "0" * 64
+            self.claim_key = "claim:v1:test"
+
+    resumed_runs = []
+
+    class FakeWorkflowRegistry:
+        def __init__(self, runs):
+            self._runs = runs
+            self._lock = threading.RLock()
+
+        def list_workflow_runs(self):
+            return list(self._runs)
+
+        def list_jobs(self):
+            return []
+
+    active_run = FakeRun("wf-active", "acme/demo", "work-1")
+    other_run = FakeRun("wf-other", "acme/demo", "work-2")
+
+    registry = FakeWorkflowRegistry([active_run, other_run])
+    dispatcher = SimpleNamespace(_registry=registry)
+
+    def fake_resume(disp, run_id, **kwargs):
+        resumed_runs.append(run_id)
+        return {"run_id": run_id}
+
+    active_activity = {
+        "action": "regenerate-gates",
+        "repo": "acme/demo",
+        "work_id": "work-1",
+        "run_id": "wf-active",
+    }
+
+    runner = manager_daemon.build_periodic_tick_runner(
+        dispatcher=dispatcher,
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(tmp_path / "handoff"),
+        scan_specs_fn=lambda _: [],
+        run_tick_fn=lambda *args, **kwargs: {},
+        active_request_provider=lambda: active_activity,
+    )
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(manager_daemon.manager, "resume_workflow_run", fake_resume)
+        mp.setattr(manager_daemon.manager, "run_auto_claim_scan", lambda **kwargs: [])
+        mp.setattr(manager_daemon.manager, "reconcile_planning_transactions", lambda **kwargs: [])
+        mp.setattr(manager_daemon.manager, "reconcile_quota_admission_reservations", lambda **kwargs: None)
+        runner()
+
+    assert "wf-active" not in resumed_runs
+    assert "wf-other" in resumed_runs
 
 
 def test_run_loop_idle_poll_backoff_is_bounded_at_ten_seconds(monkeypatch, tmp_path):

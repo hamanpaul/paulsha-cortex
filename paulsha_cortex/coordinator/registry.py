@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fcntl
+import functools
 import hashlib
 import json
 import math
@@ -8,12 +9,28 @@ import os
 import re
 import stat
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
+
+
+def _synchronized(func: Callable) -> Callable:
+    """Acquire the JobRegistry thread lock during execution to protect in-memory structures."""
+
+    @functools.wraps(func)
+    def wrapper(self, *args, **kwargs):
+        lock = getattr(self, "_lock", None)
+        if lock is not None:
+            with lock:
+                return func(self, *args, **kwargs)
+        return func(self, *args, **kwargs)
+
+    return wrapper
+
 
 from paulsha_cortex.config import paths
 from . import terminal_contract, verification
@@ -2387,6 +2404,7 @@ class JobRegistry:
         )
         self.canonical_state_path = canonical_state_path(self._state_path)
         self.state_transaction_lock_path = state_transaction_lock_path(self._state_path)
+        self._lock = threading.RLock()
         self._seq_start = seq_start
         self._jobs: list[dict[str, Any]] = []
         self._slices: list[dict[str, Any]] = []
@@ -6837,3 +6855,18 @@ class JobRegistry:
         self._workflows[index] = updated
         self._persist()
         return self._copy_workflow_run(updated)
+
+    @property
+    def lock(self) -> threading.RLock:
+        """The reentrant thread lock protecting in-memory coordinator state."""
+        return self._lock
+
+
+for _name, _member in list(JobRegistry.__dict__.items()):
+    if (
+        callable(_member)
+        and not _name.startswith("__")
+        and not isinstance(JobRegistry.__dict__[_name], (staticmethod, property))
+        and _name not in {"_hold_state_transaction_lock"}
+    ):
+        setattr(JobRegistry, _name, _synchronized(_member))

@@ -1482,6 +1482,7 @@ def build_periodic_tick_runner(
     workflow_identity_registry=None,
     workflow_ship_validator=None,
     spawn_admission: SpawnAdmissionLimiter | None = None,
+    active_request_provider: Callable[[], dict[str, Any] | None] | None = None,
 ) -> Callable[[], dict[str, Any]]:
     """#381：``spawn_admission``（若提供）在同一個 runner 的整個生命週期內只解析
     一次，讓 workflow resume 迴圈與其後的 run_tick（fanout）在同一輪、甚至跨輪
@@ -1556,6 +1557,9 @@ def build_periodic_tick_runner(
             # #839 production 接線 b：本輪 tick 內所有 resume 呼叫與稍後的
             # reserved／bound 收斂掃描（c）共用同一個 context——同一次讀檔／
             # 解析結果，不必每個 workflow 各自重建。
+            active_request = (
+                active_request_provider() if active_request_provider is not None else None
+            )
             for workflow in registry.list_workflow_runs():
                 if (
                     workflow.status != "ongoing"
@@ -1574,6 +1578,19 @@ def build_periodic_tick_runner(
                     )
                 ):
                     continue
+                if active_request is not None:
+                    active_run_id = active_request.get("run_id")
+                    active_work_id = active_request.get("work_id")
+                    active_repo = active_request.get("repo")
+                    if (
+                        (active_run_id and workflow.run_id == active_run_id)
+                        or (
+                            active_work_id
+                            and workflow.work_id == active_work_id
+                            and (not active_repo or workflow.repo == active_repo)
+                        )
+                    ):
+                        continue
                 # #536：define 必須在集合內。實測 run `workflow-7a430d31eff66ef13630`
                 # 停在 define/ongoing/facets 空（brainstorm 已發佈 artifacts 但 run
                 # 狀態未推進——發佈與狀態更新非同一事務），而 resume 迴圈排除
@@ -1880,6 +1897,7 @@ def run_loop(
         recent_done_window_seconds=recent_done_window_seconds,
         now_fn=now_fn,
     )
+    pending_request: _PendingRequest | None = None
     if periodic_tick_runner is not None:
         periodic_runner = periodic_tick_runner
     else:
@@ -1891,6 +1909,9 @@ def run_loop(
             "require_idle": require_idle,
             "default_executor": resolved_default_executor,
             "reaper": reaper,
+            "active_request_provider": lambda: (
+                pending_request.activity if pending_request is not None else None
+            ),
         }
         if default_model is not None:
             periodic_kwargs["default_model"] = default_model
@@ -1908,7 +1929,9 @@ def run_loop(
             periodic_kwargs["spawn_admission"] = spawn_admission
         if default_max_load is not None:
             periodic_kwargs["default_max_load"] = default_max_load
-        periodic_runner = build_periodic_tick_runner(**periodic_kwargs)
+        periodic_runner = _call_with_supported_kwargs(
+            build_periodic_tick_runner, **periodic_kwargs
+        )
 
     constants.requests_dir().mkdir(parents=True, exist_ok=True)
     constants.done_dir().mkdir(parents=True, exist_ok=True)
@@ -1926,7 +1949,6 @@ def run_loop(
     # #716：最近一輪 periodic tick 中「resume 沒派 job、也沒轉 needs_human」的
     # workflow 與原因，寫進 status.json 供 inspect status／canary 診斷。
     last_workflow_waits: list[dict[str, Any]] = []
-    pending_request: _PendingRequest | None = None
     _reset_log_error_dedup_state()
 
     def _drain_pending_request() -> bool:
@@ -1993,9 +2015,7 @@ def run_loop(
             snapshot: dict[str, Any] = {}
             request_paths = sorted(constants.requests_dir().glob("*.json"), key=_request_sort_key)
             pending_request_blocking = _drain_pending_request()
-            if pending_request_blocking:
-                request_drain_interrupted = True
-            else:
+            if not pending_request_blocking:
                 for request_path in request_paths:
                     if not request_path.exists():
                         continue
@@ -2054,7 +2074,6 @@ def run_loop(
                             )
                             daemon_idle = False
                             activity_written = False
-                            request_drain_interrupted = True
                             break
 
                         done_payload = contract.build_done(
@@ -2112,7 +2131,7 @@ def run_loop(
                 try:
                     summary = periodic_runner()
                     skipped = isinstance(summary, dict) and summary.get("dispatch_skipped") == "not-idle"
-                    daemon_idle = not skipped
+                    daemon_idle = not skipped and pending_request is None
                     if not skipped:
                         waits = summary.get("workflow_waits") if isinstance(summary, dict) else None
                         last_workflow_waits = list(waits) if isinstance(waits, list) else []
@@ -2146,7 +2165,7 @@ def run_loop(
                     daemon={
                         "pid": runtime_pid,
                         "last_tick_at": last_tick_at,
-                        "idle": daemon_idle,
+                        "idle": daemon_idle and pending_request is None,
                         "consecutive_tick_failures": consecutive_tick_failures,
                         "tick_circuit_open": tick_circuit_open,
                         "last_tick_error": last_tick_error,
