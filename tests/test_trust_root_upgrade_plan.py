@@ -6,6 +6,7 @@ import json
 import os
 import re
 import stat
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -257,3 +258,73 @@ def test_plan_refuses_a_replay_of_the_same_plan_via_the_real_handoff_check(
     ):
         upgrade.produce_plan(sealed, prior, options=upgrade.UpgradeOptions(version="0.1.12"))
     assert not (tmp_path / "installer" / "plans").exists()
+
+
+def test_the_plan_child_gets_no_terminal_stdin_or_root_working_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, planning
+) -> None:
+    # #1270: the unprivileged plan child must not inherit root's stdin,
+    # controlling terminal or working directory.
+    sealed = fx.make_sealed(tmp_path)
+    cli = fx.FakePlanCli(_new_plan(tmp_path))
+    options: list[dict[str, object]] = []
+
+    def run(argv, **kwargs):
+        options.append(kwargs)
+        return cli(argv, **kwargs)
+
+    monkeypatch.setattr(upgrade, "_run", run)
+    monkeypatch.setattr(upgrade, "_lookup_account", lambda name: fx.account(65534, 65534))
+
+    upgrade.produce_plan(
+        sealed, fx.make_prior(tmp_path), options=upgrade.UpgradeOptions(version="0.1.13")
+    )
+
+    assert options[0]["stdin"] == subprocess.DEVNULL
+    assert options[0]["start_new_session"] is True
+    assert options[0]["cwd"] == sealed.attempt_dir / "plan"
+
+
+def test_a_plan_output_swapped_for_a_fifo_is_refused_without_blocking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, planning
+) -> None:
+    # #1270: the plan account owns the output directory and can replace the
+    # plan file with a FIFO; root must refuse it instead of blocking in open().
+    sealed = fx.make_sealed(tmp_path)
+    cli = fx.FakePlanCli(_new_plan(tmp_path))
+    output = sealed.attempt_dir / "plan" / "install-plan.json"
+
+    def run(argv, **kwargs):
+        result = cli(argv, **kwargs)
+        output.unlink()
+        os.mkfifo(output, 0o600)
+        return result
+
+    monkeypatch.setattr(upgrade, "_run", run)
+    monkeypatch.setattr(upgrade, "_lookup_account", lambda name: fx.account(65534, 65534))
+
+    with pytest.raises(upgrade.UpgradeError, match="single-link regular file"):
+        fx.call_without_blocking_on(
+            output,
+            lambda: upgrade.produce_plan(
+                sealed, fx.make_prior(tmp_path), options=upgrade.UpgradeOptions(version="0.1.13")
+            ),
+        )
+    assert not (tmp_path / "installer" / "plans").exists()
+
+
+def test_durable_plan_publication_refuses_a_fifo_target_without_blocking(
+    tmp_path: Path, planning
+) -> None:
+    plans = tmp_path / "installer" / "plans"
+    plans.mkdir(parents=True)
+    plans.chmod(0o700)
+    payload = b'{"plan": 1}\n'
+    sha = hashlib.sha256(payload).hexdigest()
+    fifo = plans / f"{sha}.json"
+    os.mkfifo(fifo, 0o600)
+
+    with pytest.raises(upgrade.UpgradeError, match="does not match reviewed bytes"):
+        fx.call_without_blocking_on(
+            fifo, lambda: upgrade.publish_durable_plan(payload, sha, plans_root=plans)
+        )

@@ -23,6 +23,7 @@ import re
 import secrets
 import signal
 import stat
+import subprocess
 import sys
 import time
 from argparse import Namespace
@@ -30,8 +31,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from subprocess import CompletedProcess
-from typing import Iterator, Mapping
+from subprocess import CompletedProcess, TimeoutExpired
+from typing import Callable, Iterator, Mapping
 
 from . import cli as install_cli
 from .backend import JOB_ACCOUNT_NAMES, _run
@@ -66,6 +67,8 @@ _CHAIN_STOP = Path("/")
 _IDLE_POLL_SECONDS = 5.0
 _STATUS_SETTLE_SECONDS = 60.0
 _STATUS_POLL_SECONDS = 2.0
+# One `cortex service status` call; a hung probe counts as unavailable (#1270).
+_STATUS_TIMEOUT_SECONDS = 60.0
 _JOB_ACCOUNTS = JOB_ACCOUNT_NAMES
 _sleep = time.sleep
 _monotonic = time.monotonic
@@ -214,6 +217,10 @@ def check_target_version(
 _CHILD_OUTPUT_LIMIT = 4000
 
 
+def _has_output(result: CompletedProcess[str]) -> bool:
+    return bool((result.stderr or "").strip() or (result.stdout or "").strip())
+
+
 def _output_tail(result: CompletedProcess[str]) -> str:
     """A failed child's stderr and stdout, each cut to its last characters.
 
@@ -227,9 +234,17 @@ def _output_tail(result: CompletedProcess[str]) -> str:
         if text
     ]
     if not parts:
-        return f"exit {result.returncode}"
+        return f"exit {result.returncode} with no output"
     limit = _CHILD_OUTPUT_LIMIT // len(parts)
     return " | ".join(text if len(text) <= limit else "…" + text[-limit:] for text in parts)
+
+
+def _exit_detail(result: CompletedProcess[str]) -> str:
+    """``exit N: <output tail>``; a silent child names its exit code once (#1270)."""
+
+    if not _has_output(result):
+        return _output_tail(result)
+    return f"exit {result.returncode}: {_output_tail(result)}"
 
 
 @dataclass(frozen=True)
@@ -261,11 +276,12 @@ def _service_status(plan: Mapping[str, object], receipt_path: Path) -> object:
                 str(receipt_path),
             ),
             env=env,
+            timeout=_STATUS_TIMEOUT_SECONDS,
         )
-    except (InstallError, OSError) as exc:
+    except (InstallError, OSError, TimeoutExpired) as exc:
         return _StatusUnavailable(f"{type(exc).__name__}: {exc}")
     if result.returncode != 0:
-        return _StatusUnavailable(f"exit {result.returncode}: {_output_tail(result)}")
+        return _StatusUnavailable(_exit_detail(result))
     try:
         return json.loads(result.stdout)
     except json.JSONDecodeError as exc:
@@ -396,7 +412,15 @@ def preflight(options: UpgradeOptions) -> Preflight:
 _HOST_OVERLAY_NAME = "host-overlay.yaml"
 _PLAN_ENV = {"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PYTHONNOUSERSITE": "1"}
 _MAX_PLAN_BYTES = 64 * 1024 * 1024
-_READ_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+# O_NONBLOCK: the plan account owns the plan output directory and could swap
+# the file for a FIFO; open() must not block root (#1270).  Every reader checks
+# the type with fstat before reading; regular files ignore the flag.
+_READ_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_NONBLOCK", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
 _CREATE_FLAGS = (
     os.O_WRONLY
     | os.O_CREAT
@@ -535,8 +559,11 @@ def publish_durable_plan(payload: bytes, expected_sha256: str, *, plans_root: Pa
             try:
                 observed = os.fstat(existing_fd)
                 existing = b""
-                while chunk := os.read(existing_fd, 1024 * 1024):
-                    existing += chunk
+                if stat.S_ISREG(observed.st_mode):
+                    while chunk := os.read(existing_fd, 1024 * 1024):
+                        existing += chunk
+                        if len(existing) > len(payload):
+                            break
             finally:
                 os.close(existing_fd)
             if (
@@ -627,6 +654,11 @@ def produce_plan(
         overlay_args = ("--host-overlay", str(overlay_path))
     output = work / "install-plan.json"
     sealed.assert_unchanged()
+    # No root stdin, controlling terminal or working directory reaches the
+    # unprivileged plan child (#1270).  CPython changes into `cwd` as root,
+    # before it drops to the plan uid (child_exec: chdir, setsid, setgroups,
+    # setregid, setreuid); that is safe because `<attempt>` is root-owned, so
+    # the plan account cannot replace the `plan` directory being entered.
     result = _run(
         (
             str(sealed.cli),
@@ -645,6 +677,9 @@ def produce_plan(
         env={**_PLAN_ENV, "HOME": str(home), "PATH": f"{sealed.venv}/bin:/usr/bin:/bin"},
         uid=uid,
         gid=gid,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+        cwd=work,
     )
     try:
         reported = json.loads(result.stdout)["plan_sha256"]
@@ -699,16 +734,108 @@ _ROLLBACK_ERROR_LIMIT = 4000
 
 
 class UpgradeInterrupted(BaseException):
-    """INT/TERM/HUP inside the maintenance window; handled like any step failure."""
+    """INT/TERM/HUP inside the maintenance window; handled like any step failure.
+
+    ``completed`` is the candidate child's result when the signal was held
+    until that step ended; ``detail`` then names how a failed step ended.
+    """
+
+    def __init__(
+        self, signal_name: str, *, completed: CompletedProcess[str] | None = None
+    ) -> None:
+        super().__init__(signal_name)
+        self.completed = completed
+        self.detail: str | None = None
 
 
 # SIGHUP is here because production upgrades run over SSH: a dropped session
 # must roll back and report, not kill the coordinator mid-window.
 _INTERRUPT_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+# A held interrupt escalates to "stop the step now" only for an INT/TERM that
+# arrives at least this long after the first signal (#1270).
+_ESCALATION_MIN_SECONDS = 1.0
+# Where the one-line notice on the first held signal goes; a raw descriptor
+# write, never buffered IO, because it runs inside a signal handler.
+_STDERR_FD = 2
+
+
+@dataclass
+class _InterruptDeferral:
+    """While a candidate child mutates the host, the first interrupt waits for it.
+
+    Candidate children run in their own session, so the terminal's INT/HUP reach
+    only this coordinator.  Raising inside the wait would kill the root child
+    mid-mutation; instead the first signal is held, one line on stderr says so,
+    and it is raised right after the child's step ends.
+
+    An SSH drop delivers two SIGHUPs about 0.2 ms apart (the shell's hangup to
+    its jobs, then the kernel's to the old foreground process group), so a
+    SIGHUP never escalates.  Only an INT/TERM at least
+    ``_ESCALATION_MIN_SECONDS`` after the first signal stops the step at once:
+    interrupts are ignored from then on and the wait is abandoned, which kills
+    the child's whole process group (``backend._run``) before ``_abort`` rolls
+    back; the installer's journal crash recovery covers the stopped step.
+    """
+
+    active: bool = False
+    pending: str | None = None
+    pending_at: float = 0.0
+    step: str = ""
+
+
+@dataclass
+class _HeldInterrupt:
+    signal: str | None = None
+
+
+_DEFERRAL = _InterruptDeferral()
+
+
+def _say(text: str) -> None:
+    """Best-effort stderr line; after an SSH drop the terminal may answer EIO."""
+
+    try:
+        os.write(_STDERR_FD, text.encode("utf-8", "replace"))
+    except OSError:
+        pass
 
 
 def _interrupt(signum: int, _frame: object) -> None:
-    raise UpgradeInterrupted(signal.Signals(signum).name)
+    name = signal.Signals(signum).name
+    if _DEFERRAL.active:
+        if _DEFERRAL.pending is None:
+            _DEFERRAL.pending = name
+            _DEFERRAL.pending_at = time.monotonic()
+            _say(
+                f"cortex upgrade: {name} received; finishing {_DEFERRAL.step}, then "
+                "rolling back; send INT/TERM again to stop now\n"
+            )
+            return
+        if (
+            signum == signal.SIGHUP
+            or time.monotonic() - _DEFERRAL.pending_at < _ESCALATION_MIN_SECONDS
+        ):
+            return
+        # Close the window before `_abort` ignores signals itself.
+        _ignore_interrupts()
+    raise UpgradeInterrupted(name)
+
+
+@contextmanager
+def _interrupts_deferred(step: str) -> Iterator[_HeldInterrupt]:
+    """Hold the first interrupt while the enclosed child runs; report it after."""
+
+    held = _HeldInterrupt()
+    # Ordered so a signal between two stores is never lost: ``pending`` is
+    # cleared before deferral starts, and deferral ends before it is read.
+    _DEFERRAL.pending = None
+    _DEFERRAL.step = step
+    _DEFERRAL.active = True
+    try:
+        yield held
+    finally:
+        _DEFERRAL.active = False
+        held.signal, _DEFERRAL.pending = _DEFERRAL.pending, None
 
 
 @contextmanager
@@ -732,7 +859,8 @@ def _now() -> str:
 
 def _describe(error: BaseException) -> str:
     if isinstance(error, UpgradeInterrupted):
-        return f"interrupted by {error}"
+        detail = f" ({error.detail})" if error.detail else ""
+        return f"interrupted by {error}{detail}"
     return str(error) or type(error).__name__
 
 
@@ -768,26 +896,76 @@ class _TransactionState:
 
 
 def _candidate(sealed: SealedCandidate, *arguments: str) -> CompletedProcess[str]:
-    """One sealed-candidate installer call; the sealed tree is re-attested first."""
+    """One sealed-candidate installer call; the sealed tree is re-attested first.
+
+    The child runs in its own session without root's stdin, so an interrupt
+    reaches only this coordinator, which lets the running step finish before it
+    rolls back (see ``_InterruptDeferral``).  A held interrupt is raised right
+    after the child returns and carries its result (``completed``).
+    """
 
     sealed.assert_unchanged()
-    return _run(
-        (str(sealed.cli), "install", "trust-root", *arguments),
-        env={**_CANDIDATE_ENV, "PATH": f"{sealed.venv}/bin:{_CANDIDATE_SYSTEM_PATH}"},
-    )
+    label = " ".join(arguments[:2]) if arguments[:1] == ("credentials",) else arguments[0]
+    with _interrupts_deferred(label) as held:
+        result = _run(
+            (str(sealed.cli), "install", "trust-root", *arguments),
+            env={**_CANDIDATE_ENV, "PATH": f"{sealed.venv}/bin:{_CANDIDATE_SYSTEM_PATH}"},
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    if held.signal is not None:
+        raise UpgradeInterrupted(held.signal, completed=result)
+    return result
 
 
-def _candidate_json(sealed: SealedCandidate, step: str, *arguments: str) -> dict[str, object]:
-    result = _candidate(sealed, *arguments)
+def _json_object(stdout: str) -> dict[str, object] | None:
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _candidate_json(
+    sealed: SealedCandidate,
+    step: str,
+    *arguments: str,
+    record: Callable[[dict[str, object]], None] | None = None,
+) -> dict[str, object]:
+    """A candidate step's JSON result; ``record`` keeps it in the report.
+
+    When an interrupt was held until the step ended, the step's outcome is still
+    recorded before the interrupt propagates: ``record`` for a step that
+    succeeded, the failure tail as the interrupt's ``detail`` otherwise.
+    """
+
+    try:
+        result = _candidate(sealed, *arguments)
+    except UpgradeInterrupted as interrupted:
+        completed = interrupted.completed
+        if completed is not None:
+            if completed.returncode != 0:
+                interrupted.detail = f"{step} failed: {_output_tail(completed)}"
+            elif record is not None:
+                finished = _json_object(completed.stdout)
+                if finished is not None:
+                    record(finished)
+        raise
     if result.returncode != 0:
         raise UpgradeError(f"{step} failed: {_output_tail(result)}")
-    try:
-        payload = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise UpgradeError(f"{step} returned invalid JSON") from exc
-    if not isinstance(payload, dict):
+    payload = _json_object(result.stdout)
+    if payload is None:
         raise UpgradeError(f"{step} returned invalid JSON")
+    if record is not None:
+        record(payload)
     return payload
+
+
+def _verify_failure(result: CompletedProcess[str]) -> str:
+    # Refusals reach only stderr and a FAIL result is the JSON on stdout;
+    # without them the report could not say why verify failed.
+    detail = f": {_output_tail(result)}" if _has_output(result) else " with no output"
+    return f"verify did not PASS (exit {result.returncode}){detail}"
 
 
 def _advance(
@@ -809,10 +987,16 @@ def _advance(
         # Likewise set before the child starts, with the id still unknown: a
         # halted or rolled-back report must still name the receipt holding any
         # retained state even when the child never returned (interrupted, or
-        # exited non-zero after writing the file). The success assignment below
-        # overwrites this with the real receipt_id once apply actually returns.
+        # exited non-zero after writing the file). `record_apply` overwrites
+        # this with the real receipt_id once apply returns -- also when an
+        # interrupt was held until it did.
+
+        def record_apply(applied: dict[str, object]) -> None:
+            state.receipt_id = str(applied.get("receipt_id"))
+            report["receipt"] = {"path": receipt, "receipt_id": state.receipt_id}
+
         report["receipt"] = {"path": receipt, "receipt_id": None}
-        applied = _candidate_json(
+        _candidate_json(
             sealed,
             "apply",
             "apply",
@@ -826,9 +1010,8 @@ def _advance(
             str(prior.path),
             "--maintenance-token",
             token,
+            record=record_apply,
         )
-        state.receipt_id = str(applied.get("receipt_id"))
-        report["receipt"] = {"path": receipt, "receipt_id": state.receipt_id}
     with steps.step("credentials"):
         # Called exactly once per transaction attempt — never retried here.
         # `inherit_prior_credentials` (Task 2) refuses a second run against the
@@ -836,7 +1019,11 @@ def _advance(
         # authority`), so a retry loop around this step would not recover;
         # recovery of a transaction that failed after this step belongs to
         # Task 10's `--recover`, not to a loop inside this function.
-        inherited = _candidate_json(
+
+        def record_inherited(inherited: dict[str, object]) -> None:
+            report["inherited_credentials"] = inherited.get("inherited", [])
+
+        _candidate_json(
             sealed,
             "credential inheritance",
             "credentials",
@@ -847,8 +1034,8 @@ def _advance(
             str(prior.path),
             "--maintenance-token",
             token,
+            record=record_inherited,
         )
-        report["inherited_credentials"] = inherited.get("inherited", [])
     with steps.step("activate"):
         state.activation_attempted = True
         _candidate_json(
@@ -857,23 +1044,24 @@ def _advance(
     with steps.step("verify"):
         evidence = sealed.attempt_dir / "install-verification.json"
         report["verify_evidence"] = str(evidence)
-        verified = _candidate(
-            sealed,
-            "verify",
-            "--receipt",
-            receipt,
-            "--json",
-            "--evidence",
-            str(evidence),
-            "--maintenance-token",
-            token,
-        )
-        if verified.returncode != 0:
-            # Refusals reach only stderr and a FAIL result is the JSON on stdout;
-            # without them the report could not say why verify failed.
-            raise UpgradeError(
-                f"verify did not PASS (exit {verified.returncode}): {_output_tail(verified)}"
+        try:
+            verified = _candidate(
+                sealed,
+                "verify",
+                "--receipt",
+                receipt,
+                "--json",
+                "--evidence",
+                str(evidence),
+                "--maintenance-token",
+                token,
             )
+        except UpgradeInterrupted as interrupted:
+            if interrupted.completed is not None and interrupted.completed.returncode != 0:
+                interrupted.detail = _verify_failure(interrupted.completed)
+            raise
+        if verified.returncode != 0:
+            raise UpgradeError(_verify_failure(verified))
         inactive = [
             service
             for service in install_cli._MAINTENANCE_SERVICES
@@ -942,9 +1130,11 @@ def _abort(
             # means the child raised before that happened, and only its stderr
             # says why -- without this, that cause is silently discarded and
             # the operator is left with an unexplained "restore_safe: false".
-            detail = (result.stderr or result.stdout).strip() or f"exit {result.returncode}"
+            detail = (result.stderr or result.stdout).strip()
             rollback["error"] = (
                 f"rollback exited {result.returncode}: {detail[:_ROLLBACK_ERROR_LIMIT]}"
+                if detail
+                else f"rollback exited {result.returncode} with no output"
             )
         if not isinstance(payload, dict):
             payload = {}
@@ -1045,7 +1235,10 @@ def run_transaction(
             _ignore_interrupts()
             install_cli._clear_maintenance_snapshot(bound.plan, receipt_path=bound.receipt_path)
             lifecycle["complete"] = True
-    report["result"] = "upgraded"
+        # The lease is released and interrupts are still ignored: record the
+        # outcome before `_signals_raise` restores the previous handlers, so a
+        # signal right after cannot leave a finished upgrade unrecorded (#1270).
+        report["result"] = "upgraded"
     return 0
 
 
@@ -1197,7 +1390,9 @@ def perform_upgrade(options: UpgradeOptions) -> int:
                             "the upgrade stopped inside the maintenance window; "
                             "run `cortex upgrade --recover`"
                         )
-                code = 1
+                # Only a signal after the window closed can land here with the
+                # upgrade already recorded as finished; it does not undo it.
+                code = 0 if report["result"] == "upgraded" else 1
             finally:
                 report["finished_at"] = _now()
                 _publish_report(report)
@@ -1324,7 +1519,7 @@ def _maintenance_marker_present() -> bool:
         return True
     try:
         return install_cli._maintenance_lock_payload(descriptor, allow_absent=True) is not None
-    except InstallError:
+    except (InstallError, OSError):
         return True
     finally:
         os.close(descriptor)

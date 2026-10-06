@@ -11,7 +11,9 @@ import pwd
 import shutil
 import stat
 import subprocess
+import sys
 import tarfile
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Mapping
@@ -3434,3 +3436,83 @@ def test_preflight_facts_scope_the_sudo_check_to_plan_declared_cortex_accounts(
     assert seen["groups"] == list(_SUDO_GROUPS)
     assert facts["cortex_account_universal_nopasswd"] == _SUDO_BUILDER_REFUSED
     assert "universal_nopasswd" not in facts
+
+
+def test_run_keeps_the_callers_session_stdin_and_cwd_by_default() -> None:
+    result = backend_module._run(
+        (sys.executable, "-c", "import os; print(os.getsid(0)); print(os.getcwd())")
+    )
+
+    sid, cwd = result.stdout.splitlines()
+    assert int(sid) == os.getsid(0)
+    assert cwd == os.getcwd()
+
+
+def test_run_can_detach_a_child_from_the_callers_session_stdin_and_cwd(
+    tmp_path: Path,
+) -> None:
+    # #1270: the unprivileged plan child must not inherit root's controlling
+    # terminal, stdin or working directory.
+    script = (
+        "import json, os; print(json.dumps({'sid': os.getsid(0), 'cwd': os.getcwd(),"
+        " 'stdin': os.path.realpath('/proc/self/fd/0')}))"
+    )
+
+    result = backend_module._run(
+        (sys.executable, "-c", script),
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+        cwd=tmp_path,
+    )
+
+    observed = json.loads(result.stdout)
+    assert observed["sid"] != os.getsid(0)
+    assert observed["cwd"] == os.path.realpath(tmp_path)
+    assert observed["stdin"] == "/dev/null"
+
+
+def test_run_enforces_an_optional_timeout() -> None:
+    with pytest.raises(subprocess.TimeoutExpired):
+        backend_module._run(
+            (sys.executable, "-c", "import time; time.sleep(30)"), timeout=0.2
+        )
+
+
+def test_an_interrupted_own_session_child_is_stopped_with_its_whole_process_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #1270 review: with start_new_session the child's own children share its
+    # new process group; stopping only the direct child let a grandchild keep
+    # mutating the host as root while rollback ran.
+    marker = tmp_path / "grandchild"
+    started = tmp_path / "started"
+    script = (
+        "import pathlib, subprocess, sys, time\n"
+        f"subprocess.Popen(['sh', '-c', 'sleep 1; touch {marker}'])\n"
+        f"pathlib.Path({str(started)!r}).write_text('x')\n"
+        "time.sleep(30)\n"
+    )
+
+    class Stop(BaseException):
+        pass
+
+    real_communicate = subprocess.Popen.communicate
+
+    def communicate_then_stop(self, *args, **kwargs):
+        deadline = time.monotonic() + 10
+        while not started.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        raise Stop
+
+    monkeypatch.setattr(subprocess.Popen, "communicate", communicate_then_stop)
+    with pytest.raises(Stop):
+        backend_module._run(
+            (sys.executable, "-c", script),
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    monkeypatch.setattr(subprocess.Popen, "communicate", real_communicate)
+
+    time.sleep(1.5)
+    assert started.exists()
+    assert not marker.exists()

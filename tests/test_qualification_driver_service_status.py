@@ -280,7 +280,12 @@ def test_installed_checks_pass_the_effective_install_receipt_to_system_status(
 
 
 def _upgrade_inputs(
-    tmp_path: Path, *, drill_result: str = "rolled-back", inherited_from: str = "prior"
+    tmp_path: Path,
+    *,
+    drill_result: str = "rolled-back",
+    inherited_from: str = "prior",
+    report_receipt_id: object = "upgraded",
+    report_plan_sha256: object = "d" * 64,
 ):
     drill_receipt = tmp_path / "drill-receipt.json"
     parent = {
@@ -296,6 +301,7 @@ def _upgrade_inputs(
     prior = {"receipt_id": "prior", "plan": plan}
     upgraded = {
         "receipt_id": "upgraded",
+        "plan_sha256": "d" * 64,
         "state": "applied",
         "qualified": True,
         "parent_receipt": parent,
@@ -321,8 +327,11 @@ def _upgrade_inputs(
     }
     report = {
         "result": "upgraded",
-        "receipt": {"path": "/var/lib/cortex-install-receipts/next.json", "receipt_id": "upgraded"},
-        "plan": {"sha256": "d" * 64},
+        "receipt": {
+            "path": "/var/lib/cortex-install-receipts/next.json",
+            "receipt_id": report_receipt_id,
+        },
+        "plan": {"sha256": report_plan_sha256},
     }
     return prior, upgraded, drill, report
 
@@ -397,3 +406,23 @@ def test_one_command_upgrade_evidence_refuses_credentials_not_inherited(
 
     with pytest.raises(driver.QualificationFailure, match="inherited the prior credentials"):
         _capture(driver, tmp_path, monkeypatch, inherited_from="another")
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"report_receipt_id": "another"},
+        {"report_receipt_id": None},
+        {"report_plan_sha256": "0" * 64},
+        {"report_plan_sha256": None},
+    ],
+)
+def test_one_command_upgrade_evidence_refuses_a_report_for_another_receipt_or_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changes
+) -> None:
+    # #1270: the report's receipt id and plan sha must be the upgraded receipt's
+    # own, not only its path.
+    driver = _driver()
+
+    with pytest.raises(driver.QualificationFailure, match="report does not describe"):
+        _capture(driver, tmp_path, monkeypatch, **changes)

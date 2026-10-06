@@ -60,6 +60,11 @@ def _entry(raw: Any, *, root: Path, label: str) -> str:
         raise ValueError(f"{label}.sha256 is invalid")
     path = root / pure
     _single_link_regular(path, label=f"{label}.path")
+    cursor = root
+    for part in pure.parts[:-1]:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise ValueError(f"{label}.path has a symlink ancestor")
     actual = hashlib.sha256(path.read_bytes()).hexdigest()
     if actual != expected:
         raise ValueError(f"{label}.sha256 does not match {relative}")
@@ -76,9 +81,12 @@ def validate_bundle(
     # paulsha_cortex.trust_root.install.release_ingress._validate_bundle_inventory,
     # which runs after the wheel is installed; this one runs stand-alone during
     # RC qualification, before the wheel exists, so it cannot import that
-    # package. Parity is pinned by
-    # tests/test_trust_root_install_release_ingress.py::test_input_tree_validation_accepts_what_verify_bundle_accepts
-    # and ::test_input_tree_mutations_are_refused_like_verify_bundle.
+    # package. Both are equally strict and raise the same messages; parity is
+    # pinned branch by branch by
+    # tests/test_trust_root_install_release_ingress.py::test_bundle_port_refuses_every_branch_with_verify_bundles_message
+    # (with ::test_bundle_parity_table_covers_every_refusal_message_of_verify_bundle
+    # failing for a refusal added here without a parity case), plus
+    # ::test_input_tree_validation_accepts_what_verify_bundle_accepts.
     _single_link_regular(bundle, label="bundle")
     root = bundle.parent
     _plain_directory(root, label="qualification input root")
@@ -88,7 +96,10 @@ def validate_bundle(
     _single_link_regular(root / "install-config.yaml", label="install config")
     for directory in ("dist", "wheelhouse", "toolchain", "source"):
         _plain_directory(root / directory, label=f"{directory} root")
-    payload = json.loads(bundle.read_text(encoding="utf-8"))
+    try:
+        payload = json.loads(bundle.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("bundle is not JSON") from exc
     if not isinstance(payload, dict) or set(payload) != ROOT_KEYS:
         raise ValueError("bundle has missing or unknown root fields")
     if payload["schema_version"] != 1 or isinstance(payload["schema_version"], bool):
@@ -100,12 +111,12 @@ def validate_bundle(
         raise ValueError("bundle wheel sha256 does not match the selected candidate")
     if not wheel_path.startswith("dist/"):
         raise ValueError("bundle wheel must be under dist/")
-    actual_dist = {
-        path.relative_to(root).as_posix() for path in (root / "dist").iterdir()
-    }
+    actual_dist: set[str] = set()
+    for path in (root / "dist").iterdir():
+        _single_link_regular(path, label="dist entry")
+        actual_dist.add(path.relative_to(root).as_posix())
     if actual_dist != {wheel_path}:
         raise ValueError("dist inventory must contain only the declared candidate wheel")
-    _single_link_regular(root / wheel_path, label="candidate wheel")
 
     wheelhouse = payload["wheelhouse"]
     if not isinstance(wheelhouse, list) or not wheelhouse:
@@ -114,13 +125,17 @@ def validate_bundle(
         not isinstance(raw, dict)
         or not isinstance(raw.get("path"), str)
         or not raw["path"].endswith(".whl")
+        or PurePosixPath(raw["path"]).parent != PurePosixPath("wheelhouse")
         for raw in wheelhouse
     ):
-        raise ValueError("bundle wheelhouse must contain wheels only")
-    declared_wheelhouse = {
+        raise ValueError("bundle wheelhouse must list wheels directly under wheelhouse/")
+    declared = [
         _entry(raw, root=root, label=f"wheelhouse[{index}]")
         for index, raw in enumerate(wheelhouse)
-    }
+    ]
+    if len(set(declared)) != len(declared):
+        raise ValueError("wheelhouse manifest paths are duplicated")
+    declared_wheelhouse = set(declared)
     wheelhouse_root = root / "wheelhouse"
     actual_wheelhouse: set[str] = set()
     for path in wheelhouse_root.iterdir():

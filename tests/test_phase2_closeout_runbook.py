@@ -300,3 +300,51 @@ def test_legacy_adoption_runbook_hands_later_upgrades_to_cortex_upgrade() -> Non
     tail = legacy.rstrip().rsplit("\n\n", 1)[1]
     assert "cortex upgrade" in tail
     assert "legacy_adoption" in tail
+
+
+def test_hard_crash_recovery_maps_an_in_progress_report_onto_the_snapshot() -> None:
+    # #1270: after SIGKILL the durable report still says `in-progress` with a
+    # null `receipt`; the receipt to roll back then comes from the snapshot alone.
+    current = (ROOT / CURRENT).read_text(encoding="utf-8")
+
+    recovery = current.split("## 6. Hard-crash recovery", 1)[1].split(
+        "## 7. Deployment canary", 1
+    )[0]
+    section = recovery[recovery.index("### 手動恢復 `cortex upgrade` 中斷的升級") :]
+    row = next(line for line in section.splitlines() if line.startswith("| 要 rollback 的 receipt"))
+    assert "`in-progress`" in row
+    assert "`receipt` 為 null" in row
+    assert "只依 snapshot 的 `receipt_path`" in row
+
+
+def test_general_upgrade_documents_interrupts_and_attempt_directory_cleanup() -> None:
+    current = (ROOT / CURRENT).read_text(encoding="utf-8")
+
+    section = current[current.index("## 一般升級") : current.index("## 邊界")]
+    # #1270: an interrupt waits for the running installer step; SIGHUP (an SSH
+    # drop sends two) never forces a stop, a later INT/TERM stops the step's
+    # whole process group.
+    assert "等正在執行的那一步結束" in section
+    assert "SIGHUP 永遠不會強制中止" in section
+    assert "至少 1 秒後再送一次 INT 或 TERM" in section
+    assert "整個 process group" in section
+    # #1270 review: a moved release-asset host is refused before the window.
+    assert "release asset 的下載 host" in section
+    assert "§1–§5 手動流程" in section
+    # #1270: attempt directories are kept; the runbook says which ones may go.
+    assert "attempt-*" in section
+    assert "不會自動清理" in section
+    assert "`cortex upgrade --status`" in section
+
+
+def test_legacy_adoption_section_8_points_later_upgrades_at_cortex_upgrade() -> None:
+    # #1270: §8 itself (not only the trailing paragraph) hands upgrades to
+    # `cortex upgrade` instead of describing a manual `--prior-receipt` apply.
+    legacy = (
+        ROOT / "docs/superpowers/runbooks/trust-root-legacy-adoption.md"
+    ).read_text(encoding="utf-8")
+
+    section = legacy.split("## 8. 之後的升級", 1)[1].split("## 9.", 1)[0]
+    assert "sudo /opt/cortex/venv/bin/cortex upgrade <版本>" in section
+    assert "--prior-receipt" not in section
+    assert "legacy_adoption" in section

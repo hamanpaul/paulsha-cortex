@@ -630,6 +630,29 @@ def _capture_one_command_upgrade(
             "one-command upgrade receipt is not a qualified successor that "
             "inherited the prior credentials"
         )
+    report_plan = upgrade_report.get("plan")
+    upgraded_id = upgrade_receipt.get("receipt_id")
+    upgraded_plan_sha = upgrade_receipt.get("plan_sha256")
+    # #1270：report 不只要指向同一個 receipt 路徑，receipt_id 與 plan sha 也必須
+    # 就是那份 receipt 自己記錄的值。
+    receipt_id_match = (
+        isinstance(report_receipt, Mapping)
+        and isinstance(upgraded_id, str)
+        and bool(upgraded_id)
+        and report_receipt.get("receipt_id") == upgraded_id
+    )
+    plan_sha_match = (
+        isinstance(report_plan, Mapping)
+        and isinstance(upgraded_plan_sha, str)
+        and SHA256.fullmatch(upgraded_plan_sha) is not None
+        and report_plan.get("sha256") == upgraded_plan_sha
+    )
+    if not (receipt_id_match and plan_sha_match):
+        raise QualificationFailure(
+            "one-command upgrade report does not describe the upgraded receipt: "
+            f"receipt_id={'match' if receipt_id_match else 'mismatch'} "
+            f"plan_sha256={'match' if plan_sha_match else 'mismatch'}"
+        )
     expected = _rollback_runtime_expected(upgrade_receipt)
     # activate 之後 loaded receipt 可能晚幾秒寫入：與 `_installed_checks` 相同，
     # 輪詢到比對一致或逾時，逾時以最後一次結果判定。

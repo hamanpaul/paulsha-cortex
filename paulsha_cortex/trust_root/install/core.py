@@ -7708,10 +7708,14 @@ def _credential_temp_name(destination_name: str, digest: str) -> str:
 
 
 def _open_regular_at(parent_fd: int, name: str) -> int:
+    # O_NONBLOCK: the directory is account-owned, so a FIFO swapped in at the
+    # leaf must not block the root importer in open(); the fstat check below
+    # refuses it before anything reads (#1270).
     descriptor = os.open(
         name,
         os.O_RDONLY
         | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
         | getattr(os, "O_CLOEXEC", 0),
         dir_fd=parent_fd,
     )
