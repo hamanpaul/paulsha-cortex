@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Mapping
 
 from paulsha_cortex.coordinator import spool_slot
+from paulsha_cortex.trust_root.install import core
 from paulsha_cortex.trust_root.install import InstallReceipt
 from paulsha_cortex.trust_root.install.backend import LocalInstallBackend
 
@@ -74,13 +75,20 @@ def _drop_to_manager(plan: Mapping[str, object]) -> None:
     os.setuid(manager.pw_uid)
 
 
+def _validate_launch_authority_layout(plan: Mapping[str, object]) -> None:
+    layout_version = core.LAUNCH_AUTHORITY_LAYOUT_VERSION
+    if plan.get("launch_layout_version") != layout_version:
+        raise ValueError(
+            f"install plan does not declare launch authority layout v{layout_version}"
+        )
+
+
 def run(plan_path: Path, receipt_path: Path) -> dict[str, object]:
     plan = _read_document(plan_path)
     receipt_document = _read_document(receipt_path)
     if receipt_document.get("state") != "applied" or receipt_document.get("qualified") is not True:
         raise ValueError("authority probe requires the applied, qualified install receipt")
-    if plan.get("launch_layout_version") != 1:
-        raise ValueError("install plan does not declare launch authority layout v1")
+    _validate_launch_authority_layout(plan)
     receipt = InstallReceipt(receipt_document, path=receipt_path)
     credential_failures = LocalInstallBackend().validate_credentials(receipt)
     if credential_failures:

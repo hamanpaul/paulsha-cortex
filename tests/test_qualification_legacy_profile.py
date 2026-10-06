@@ -40,6 +40,10 @@ def _load(name: str, path: Path):
 
 
 fixture = _load("cortex_qualification_legacy_fixture", QUALIFICATION / "legacy_fixture.py")
+launch_authority_probe = _load(
+    "cortex_qualification_launch_authority_probe",
+    QUALIFICATION / "launch_authority_probe.py",
+)
 MANIFEST = fixture.load_manifest()
 QUARANTINE_ROOT = MANIFEST["legacy_adoption"]["quarantine_root"]
 
@@ -121,6 +125,15 @@ def test_provider_check_mapping_is_shared_across_qualification_paths() -> None:
             ), filename
         else:
             assert all(is_shared_helper_call(value) for value in check_fields), filename
+
+
+def test_launch_authority_probe_uses_core_layout_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    core = launch_authority_probe.core
+    monkeypatch.setattr(core, "LAUNCH_AUTHORITY_LAYOUT_VERSION", 17)
+
+    launch_authority_probe._validate_launch_authority_layout({"launch_layout_version": 17})
+    with pytest.raises(ValueError, match="layout v17"):
+        launch_authority_probe._validate_launch_authority_layout({"launch_layout_version": 1})
 
 
 # ---------------------------------------------------------------------------
