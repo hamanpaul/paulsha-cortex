@@ -24,7 +24,7 @@ work_item: task-memory-disposition
 
 ## Tasks
 
-- [ ] **T1 RED**：新增測試，固定以下行為（現行應失敗）：
+- [x] **T1 RED**：新增測試，固定以下行為（現行應失敗）：
       - 有送記憶的 attempt，terminal schema 要求 `task_memory_disposition`。
       - Manager 驗證 note_id 集合等於實際送出的集合。
       - 缺欄位、格式錯、集合不符時記為 `unreported` 並附原因，卡片判定與沒有此欄位時完全相同。
