@@ -28,6 +28,7 @@ from test_trust_root_install_legacy_inventory import (  # noqa: E402
     MACHINE_ID,
     RELEASE_PLAN_GOLDEN_SHA256,
     FakeLegacyHost,
+    release_host_accounts,
     _collect,
     _host_config,
     _legacy_overlay,
@@ -170,7 +171,9 @@ def _replace_group(backend, name: str, **changes) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_release_plan_without_overlay_or_inventory_matches_the_golden(tmp_path: Path) -> None:
+def test_release_plan_without_overlay_or_inventory_matches_the_golden(
+    tmp_path: Path, release_host_accounts
+) -> None:
     bundle = _write_bundle(tmp_path)
     config = _release_config(tmp_path, bundle)
     output = tmp_path / "plan.json"
@@ -222,12 +225,18 @@ def test_plan_applies_the_host_overlay_and_records_its_digest(
     assert _step(plan, "account:cortex-builder")["uid"] == LEGACY_IDS["cortex-builder"][0]
     assert _step(plan, "account:cortex-egress")["home"] == str(tmp_path / "host/srv/cortex-egress")
     assert plan["operator_account"] == "legacy-operator"
-    # The overlay changes the effective config and adds exactly one key.
+    # The overlay changes the effective config and adds exactly one key; the
+    # ids it declares are recorded as overlay-sourced (#1286).
     merged = install_cli._bound_plan_from_config(legacy.apply_host_overlay(config, overlay), bundle)
     bound = dict(plan)
     bound.pop("host_overlay_sha256")
     bound.pop("receipt_path")
     merged.pop("receipt_path")
+    bound_sources = bound.pop("account_id_sources")
+    assert merged.pop("account_id_sources") == {
+        name: {"uid": "config", "gid": "config"} for name in bound_sources
+    }
+    assert bound_sources == {name: {"uid": "overlay", "gid": "overlay"} for name in bound_sources}
     assert bound == merged
     assert plan["receipt_path"] == str(install_core.canonical_receipt_path(plan))
 
