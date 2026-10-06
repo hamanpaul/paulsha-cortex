@@ -815,28 +815,22 @@ def test_release_harness_drives_one_command_upgrade_drill_then_full_upgrade() ->
     assert '"--install-receipt"' in _required_text(DRIVER)
 
 
-def test_release_harness_installs_a_different_same_version_prior_before_the_upgrade() -> None:
+def test_release_harness_keeps_the_same_candidate_as_the_qualified_prior() -> None:
     runner = _required_text(RUNNER)
-    prior_root = runner.index("prior_artifact_root=/run/cortex-prior-artifacts")
-    verify_prior = runner.index('/usr/local/libexec/cortex-qualification-verify-bundle \\\n    --bundle "$prior_bundle_path"')
-    plan = runner.index('cortex install trust-root plan \\')
-    upgrade_source = runner.index("/usr/local/libexec/cortex-qualification-release-source")
-
-    assert prior_root < verify_prior < plan < upgrade_source
     for fragment in (
-        'prior_bundle_path=$prior_artifact_root/bundle.json',
-        'prior_config_path=$prior_artifact_root/install-config.yaml',
-        'synthetic prior wheel SHA must differ from the candidate wheel SHA',
-        "import zipfile",
-        'archive.comment = b"qualification-prior-same-version\\n"',
-        "shutil.copyfile(dist_wheel, wheelhouse_wheel)",
-        '--config "$prior_config_path"',
-        '--bundle "$prior_bundle_path"',
-        '--env "CORTEX_QUALIFICATION_WHEEL_SHA256=$prior_wheel_sha"',
-        '--env "CORTEX_QUALIFICATION_BUNDLE_SHA256=$prior_bundle_sha"',
+        '--config /artifacts/install-config.yaml',
+        '--bundle /artifacts/bundle.json',
+        '--env "CORTEX_QUALIFICATION_WHEEL_SHA256=$expected_wheel_sha"',
+        '--env "CORTEX_QUALIFICATION_BUNDLE_SHA256=$expected_bundle_sha"',
     ):
         assert fragment in runner
-    assert "qualification prior wheel for" not in runner
+    for fragment in (
+        "prior_artifact_root=/run/cortex-prior-artifacts",
+        "qualification-prior-same-version",
+        "prior_wheel_sha=",
+        "prior_bundle_sha=",
+    ):
+        assert fragment not in runner
 
 
 def test_release_harness_runs_same_version_upgrade_under_umask_077_and_exec_checks() -> None:
@@ -1269,14 +1263,15 @@ def test_full_suite_validator_accepts_distinct_candidate_identities(tmp_path: Pa
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
-def test_full_suite_validator_accepts_rollback_evidence_for_a_different_prior_wheel(
+def test_full_suite_validator_rejects_rollback_evidence_for_another_candidate(
     tmp_path: Path,
 ) -> None:
-    """#1295：same-version upgrade 先裝不同 wheel 的 qualified prior，再升到 candidate。"""
+    """#1224：rollback 證據的 expected 必須是本次 candidate，不能是任意 wheel。"""
     payload = _valid_full_qualification(tmp_path, rollback_expected_wheel="9" * 64)
 
     completed = _run_full_validator(tmp_path, payload)
-    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert completed.returncode != 0, completed.stdout + completed.stderr
+    assert "expected receipt is not this candidate" in completed.stderr
 
 
 def test_full_suite_validator_rejects_unlisted_evidence_files(tmp_path: Path) -> None:

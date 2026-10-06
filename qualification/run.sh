@@ -127,58 +127,6 @@ docker exec "$container_name" /usr/local/libexec/cortex-qualification-verify-bun
 docker exec "$container_name" sh -eu -c \
     'python3 -m pip install --break-system-packages --no-index --no-deps /artifacts/wheelhouse/*.whl'
 
-prior_artifact_root=/run/cortex-prior-artifacts
-prior_bundle_path=$prior_artifact_root/bundle.json
-prior_config_path=$prior_artifact_root/install-config.yaml
-readarray -t prior_artifact_digests < <(docker exec "$container_name" python3 - \
-    "$wheel_name" "$candidate_sha" <<'PY'
-import hashlib
-import json
-import shutil
-import sys
-import zipfile
-from pathlib import Path
-
-root = Path("/run/cortex-prior-artifacts")
-wheel_name = sys.argv[1]
-candidate_sha = sys.argv[2]
-
-if root.exists() or root.is_symlink():
-    raise SystemExit("prior artifact root already exists")
-shutil.copytree("/artifacts", root, symlinks=False)
-
-dist_wheel = root / "dist" / wheel_name
-wheelhouse_wheel = root / "wheelhouse" / wheel_name
-with zipfile.ZipFile(dist_wheel, "a") as archive:
-    archive.comment = b"qualification-prior-same-version\n"
-shutil.copyfile(dist_wheel, wheelhouse_wheel)
-
-bundle_path = root / "bundle.json"
-document = json.loads(bundle_path.read_text(encoding="utf-8"))
-document["candidate_sha"] = candidate_sha
-document["wheel"]["sha256"] = hashlib.sha256(dist_wheel.read_bytes()).hexdigest()
-for row in document["wheelhouse"]:
-    if row.get("path") == f"wheelhouse/{wheel_name}":
-        row["sha256"] = hashlib.sha256(wheelhouse_wheel.read_bytes()).hexdigest()
-for row in document.get("source_repositories", []):
-    if isinstance(row, dict) and row.get("slug") == "paulsha-cortex":
-        row["commit"] = candidate_sha
-bundle_path.write_text(json.dumps(document, sort_keys=True), encoding="utf-8")
-
-print(hashlib.sha256(dist_wheel.read_bytes()).hexdigest())
-print(hashlib.sha256(bundle_path.read_bytes()).hexdigest())
-PY
-)
-prior_wheel_sha=${prior_artifact_digests[0]-}
-prior_bundle_sha=${prior_artifact_digests[1]-}
-[[ "$prior_wheel_sha" =~ ^[0-9a-f]{64}$ && "$prior_wheel_sha" != "$expected_wheel_sha" ]] || \
-    die "synthetic prior wheel SHA must differ from the candidate wheel SHA"
-[[ "$prior_bundle_sha" =~ ^[0-9a-f]{64}$ ]] || die "synthetic prior bundle SHA is invalid"
-docker exec "$container_name" /usr/local/libexec/cortex-qualification-verify-bundle \
-    --bundle "$prior_bundle_path" \
-    --candidate-sha "$candidate_sha" \
-    --wheel-sha256 "$prior_wheel_sha"
-
 plan_path=/run/cortex-install/install-plan.json
 receipt_path=/run/cortex-install/install-receipt.json
 qualification_root=/qualification-output
@@ -242,8 +190,8 @@ if [[ "$profile" == legacy-adoption ]]; then
     exit 0
 fi
 docker exec "$container_name" cortex install trust-root plan \
-    --config "$prior_config_path" \
-    --bundle "$prior_bundle_path" \
+    --config /artifacts/install-config.yaml \
+    --bundle /artifacts/bundle.json \
     --output "$plan_path"
 plan_sha=$(docker exec "$container_name" sha256sum "$plan_path" | awk '{print $1}')
 
@@ -435,8 +383,8 @@ docker exec "$container_name" cortex install trust-root activate --receipt "$rec
 install_evidence_path=$qualification_root/install-verification.json
 docker exec \
     --env "CORTEX_QUALIFICATION_CANDIDATE_SHA=$candidate_sha" \
-    --env "CORTEX_QUALIFICATION_WHEEL_SHA256=$prior_wheel_sha" \
-    --env "CORTEX_QUALIFICATION_BUNDLE_SHA256=$prior_bundle_sha" \
+    --env "CORTEX_QUALIFICATION_WHEEL_SHA256=$expected_wheel_sha" \
+    --env "CORTEX_QUALIFICATION_BUNDLE_SHA256=$expected_bundle_sha" \
     --env "CORTEX_QUALIFICATION_IMAGE_DIGEST=$image_digest" \
     "$container_name" cortex install trust-root verify \
     --receipt "$receipt_path" --json --evidence "$install_evidence_path"
