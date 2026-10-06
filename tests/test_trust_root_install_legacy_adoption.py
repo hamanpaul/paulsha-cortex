@@ -742,8 +742,13 @@ def _other_scope(case: LegacyCase, monkeypatch) -> None:
     monkeypatch.setattr(legacy, "collect_legacy_inventory", collect)
 
 
+def _coordinator(case: LegacyCase) -> str:
+    # An adopted-in-place directory: nothing in the plan quarantines it.
+    return str(Path(case.base["roots"]["state"]) / "coordinator")
+
+
 def _new_writable(case: LegacyCase, _monkeypatch) -> None:
-    case.host.writable = {LEGACY_IDS["cortex-builder"][0]: {str(case.seeded["specs"])}}
+    case.host.writable = {LEGACY_IDS["cortex-builder"][0]: {_coordinator(case)}}
 
 
 def _unstable(case: LegacyCase, _monkeypatch) -> None:
@@ -845,7 +850,26 @@ def test_new_writable_path_is_named_with_its_principal(tmp_path: Path, monkeypat
     with pytest.raises(InstallDriftError) as caught:
         case.apply(new_install_receipt(case.plan))
 
-    assert f"cortex-builder can write {case.seeded['specs']}" in str(caught.value)
+    assert f"cortex-builder can write {_coordinator(case)}," in str(caught.value)
+
+
+def test_apply_gate_ignores_writable_paths_inside_quarantined_objects(
+    tmp_path: Path,
+) -> None:
+    # #1282: what a job account can write inside an object the plan moves
+    # into the quarantine is gone from its path once apply runs; the plan
+    # needs no census exception for it and the apply gate does not refuse.
+    def sandboxes_writable(seeded, fake, _base) -> None:
+        fake.writable = {LEGACY_IDS["cortex-reviewer-planner"][0]: {str(seeded["sandboxes"])}}
+
+    case = LegacyCase(tmp_path, host=sandboxes_writable)
+    assert case.block["census_exceptions"] == []
+    receipt = new_install_receipt(case.plan)
+
+    case.apply(receipt)
+
+    assert receipt.to_dict()["state"] == "applied"
+    assert not os.path.lexists(case.seeded["sandboxes"])
 
 
 def test_apply_accepts_only_the_plan_bound_inventory(tmp_path: Path) -> None:
@@ -1527,6 +1551,72 @@ def test_rollback_restores_every_quarantined_object_and_proves_the_host(tmp_path
     # The restored host passes the apply gate again.
     case.apply(receipt)
     assert receipt.to_dict()["state"] == "applied"
+
+
+class IdentityLegacyBackend(MemoryInstallBackend):
+    """The memory backend plus the real quarantine identity (tree digest)."""
+
+    def legacy_quarantine_identity(self, path) -> dict[str, object]:
+        try:
+            return install_backend._legacy_quarantine_identity(Path(path))
+        except PermissionError:
+            # A mode-0 fake credential (or a tree holding one): root hashes it
+            # on a host, the test user cannot.  Bind it by inode only here.
+            observed = os.lstat(path)
+            return {
+                "device": observed.st_dev,
+                "inode": observed.st_ino,
+                "type": install_backend._file_type_name(observed.st_mode),
+                "tree_sha256": "0" * 64,
+            }
+
+
+def _stale_special_files(seeded, _fake, base) -> None:
+    state = Path(base["roots"]["state"])
+    os.mknod(seeded["sandboxes"] / "job-9" / "agent.sock", 0o600 | stat.S_IFSOCK)
+    os.mkfifo(state / "legacy-imported" / "notify.fifo", 0o600)
+    os.mknod(state / "manager-control.sock", 0o600 | stat.S_IFSOCK)
+
+
+def test_stale_sockets_and_fifos_are_quarantined_recorded_and_restored(
+    tmp_path: Path,
+) -> None:
+    # #1282: the reference host's apply failed after the move with "tree contains an
+    # unsupported object" for a stale socket.  The quarantine now records
+    # sockets and FIFOs by type and mode, and rollback still restores the
+    # exact reviewed inventory digest.
+    case = LegacyCase(
+        tmp_path, host=_stale_special_files, backend_class=IdentityLegacyBackend
+    )
+    state = Path(case.base["roots"]["state"])
+    top = str(state / "manager-control.sock")
+    reasons = {row["path"]: row["reason"] for row in case.block["quarantine"]}
+    assert reasons[top] == "state-top"
+
+    receipt = _failed_late(case)
+
+    entries = {entry["step_id"]: entry for entry in receipt.to_dict()["journal"]}
+    identities = {
+        entries[step["step_id"]]["step"]["path"]: entries[step["step_id"]]["quarantine_identity"]
+        for step in case.quarantine_steps()
+    }
+    assert identities[top]["type"] == "socket"
+    special = (top, str(case.seeded["sandboxes"]), str(case.seeded["legacy_imported"]))
+    for path in special[1:]:
+        assert identities[path]["type"] == "directory"
+    for step in case.quarantine_steps():
+        if step["path"] in special:
+            assert install_backend._legacy_quarantine_identity(
+                Path(step["destination"])
+            ) == identities[step["path"]]
+
+    report = rollback_receipt(receipt, backend=case.backend, legacy_host=case.host)
+
+    assert report.legacy_restored is True
+    assert case.snapshot() == case.legacy_identities()
+    assert stat.S_ISSOCK(os.lstat(top).st_mode)
+    assert stat.S_ISFIFO(os.lstat(state / "legacy-imported" / "notify.fifo").st_mode)
+    assert case.recaptured_sha256() == case.block["inventory_sha256"]
 
 
 def test_rollback_after_a_complete_adoption_restores_the_legacy_host(tmp_path: Path) -> None:

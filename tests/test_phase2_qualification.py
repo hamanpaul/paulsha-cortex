@@ -277,6 +277,24 @@ def _one_command_upgrade_document(
     }
 
 
+#: #1286：RC 容器先占用 uid／gid 991–995（模擬 Ubuntu）、配號範圍內的 uid 989 與 gid 988，
+#: plan 從 987 開始配號；升級時沿用（existing）。fixture 用 RC 應得的結果。
+PLANNED_ACCOUNT_IDS = {
+    "cortex-builder": (987, 987),
+    "cortex-gate": (986, 986),
+    "cortex-manager": (985, 985),
+    "cortex-reviewer-planner": (984, 984),
+    "cortex-egress": (983, 983),
+}
+
+
+def _planned_account_ids() -> dict:
+    return {
+        name: {"uid": uid, "gid": gid, "uid_source": "existing", "gid_source": "existing"}
+        for name, (uid, gid) in PLANNED_ACCOUNT_IDS.items()
+    }
+
+
 def _valid_full_qualification(
     tmp_path: Path,
     *,
@@ -285,10 +303,12 @@ def _valid_full_qualification(
     upgrade_document: dict | None = None,
 ) -> dict:
     payload = _valid_qualification()
+    manager_uid, manager_gid = PLANNED_ACCOUNT_IDS["cortex-manager"]
+    egress_uid, egress_gid = PLANNED_ACCOUNT_IDS["cortex-egress"]
     payload["services"] = [
-        {"name": "cortex-egress-proxy.service", "uid": 995, "gid": 995, "active": True},
-        {"name": "cortex-manager.service", "uid": 991, "gid": 991, "active": True},
-        {"name": "cortex-monitor.service", "uid": 991, "gid": 991, "active": True},
+        {"name": "cortex-egress-proxy.service", "uid": egress_uid, "gid": egress_gid, "active": True},
+        {"name": "cortex-manager.service", "uid": manager_uid, "gid": manager_gid, "active": True},
+        {"name": "cortex-monitor.service", "uid": manager_uid, "gid": manager_gid, "active": True},
     ]
     payload["tests"] = [
         {"name": name, "status": "passed"}
@@ -323,6 +343,7 @@ def _valid_full_qualification(
         "attestation": attestation,
         "artifact_hashes": {"units/cortex-manager.service": "1" * 64},
         "service_identities": {"cortex-manager.service": {"user": "cortex-manager"}},
+        "account_ids": _planned_account_ids(),
     }
     generated = {
         "schema_version": 1,
@@ -2086,3 +2107,176 @@ def test_runtime_workspace_provisioning_rejects_an_incomplete_acl_pair() -> None
 
     with pytest.raises(driver.QualificationFailure, match="access/default ACL pair"):
         driver._runtime_workspace_provisioning_spec(assets)
+
+
+# ---------------------------------------------------------------------------
+# #1286：RC 容器先占用 991–995，service 身分對照 plan 實際配到的號碼
+# ---------------------------------------------------------------------------
+
+
+def _run_release_validator(tmp_path: Path, payload: dict) -> subprocess.CompletedProcess[str]:
+    qualification = tmp_path / "qualification.json"
+    _write_json(qualification, payload)
+    return subprocess.run(
+        [
+            sys.executable,
+            str(VALIDATOR),
+            "--qualification",
+            str(qualification),
+            "--candidate-sha",
+            "a" * 40,
+            "--wheel-sha256",
+            "b" * 64,
+            "--bundle-sha256",
+            "c" * 64,
+            "--evidence-root",
+            str(tmp_path),
+            "--require-release-profile",
+        ],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def _mutate_install_verification(tmp_path: Path, payload: dict, mutate) -> None:
+    path = tmp_path / "evidence" / "install-verification.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    mutate(document)
+    _write_json(path, document)
+    _refresh_full_hashes(tmp_path, payload)
+
+
+def test_release_fixture_runs_on_allocated_ids_outside_the_ubuntu_band(tmp_path: Path) -> None:
+    payload = _valid_release_qualification(tmp_path)
+    services = {row["name"]: (row["uid"], row["gid"]) for row in payload["services"]}
+    install = json.loads(
+        (tmp_path / "evidence" / "install-verification.json").read_text(encoding="utf-8")
+    )
+    planned = install["account_ids"]
+
+    assert services["cortex-manager.service"] == (
+        planned["cortex-manager"]["uid"],
+        planned["cortex-manager"]["gid"],
+    )
+    assert services["cortex-egress-proxy.service"] == (
+        planned["cortex-egress"]["uid"],
+        planned["cortex-egress"]["gid"],
+    )
+    assert all(not 990 <= row[key] <= 999 for row in planned.values() for key in ("uid", "gid"))
+    completed = _run_release_validator(tmp_path, payload)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("mutate_payload", "mutate_install", "detail"),
+    [
+        (
+            lambda payload: payload["services"][1].update(uid=991, gid=991),
+            None,
+            "Manager service identity",
+        ),
+        (
+            lambda payload: payload["services"][2].update(gid=4242),
+            None,
+            "Monitor service identity",
+        ),
+        (
+            lambda payload: payload["services"][0].update(uid=4243, gid=4243),
+            None,
+            "egress proxy",
+        ),
+        (None, lambda install: install.pop("account_ids"), "account_ids"),
+        (
+            None,
+            lambda install: install["account_ids"].pop("cortex-gate"),
+            "account_ids",
+        ),
+        (
+            lambda payload: [
+                row.update(uid=995, gid=995)
+                for row in payload["services"]
+                if row["name"] == "cortex-egress-proxy.service"
+            ],
+            lambda install: install["account_ids"]["cortex-egress"].update(uid=995, gid=995),
+            "990-999",
+        ),
+        (
+            None,
+            lambda install: install["account_ids"]["cortex-builder"].update(uid=989),
+            "occupied",
+        ),
+        (
+            None,
+            lambda install: install["account_ids"]["cortex-gate"].update(gid=988),
+            "occupied",
+        ),
+        (
+            None,
+            lambda install: install["account_ids"]["cortex-builder"].update(
+                uid_source="allocated"
+            ),
+            "existing",
+        ),
+        (
+            None,
+            lambda install: install["account_ids"]["cortex-builder"].update(
+                gid_source="overlay"
+            ),
+            "existing",
+        ),
+    ],
+)
+def test_release_validator_binds_service_identities_to_the_planned_account_ids(
+    tmp_path: Path, mutate_payload, mutate_install, detail: str
+) -> None:
+    payload = _valid_release_qualification(tmp_path)
+    if mutate_install is not None:
+        _mutate_install_verification(tmp_path, payload, mutate_install)
+    if mutate_payload is not None:
+        mutate_payload(payload)
+
+    completed = _run_release_validator(tmp_path, payload)
+
+    assert completed.returncode != 0
+    assert detail in completed.stdout + completed.stderr
+
+
+def test_release_harness_occupies_the_ubuntu_system_ids_before_the_first_plan() -> None:
+    runner = _required_text(RUNNER)
+    legacy_exit = runner.index("    run_legacy_adoption_profile\n    exit 0")
+    seed = runner.index("991:systemd-resolve")
+    plan = runner.index('cortex install trust-root plan \\\n    --config /artifacts/install-config.yaml')
+    check = runner.index("account_id_sources", plan)
+    apply = runner.index("cortex install trust-root apply", plan)
+
+    # 只有 release／deployment-canary 走這段；legacy-adoption 以 overlay 宣告自己的號碼。
+    assert legacy_exit < seed < plan < check < apply
+    for row in ("991:systemd-resolve", "992:render", "993:kvm", "994:sgx", "995:input"):
+        assert row in runner
+    seeding = runner[seed:plan]
+    assert "groupadd" in seeding and "useradd" in seeding
+    assert "die" in runner[check:apply]
+
+
+def test_release_harness_also_occupies_ids_inside_the_allocation_range() -> None:
+    # 只占 991–995 碰不到配號器（它從 989 開始）：再占「只有 uid 989」與「只有 gid 988」，
+    # RC 才證明配號器讀真實 passwd／group、uid 與 gid 各自判斷占用。
+    from qualification import validate as validate_module
+
+    runner = _required_text(RUNNER)
+    seed = runner.index("991:systemd-resolve")
+    plan = runner.index('cortex install trust-root plan \\\n    --config /artifacts/install-config.yaml')
+    seeding = runner[seed:plan]
+    assert "useradd --system --uid 989 --gid 991" in seeding
+    assert "groupadd --gid 988" in seeding
+    assert "getent passwd 988" in seeding and "getent group 989" in seeding
+    check = runner[plan : runner.index("cortex install trust-root apply", plan)]
+    assert "989" in check and "988" in check
+
+    assert validate_module.RC_OCCUPIED_UIDS == frozenset({989, 991, 992, 993, 994, 995})
+    assert validate_module.RC_OCCUPIED_GIDS == frozenset({988, 991, 992, 993, 994, 995})
+    for name, (uid, gid) in PLANNED_ACCOUNT_IDS.items():
+        assert uid not in validate_module.RC_OCCUPIED_UIDS, name
+        assert gid not in validate_module.RC_OCCUPIED_GIDS, name

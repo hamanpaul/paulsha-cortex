@@ -100,8 +100,8 @@ legacy adoption（`trust-root-legacy-adoption.md`）仍照這些步驟操作。
 
 ## 1. 封存唯一 candidate CLI
 
-先由 release artifact ingress 將 `v0.1.14` 的 install-input archive 與 qualification
-manifest 放到 `/var/lib/cortex-installer/0.1.14/release`。這個 ingress 是前置 authority：
+先由 release artifact ingress 將 `v0.1.13` 的 install-input archive 與 qualification
+manifest 放到 `/var/lib/cortex-installer/0.1.13/release`。這個 ingress 是前置 authority：
 目錄及每一層 ancestor 必須是 root-owned、不可由 group/other 寫入、不可有 symlink。
 不要直接從使用者 checkout、`$HOME` 或 `/tmp` 以 root 執行 candidate code。
 
@@ -121,15 +121,15 @@ PATH=/usr/bin:/bin
 export PATH
 
 cortex_installer_root=/var/lib/cortex-installer
-cortex_bootstrap_root="$cortex_installer_root/0.1.14"
+cortex_bootstrap_root="$cortex_installer_root/0.1.13"
 cortex_release_root="$cortex_bootstrap_root/release"
 cortex_input_root="$cortex_bootstrap_root/input"
-cortex_install_input_archive="$cortex_release_root/paulsha-cortex-0.1.14-install-input.tar.gz"
-cortex_qualification_manifest="$cortex_release_root/paulsha-cortex-0.1.14-qualification.json"
+cortex_install_input_archive="$cortex_release_root/paulsha-cortex-0.1.13-install-input.tar.gz"
+cortex_qualification_manifest="$cortex_release_root/paulsha-cortex-0.1.13-qualification.json"
 cortex_bundle="$cortex_input_root/bundle.json"
 cortex_install_config="$cortex_input_root/install-config.yaml"
 cortex_release_candidate_sha=<40-hex-annotated-tag-target>
-cortex_release_wheel_asset_name=paulsha_cortex-0.1.14-py3-none-any.whl
+cortex_release_wheel_asset_name=paulsha_cortex-0.1.13-py3-none-any.whl
 cortex_release_wheel_asset_sha256=<64-hex-release-wheel-asset-digest>
 cortex_install_input_asset_sha256=<64-hex-release-install-input-asset-digest>
 cortex_qualification_asset_sha256=<64-hex-release-qualification-asset-digest>
@@ -371,6 +371,11 @@ test -x "$cortex_cli"
 一次；兩次 digest 不同就停止。digest 只涵蓋 relative path、mode 與 file content，且遇到
 symlink、非 root owner、group/other writable 或特殊檔案立即失敗。
 
+`cortex_root_cli` 給 root installer 的 PATH 與 `cortex upgrade` 相同，含 `/usr/sbin`、`/sbin`
+（Ubuntu 的 `useradd`、`groupadd`、`visudo` 在 `/usr/sbin`，#1282）。installer 本身也只從固定
+系統目錄（依序 `/usr/sbin`、`/usr/bin`、`/sbin`、`/bin`）解析這些工具、不看 PATH，PATH 缺 sbin
+不會再讓 apply 失敗；PATH 只影響 installer 以外的指令。
+
 ```bash
 cortex_cli_tree_sha() {
   /usr/bin/sudo /usr/bin/env -i HOME=/root PATH=/usr/bin:/bin LANG=C.UTF-8 LC_ALL=C.UTF-8 \
@@ -404,7 +409,7 @@ cortex_sealed_cli_tree_sha=$(cortex_cli_tree_sha)
 cortex_root_cli() {
   test "$(cortex_cli_tree_sha)" = "$cortex_sealed_cli_tree_sha"
   /usr/bin/sudo /usr/bin/env -i HOME=/root \
-    PATH="$cortex_bootstrap_root/venv/bin:/usr/bin:/bin" \
+    PATH="$cortex_bootstrap_root/venv/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     LANG=C.UTF-8 LC_ALL=C.UTF-8 PYTHONNOUSERSITE=1 \
     "$cortex_cli" "$@"
 }
@@ -577,10 +582,51 @@ PY
 cortex_plan_path=$cortex_durable_plan_path
 ```
 
-人工 review 至少確認 candidate SHA／wheel hash、四個 service accounts、所有目標路徑、
+人工 review 至少確認 candidate SHA／wheel hash、四個 service accounts 與
+`plan-result.json` 的 `account_ids`（每個帳號的 uid／gid 與來源，見下方）、所有目標路徑、
 systemd units、polkit 規則、toolchain artifacts、required credentials、canonical receipt
 parent 與本次隨機且不存在的 effective receipt path 都符合本次變更。不要只把畫面上的 SHA
 複製回 prompt；確認值代表 operator 已閱讀 plan 並接受其完整 mutation set。
+
+### 帳號 uid／gid 的來源（#1286）
+
+release 的 install config 不寫死帳號號碼。plan 對五個帳號（`cortex-manager`、
+`cortex-reviewer-planner`、`cortex-builder`、`cortex-gate`、`cortex-egress`）的 uid 與 gid
+逐一決定，優先順序：
+
+1. host overlay（`--host-overlay`）宣告的號碼，來源記為 `overlay`；手寫的 install config
+   自己宣告的號碼記為 `config`。
+2. 主機已有同名帳號／群組：沿用現有號碼，來源 `existing`。升級與重跑 plan 都走這條，
+   帳號 step 不需要 overlay；從未用過 overlay 的主機升級時也不需要（曾用過的見下方）。
+3. 都沒有：自動配號，來源 `allocated`。從 989 往下找第一個 uid 與 gid 都空著的號碼，
+   uid＝gid；沒有同號可用時 uid、gid 分開配。範圍限 system 範圍 100–989，避開發行版
+   慣用的 990–999（Ubuntu 的 `systemd-resolve` 與 udev 的 `render`／`kvm`／`sgx`／`input`
+   等都在這段）。同一份 passwd／group，plan 兩次得到同一組號碼，plan sha 不變。
+
+plan 經 NSS 讀 passwd／group（非 root 也讀得到），與 apply preflight 看到的是同一份；自動配號
+另對每個候選號碼做 `getpwuid`／`getgrgid` 單點查詢。passwd／group 有 `files`／`systemd` 以外
+來源（sssd、LDAP）的主機，目錄服務的使用者若以某號碼當 primary gid、卻沒有同號的 group，
+這兩種查詢都看不到，這類主機請用 overlay 指定號碼。
+host overlay 只在要**指定**號碼時才需要，例如多台主機要統一號碼：
+
+```yaml
+accounts:
+  cortex-builder: {uid: 1500, gid: 1500}
+```
+
+要用 overlay 時，先以 `/usr/bin/sudo /usr/bin/install -o root -g root -m 0644` 存成
+`/var/lib/cortex-installer/host-overlay.yaml`，上面的 plan 指令再加
+`--host-overlay /var/lib/cortex-installer/host-overlay.yaml`。之後 `cortex upgrade` 會讀同一份
+檔案，並要求它的 digest 與上一次 plan 相同，所以 overlay 一旦用了就保留原檔。以前從暫存路徑
+或家目錄傳 `--host-overlay` 安裝的主機，`cortex upgrade` 之前要先把**同一份**檔案（內容不變）
+以上述方式放到 `/var/lib/cortex-installer/host-overlay.yaml`，否則升級會以 overlay 不同拒絕。
+
+`account_ids` 以帳號名為 key，列出 `uid`、`gid`、`uid_source`、`gid_source`；審核時用
+`/usr/bin/python3 -I -S -m json.tool "$cortex_plan_result"` 檢視。apply preflight 在任何變更
+之前重新確認：`allocated` 的號碼仍沒有被其他帳號或群組占用，`existing` 的號碼仍屬同名
+帳號。plan 之後主機帳號有變動（例如期間裝了會建 system 帳號的套件）時，apply 在任何變更
+前 fail closed 並要求重新產生 plan，回到本節重跑 plan 與三方確認即可。overlay 指定的號碼
+被占用時照舊報錯，要改 overlay。
 
 ## 3. Stop services and apply exact plan
 
@@ -742,14 +788,17 @@ PY
     cortex_release_maintenance_lease || true
     return 1
   fi
+  # One line per name and nothing for an empty list: `print(*[], sep=...)`
+  # still prints a newline, which mapfile reads as one empty service name
+  # (#1282 -- services stopped before the lease made restore start "").
   mapfile -t cortex_present_services < <(
     /usr/bin/python3 -I -S -c \
-      'import json,sys; print(*json.loads(sys.argv[1])["present_services"], sep="\n")' \
+      'import json,sys; sys.stdout.write("".join(n + "\n" for n in json.loads(sys.argv[1])["present_services"]))' \
       "$cortex_maintenance_result"
   )
   mapfile -t cortex_previously_active < <(
     /usr/bin/python3 -I -S -c \
-      'import json,sys; print(*json.loads(sys.argv[1])["previously_active"], sep="\n")' \
+      'import json,sys; sys.stdout.write("".join(n + "\n" for n in json.loads(sys.argv[1])["previously_active"]))' \
       "$cortex_maintenance_result"
   )
 }
@@ -799,7 +848,7 @@ test "$(cortex_cli_tree_sha)" = "$cortex_sealed_cli_tree_sha"
 
 cortex_apply_attempted=1
 /usr/bin/sudo /usr/bin/env -i HOME=/root \
-  PATH="$cortex_bootstrap_root/venv/bin:/usr/bin:/bin" \
+  PATH="$cortex_bootstrap_root/venv/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
   LANG=C.UTF-8 LC_ALL=C.UTF-8 PYTHONNOUSERSITE=1 \
   "$cortex_cli" install trust-root apply \
     --plan "$cortex_plan_path" \
@@ -819,7 +868,10 @@ window 內會 fail closed。trap 不依賴 apply child 返回後才更新的 she
 誤當本次 transaction 回滾。lease 的 root-owned plan/token marker 只在 helper 正常結束時
 清除；若 coproc 先死亡，marker 仍擋住所有新 lease 與 tokenless mutation，原 token 可繼續
 rollback。只有 rollback 回報 `restore_safe=true` 才恢復原本 active 的 units；restore 後才以
-exact token 清除可能殘留的 marker。
+exact token 清除可能殘留的 marker。取得 lease 前服務就已停止時，`previously_active` 是空
+陣列（每個名稱一行、空清單不輸出任何行），restore 不 start 任何 unit 而直接成功，trap
+照常清除 snapshot／marker（#1282：舊寫法把空清單讀成一個空字串，`systemctl start ""` 失敗
+後保留 snapshot，只能走 recover）。
 
 ### 升級時 repository step 如何接手跑過 job 的來源樹（#1124）
 
@@ -981,7 +1033,7 @@ PATH=/usr/bin:/bin
 export PATH
 
 cortex_installer_root=/var/lib/cortex-installer
-cortex_bootstrap_root="$cortex_installer_root/0.1.14"
+cortex_bootstrap_root="$cortex_installer_root/0.1.13"
 cortex_cli="$cortex_bootstrap_root/venv/bin/cortex"
 read -r -p "Re-enter the previously reviewed plan SHA-256: " cortex_confirmed_plan_sha
 test "${#cortex_confirmed_plan_sha}" -eq 64
@@ -1104,7 +1156,7 @@ active、loaded runtime 不一致或 status 探測失敗），就照舊執行上
 前就被打斷），`recover` 本來就只清 marker、不動 service，輸出標為 `"action": "marker-cleared"`。
 
 只有 `--recover` 拒絕執行或回報要人工裁決時，才照上面的 snippet 手動恢復。這時 snippet 裡寫死的
-`0.1.14/venv` 不適用：該次升級的 sealed CLI 在它自己的 attempt 目錄。每個變數改由該次升級的
+`0.1.13/venv` 不適用：該次升級的 sealed CLI 在它自己的 attempt 目錄。每個變數改由該次升級的
 report（`/var/lib/cortex-installer/<版本>/upgrade-report.json`，與
 `/var/lib/cortex-installer/last-upgrade-report.json` 內容相同）對應：
 

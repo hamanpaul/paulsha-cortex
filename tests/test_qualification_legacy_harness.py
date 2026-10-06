@@ -67,6 +67,14 @@ class FakeHost:
         self.extra_quarantine: list[str] = []
         self.plan: dict | None = None
         self.sample_changes: dict[str, str] = {}
+        self.environments: list[tuple[tuple[str, ...], object]] = []
+        self.plan_preview: dict = {
+            "ready": True,
+            "failures": [],
+            "quarantine": len(MANIFEST["expected"]["quarantine"]),
+            "summary": {"adopt": 1},
+        }
+        self.sudoers: dict = {"accounts": [], "unproven": None}
         inode = 1000
         for path in MANIFEST["expected"]["quarantine"] + MANIFEST["expected"]["adopted_samples"]:
             inode += 1
@@ -125,7 +133,11 @@ class FakeHost:
     # -- command runner ------------------------------------------------------
     def run(self, argv, env=None):
         argv = tuple(argv)
+        if argv[0].endswith("/cortex"):
+            # The harness may call the installer by absolute path (main()).
+            argv = ("cortex", *argv[1:])
         self.calls.append(argv)
+        self.environments.append((argv, env))
         if argv[0] == "systemctl":
             return self._systemctl(argv)
         assert argv[:3] == ("cortex", "install", "trust-root"), argv
@@ -144,6 +156,8 @@ class FakeHost:
                         "scope_sha256": "2" * 64,
                         "host_binding_sha256": "3" * 64,
                         "census_stable": True,
+                        "plan_preview": self.plan_preview,
+                        "cortex_account_universal_nopasswd": self.sudoers,
                     }
                 )
             )
@@ -215,12 +229,13 @@ class FakeHost:
         raise AssertionError(f"unexpected systemctl {argv}")
 
 
-def _harness(tmp_path: Path, host: FakeHost):
+def _harness(tmp_path: Path, host: FakeHost, **options):
     output = tmp_path / "output"
     output.mkdir()
     work = tmp_path / "work"
     work.mkdir()
     return harness_module.Harness(
+        **options,
         manifest=MANIFEST,
         config=tmp_path / "install-config.yaml",
         bundle=tmp_path / "bundle.json",
@@ -297,6 +312,77 @@ def test_harness_runs_every_step_in_order_and_records_passing_evidence(tmp_path:
     assert overlay["legacy_adoption"]["inventory_sha256"] == INVENTORY_SHA
 
 
+def test_harness_runs_the_installer_with_the_tools_only_in_sbin(tmp_path: Path) -> None:
+    # #1282: the RC run calls the installer the way the runbook did on the
+    # reference host -- by absolute path, with no sbin directory on PATH --
+    # so a tool resolved through PATH (visudo, useradd, groupadd) fails here.
+    host = FakeHost(tmp_path)
+    cli_path = "/usr/local/bin:/usr/bin:/bin"
+    harness = _harness(
+        tmp_path,
+        host,
+        cli=("/usr/local/bin/cortex", "install", "trust-root"),
+        cli_env={"PATH": cli_path},
+    )
+
+    assert harness.run() == 0
+
+    installer = [env for argv, env in host.environments if argv[0] == "cortex"]
+    assert installer and all(env == {"PATH": cli_path} for env in installer)
+    evidence = _evidence(tmp_path)
+    assert evidence["cli_environment"] == {"path": cli_path, "sbin_on_path": False}
+    # The S2 review facts the capture reported are evidence too.
+    assert evidence["inventory"]["plan_preview"] == {
+        "ready": True,
+        "quarantine": len(MANIFEST["expected"]["quarantine"]),
+    }
+    assert evidence["inventory"]["cortex_account_universal_nopasswd"] == {
+        "accounts": [],
+        "unproven": None,
+    }
+
+
+def test_harness_main_resolves_the_installer_and_drops_sbin_from_its_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict = {}
+
+    class Recorder:
+        def __init__(self, **kwargs) -> None:
+            seen.update(kwargs)
+
+        def run(self) -> int:
+            return 0
+
+    monkeypatch.setattr(harness_module.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(
+        harness_module.shutil,
+        "which",
+        lambda name, path=None: "/usr/local/bin/cortex" if name == "cortex" else None,
+    )
+    monkeypatch.setattr(harness_module, "Harness", Recorder)
+
+    assert harness_module.main(
+        [
+            "--config",
+            "/artifacts/install-config.yaml",
+            "--bundle",
+            "/artifacts/bundle.json",
+            "--output-dir",
+            "/qualification-output",
+            "--candidate-sha",
+            "a" * 40,
+            "--wheel-sha256",
+            "b" * 64,
+            "--bundle-sha256",
+            "c" * 64,
+        ]
+    ) == 0
+    assert seen["cli"] == ("/usr/local/bin/cortex", "install", "trust-root")
+    assert seen["cli_env"] == {"PATH": "/usr/local/bin:/usr/bin:/bin"}
+    assert "sbin" not in seen["cli_env"]["PATH"]
+
+
 def test_harness_order_rolls_back_before_credentials_and_activation(tmp_path: Path) -> None:
     host = FakeHost(tmp_path)
     assert _harness(tmp_path, host).run() == 0
@@ -335,6 +421,23 @@ def test_harness_order_rolls_back_before_credentials_and_activation(tmp_path: Pa
         ),
         (lambda host: setattr(host, "need_reload", "yes"), "rollback", "NeedDaemonReload"),
         (lambda host: setattr(host, "verify_result", "fail"), "verify", "verify"),
+        (
+            lambda host: host.plan_preview.update(
+                ready=False, failures=["unclassified: /var/lib/cortex-manager/x"]
+            ),
+            "inventory",
+            "plan preview",
+        ),
+        (
+            lambda host: host.sudoers.update(accounts=["cortex-builder"]),
+            "inventory",
+            "NOPASSWD",
+        ),
+        (
+            lambda host: host.sudoers.update(unproven="visudo not found"),
+            "inventory",
+            "NOPASSWD",
+        ),
     ],
     ids=[
         "plan-sha",
@@ -343,6 +446,9 @@ def test_harness_order_rolls_back_before_credentials_and_activation(tmp_path: Pa
         "rollback-not-restored",
         "stale-units",
         "verify-failed",
+        "preview-not-ready",
+        "sudoers-offender",
+        "sudoers-unproven",
     ],
 )
 def test_harness_fails_closed_and_names_the_failing_step(

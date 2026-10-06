@@ -1,0 +1,1 @@
+- 撤回 v0.1.14：該版從 0.1.13 一鍵升級會在 verify 失敗（#1295，`cortex upgrade` 的 umask 077 讓新 venv 不可執行），且仍封存 agent 執行檔（#1293）。owner 2026-10-06 指示刪除 v0.1.14 release 與 tag、不跳號，修完後重新發布 0.1.14。`VERSION` 與 `trust-root-transactional-install.md` 的 release ingress 版本字串改回 0.1.13，以符合 R-07（VERSION 必須等於最新 tag，只有 release PR 可以偏離）。

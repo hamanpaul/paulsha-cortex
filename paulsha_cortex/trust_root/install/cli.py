@@ -4,9 +4,11 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import fcntl
+import grp
 import hashlib
 import json
 import os
+import pwd
 import secrets
 import stat
 import subprocess
@@ -29,11 +31,13 @@ from .legacy import (
     host_binding_sha256,
     legacy_adoption_request,
     legacy_scope,
+    preview_legacy_adoption,
     publish_inventory,
     render_inventory_summary,
     validate_host_overlay,
 )
 from .core import (
+    HostAccounts,
     InstallError,
     InstallPlanError,
     InstallReceipt,
@@ -41,6 +45,7 @@ from .core import (
     _open_receipt_parent_directory,
     _rename_noreplace_at,
     _write_all,
+    account_id_summary,
     activate_receipt,
     apply_plan,
     atomic_write_json,
@@ -825,6 +830,35 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _nss_id_in_use(kind: str, number: int) -> bool:
+    """The point lookup ``useradd``/``groupadd`` make before taking an id."""
+
+    try:
+        if kind == "uid":
+            pwd.getpwuid(number)
+        else:
+            grp.getgrgid(number)
+    except KeyError:
+        return False
+    return True
+
+
+def _host_account_snapshot() -> HostAccounts:
+    """passwd/group as plan resolves undeclared account ids against (#1286).
+
+    Read through NSS like apply's ``preflight_facts``; both databases are
+    world-readable, so the unprivileged plan account sees the same rows.
+    Allocation also point-looks-up each candidate id, which catches sources
+    that do not enumerate.
+    """
+
+    return HostAccounts(
+        users=tuple((row.pw_name, row.pw_uid, row.pw_gid) for row in pwd.getpwall()),
+        groups=tuple((row.gr_name, row.gr_gid) for row in grp.getgrall()),
+        id_in_use=_nss_id_in_use,
+    )
+
+
 def _bound_plan_from_config(
     config: Mapping[str, object], bundle: Path
 ) -> dict[str, object]:
@@ -843,6 +877,7 @@ def _bound_plan_from_config(
         config=config,
         candidate_wheel=Path(str(wheel["resolved_path"])),
         bundle=Path(str(manifest["manifest_path"])),
+        host_accounts=_host_account_snapshot,
     )
     plan = bind_bundle_artifacts(plan, manifest)
     candidate = plan.get("candidate")
@@ -949,7 +984,12 @@ def _plan_command(args: argparse.Namespace) -> int:
     )
     output = Path(args.output).expanduser().absolute()
     atomic_write_json(output, plan, mode=0o600)
-    payload: dict[str, object] = {"output": str(output), "plan_sha256": plan_sha256(plan)}
+    payload: dict[str, object] = {
+        "output": str(output),
+        "plan_sha256": plan_sha256(plan),
+        # #1286：每個帳號的號碼與來源（overlay／config／existing／allocated），供審核。
+        "account_ids": account_id_summary(plan),
+    }
     if "host_overlay_sha256" in plan:
         payload["host_overlay_sha256"] = plan["host_overlay_sha256"]
     legacy_block = plan.get("legacy_adoption")
@@ -1448,9 +1488,10 @@ def _legacy_inventory_command(args: argparse.Namespace) -> int:
         raise InstallError(
             f"legacy inventory output already exists; refusing to overwrite: {output}"
         )
+    backend = LocalLegacyHostBackend()
     with _legacy_inventory_admission(plan):
         document = collect_legacy_inventory(
-            plan=plan, backend=LocalLegacyHostBackend(), host_overlay=overlay
+            plan=plan, backend=backend, host_overlay=overlay
         )
         publish_inventory(output, document)
     host = document["host"]
@@ -1466,6 +1507,28 @@ def _legacy_inventory_command(args: argparse.Namespace) -> int:
             "changed while they were checked); any adoption plan or apply gate must "
             "refuse this inventory -- rerun the capture with the services stopped\n"
         )
+    # S2 review (#1282): what the plan will refuse, and the sudoers preflight a
+    # non-root review cannot read, surface here instead of at plan or apply.
+    preview = preview_legacy_adoption(plan, overlay=overlay, document=document)
+    sudoers = backend.sudoers_verdict(plan)
+    if not preview["ready"]:
+        sys.stderr.write(
+            "trust-root legacy inventory: a plan bound to this capture would refuse it:\n"
+            + "".join(f"  - {failure}\n" for failure in preview["failures"])  # type: ignore[union-attr]
+        )
+    if sudoers.get("accounts"):
+        sys.stderr.write(
+            "trust-root legacy inventory: cortex account(s) "
+            f"{', '.join(sudoers['accounts'])} have universal NOPASSWD sudo; apply "  # type: ignore[arg-type]
+            "preflight refuses them (cortex_account_universal_nopasswd) -- fix "
+            "/etc/sudoers before apply\n"
+        )
+    if sudoers.get("unproven"):
+        sys.stderr.write(
+            "trust-root legacy inventory: sudoers cannot be proven free of universal "
+            f"NOPASSWD for cortex accounts ({sudoers['unproven']}); apply preflight "
+            "fails closed until it can\n"
+        )
     _emit(
         {
             "output": str(output),
@@ -1473,6 +1536,11 @@ def _legacy_inventory_command(args: argparse.Namespace) -> int:
             "scope_sha256": document["scope_sha256"],
             "host_binding_sha256": host["binding_sha256"],
             "census_stable": census_stable,
+            "plan_preview": preview,
+            "cortex_account_universal_nopasswd": {
+                "accounts": list(sudoers.get("accounts") or []),
+                "unproven": sudoers.get("unproven"),
+            },
         }
     )
     return 0

@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from paulsha_cortex.trust_root.install import backend, cli, legacy_purge
+from paulsha_cortex.trust_root.install import backend, cli, core, legacy_purge
 from paulsha_cortex.trust_root.install.core import (
     InstallDriftError,
     InstallReceipt,
@@ -245,6 +245,43 @@ def test_secure_purge_deletes_exact_staged_tree(tmp_path) -> None:
         target, identity, quarantine_root=root, key="receipt:step"
     )
     assert not target.exists()
+
+
+def test_secure_purge_records_and_deletes_stale_sockets_and_fifos(tmp_path) -> None:
+    # #1282: a quarantined tree may hold a stale UNIX socket or a FIFO; they
+    # are bound by type and mode (never opened) and purge removes them.
+    root, target, _identity = _quarantine_tree(tmp_path)
+    os.mknod(target / "agent.sock", 0o600 | stat.S_IFSOCK)
+    os.mkfifo(target / "events.fifo", 0o640)
+    identity = backend._legacy_quarantine_identity(target)
+    assert identity["type"] == "directory"
+    # The digest changes with the special member's type and mode.
+    os.chmod(target / "events.fifo", 0o600)
+    assert backend._legacy_quarantine_identity(target) != identity
+    os.chmod(target / "events.fifo", 0o640)
+    assert backend._legacy_quarantine_identity(target) == identity
+
+    backend._discard_legacy_quarantine(
+        target, identity, quarantine_root=root, key="receipt:specials"
+    )
+    assert not target.exists()
+
+
+@pytest.mark.parametrize("kind", ["socket", "fifo"])
+def test_secure_purge_deletes_a_quarantined_socket_or_fifo(tmp_path, kind: str) -> None:
+    root = tmp_path / "quarantine"
+    root.mkdir(mode=0o700)
+    target = root / "entry"
+    if kind == "socket":
+        os.mknod(target, 0o600 | stat.S_IFSOCK)
+    else:
+        os.mkfifo(target, 0o600)
+    identity = backend._legacy_quarantine_identity(target)
+    assert identity["type"] == kind
+    assert core._valid_quarantine_identity(identity)
+
+    backend._discard_legacy_quarantine(target, identity, quarantine_root=root, key=f"k:{kind}")
+    assert not os.path.lexists(target)
 
 
 def test_secure_purge_keeps_tree_when_staging_is_cross_filesystem(
