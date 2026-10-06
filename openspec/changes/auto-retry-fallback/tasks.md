@@ -1,0 +1,2 @@
+- [x] 1. Keep provider-failure retry limits independent from `PSC_WORKFLOW_AUTO_RETRY_LIMIT`, with regression coverage for limits 0 and 5.
+- [x] 2. Cover control-queue review rejection through a periodic tick to an exact-Candidate builder launch.

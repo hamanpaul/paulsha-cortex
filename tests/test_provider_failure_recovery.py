@@ -726,7 +726,11 @@ def test_reroutable_failure_with_unknown_backoff_state_returns_unknown_decision(
     assert persisted.attempts.get(manager._provider_retry_attempt_key("subagent-build"), 0) == 0
 
 
-def test_provider_retry_bounded_and_exhaustion_reaches_needs_human(tmp_path: Path) -> None:
+@pytest.mark.parametrize("auto_retry_limit", [0, 5])
+def test_provider_retry_bounded_and_exhaustion_reaches_needs_human(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, auto_retry_limit: int
+) -> None:
+    monkeypatch.setenv("PSC_WORKFLOW_AUTO_RETRY_LIMIT", str(auto_retry_limit))
     registry = JobRegistry(state_path=tmp_path / "jobs.json")
     worktree = tmp_path / "wt"
     base_head = _init_worktree(worktree)
@@ -746,6 +750,7 @@ def test_provider_retry_bounded_and_exhaustion_reaches_needs_human(tmp_path: Pat
 
     reasons: list[str] = []
     counts: list[int | None] = []
+    limits: list[int | None] = []
     for _ in range(terminal_contract.MAX_PROVIDER_RETRIES + 2):
         result = manager.resume_workflow_run(
             dispatcher,
@@ -756,6 +761,7 @@ def test_provider_retry_bounded_and_exhaustion_reaches_needs_human(tmp_path: Pat
         )
         reasons.append(result["reason"])
         counts.append(result.get("provider_retry_count"))
+        limits.append(result.get("provider_retry_limit"))
         if result["reason"] != "provider-failure-retry":
             break
         # 讓最新那個 replacement job 也失敗，逼近上限。
@@ -775,6 +781,7 @@ def test_provider_retry_bounded_and_exhaustion_reaches_needs_human(tmp_path: Pat
 
     assert reasons.count("provider-failure-retry") == terminal_contract.MAX_PROVIDER_RETRIES
     assert reasons[-1] == "provider-retry-exhausted"
+    assert set(limits) == {terminal_contract.MAX_PROVIDER_RETRIES}
     assert counts[: terminal_contract.MAX_PROVIDER_RETRIES] == list(
         range(1, terminal_contract.MAX_PROVIDER_RETRIES + 1)
     )

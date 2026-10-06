@@ -945,6 +945,52 @@ class TestS05RejectedSources:
         )
         assert harness.jobs("adversarial-review") == []
 
+    def test_periodic_tick_launches_retry_for_control_queue_blocking_review(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """A daemon tick carries a control-queue workflow through review failure to a build launch."""
+
+        # This scenario isolates the retry route; the synthetic repo has no live
+        # WorkAuthority snapshot for the unrelated builder-todo admission check.
+        monkeypatch.setattr(manager_daemon, "_builder_todo_admission_for_run", lambda _run: None)
+        harness = _DaemonHarness(tmp_path, monkeypatch)
+        first = harness.work()["result"]
+        verification_job = first["job_id"]
+        harness.finish(verification_job)
+        second = harness.work()["result"]
+        assert second["current_phase"] == "review"
+        review_job = second["job_id"]
+        harness.finish(review_job, findings=[BLOCKING_FINDING])
+
+        launches_before_tick = list(harness.launches)
+        retry_launcher = base._Launcher(
+            "codex", "gpt-primary", on_launch=harness.launches.append
+        )
+        periodic = manager_daemon.build_periodic_tick_runner(
+            dispatcher=harness.dispatcher,
+            specs_dir=str(tmp_path / "specs"),
+            handoff_dir=str(tmp_path / "handoff"),
+            launcher=retry_launcher,
+            workflow_ship_validator=object(),
+            require_idle=False,
+            workflow_identity_registry=harness.identities,
+            scan_specs_fn=lambda _root: [],
+            run_tick_fn=lambda *args, **kwargs: {"dispatch_skipped": False},
+            auto_claim_fn=lambda: [],
+        )
+
+        periodic()
+
+        retried = harness.run()
+        build_jobs = harness.jobs("subagent-build")
+        assert retried.current_phase == "build"
+        assert retried.candidate_head == harness.candidate
+        assert "needs_human" not in retried.facets
+        assert retried.auto_retry_history[-1]["reason"] == "blocking-findings"
+        assert len(build_jobs) == 2
+        assert launches_before_tick[-1] != build_jobs[-1]["job_id"]
+        assert harness.launches[-1] == build_jobs[-1]["job_id"]
+
     def test_revoked_review_evidence_is_not_reused(self, tmp_path, monkeypatch) -> None:
         """撤銷：retry-review reset 把舊 review job 標 failed，之後的 resume 不得
         再把它當可重用來源。"""

@@ -19162,8 +19162,9 @@ def resume_workflow_run(
             attempts = dict(run.attempts)
             seen = attempts.get(retry_key, 0)
             status_fields["provider_retry_count"] = seen
-            status_fields["provider_retry_limit"] = run.auto_retry_limit
-            if seen < run.auto_retry_limit:
+            provider_retry_limit = terminal_contract.MAX_PROVIDER_RETRIES
+            status_fields["provider_retry_limit"] = provider_retry_limit
+            if seen < provider_retry_limit:
                 rerouted_target = _provider_failure_reroute(
                     run,
                     step,
@@ -19256,7 +19257,7 @@ def resume_workflow_run(
                                 "builder_before": before_pair,
                                 "builder_after": after_pair,
                                 "builder_retry_number": retry_number,
-                                "limit": run.auto_retry_limit,
+                                "limit": provider_retry_limit,
                                 "job_id": str(job.get("job_id") or "") or None,
                                 "feedback": classification.reason[:RETRY_CONTEXT_EVIDENCE_LIMIT],
                                 "created_at": _utcnow(),
