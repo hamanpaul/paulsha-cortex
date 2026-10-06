@@ -272,14 +272,14 @@ def _one_command_upgrade_document(
     }
 
 
-#: #1286：RC 容器的 991–995 先被模擬的 Ubuntu 身分占用，plan 在 989 以下自動配號；
-#: 升級時沿用（existing）。fixture 用與 Ubuntu 主機同形狀的結果。
+#: #1286：RC 容器先占用 uid／gid 991–995（模擬 Ubuntu）、配號範圍內的 uid 989 與 gid 988，
+#: plan 從 987 開始配號；升級時沿用（existing）。fixture 用 RC 應得的結果。
 PLANNED_ACCOUNT_IDS = {
-    "cortex-builder": (988, 988),
-    "cortex-gate": (987, 987),
-    "cortex-manager": (986, 986),
-    "cortex-reviewer-planner": (985, 985),
-    "cortex-egress": (984, 984),
+    "cortex-builder": (987, 987),
+    "cortex-gate": (986, 986),
+    "cortex-manager": (985, 985),
+    "cortex-reviewer-planner": (984, 984),
+    "cortex-egress": (983, 983),
 }
 
 
@@ -2069,6 +2069,16 @@ def test_release_fixture_runs_on_allocated_ids_outside_the_ubuntu_band(tmp_path:
         ),
         (
             None,
+            lambda install: install["account_ids"]["cortex-builder"].update(uid=989),
+            "occupied",
+        ),
+        (
+            None,
+            lambda install: install["account_ids"]["cortex-gate"].update(gid=988),
+            "occupied",
+        ),
+        (
+            None,
             lambda install: install["account_ids"]["cortex-builder"].update(
                 uid_source="allocated"
             ),
@@ -2113,3 +2123,25 @@ def test_release_harness_occupies_the_ubuntu_system_ids_before_the_first_plan() 
     seeding = runner[seed:plan]
     assert "groupadd" in seeding and "useradd" in seeding
     assert "die" in runner[check:apply]
+
+
+def test_release_harness_also_occupies_ids_inside_the_allocation_range() -> None:
+    # 只占 991–995 碰不到配號器（它從 989 開始）：再占「只有 uid 989」與「只有 gid 988」，
+    # RC 才證明配號器讀真實 passwd／group、uid 與 gid 各自判斷占用。
+    from qualification import validate as validate_module
+
+    runner = _required_text(RUNNER)
+    seed = runner.index("991:systemd-resolve")
+    plan = runner.index('cortex install trust-root plan \\\n    --config /artifacts/install-config.yaml')
+    seeding = runner[seed:plan]
+    assert "useradd --system --uid 989 --gid 991" in seeding
+    assert "groupadd --gid 988" in seeding
+    assert "getent passwd 988" in seeding and "getent group 989" in seeding
+    check = runner[plan : runner.index("cortex install trust-root apply", plan)]
+    assert "989" in check and "988" in check
+
+    assert validate_module.RC_OCCUPIED_UIDS == frozenset({989, 991, 992, 993, 994, 995})
+    assert validate_module.RC_OCCUPIED_GIDS == frozenset({988, 991, 992, 993, 994, 995})
+    for name, (uid, gid) in PLANNED_ACCOUNT_IDS.items():
+        assert uid not in validate_module.RC_OCCUPIED_UIDS, name
+        assert gid not in validate_module.RC_OCCUPIED_GIDS, name

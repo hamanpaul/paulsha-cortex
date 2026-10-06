@@ -207,6 +207,18 @@ docker exec "$container_name" sh -eu -c '
         getent group "$id" >/dev/null
         getent passwd "$id" >/dev/null
     done
+    # 配號範圍（989 往下）內也占兩個號碼，而且 uid、gid 各占一邊：uid 989 的 primary
+    # group 借用 991，gid 988 沒有同號的 user。配號器必須讀真實 passwd／group，
+    # 並分別判斷 uid 與 gid 的占用，才會略過 989 與 988。
+    getent group 988 >/dev/null || groupadd --gid 988 qual-gid-only-988
+    getent passwd 989 >/dev/null || useradd --system --uid 989 --gid 991 \
+        --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin qual-uid-only-989
+    getent group 988 >/dev/null
+    getent passwd 989 >/dev/null
+    if getent passwd 988 >/dev/null || getent group 989 >/dev/null; then
+        echo "uid 988 or gid 989 is taken; the uid-only/gid-only occupancy is not isolated" >&2
+        exit 1
+    fi
 '
 docker exec "$container_name" cortex install trust-root plan \
     --config /artifacts/install-config.yaml \
@@ -214,15 +226,18 @@ docker exec "$container_name" cortex install trust-root plan \
     --output "$plan_path"
 plan_sha=$(docker exec "$container_name" sha256sum "$plan_path" | awk '{print $1}')
 # 首次安裝的 plan 不得用到被占用的號碼：五個帳號的 uid／gid 都必須是 plan 自動配的
-# （account_id_sources 全為 allocated），而且不落在發行版慣用的 990–999。
+# （account_id_sources 全為 allocated），不落在發行版慣用的 990–999，也不等於上面占用
+# 的 uid 989、gid 988。
 if ! docker exec "$container_name" jq -e '
     ([.account_id_sources[] | .uid, .gid] | length == 10 and all(. == "allocated"))
     and ([(.accounts + .service_accounts)[] | .uid, .gid]
-         | length == 10 and all(. < 990 or . > 999))' \
+         | length == 10 and all(. < 990 or . > 999))
+    and ([(.accounts + .service_accounts)[] | .uid] | all(. != 989))
+    and ([(.accounts + .service_accounts)[] | .gid] | all(. != 988))' \
     "$plan_path" >/dev/null; then
     docker exec "$container_name" jq '{account_id_sources, accounts, service_accounts}' \
         "$plan_path" >&2 || true
-    die "first install plan did not allocate account ids around the occupied 991-995"
+    die "first install plan did not allocate account ids around the occupied 988-995"
 fi
 
 # Credential source basenames come from the installer's adapter allowlist

@@ -81,6 +81,10 @@ PLANNED_ACCOUNTS = {
 #: 發行版慣用的 system 帳號號段；RC 容器先以模擬的 Ubuntu 身分占用 991–995，plan
 #: 的自動配號也避開整段，所以 release／canary 的帳號號碼不得落在這裡。
 DISTRO_RESERVED_IDS = range(990, 1000)
+#: run.sh 在首次 plan 前占用的號碼（與 run.sh 逐字一致，測試釘住）：uid／gid 991–995，
+#: 加上配號範圍內只占 uid 的 989 與只占 gid 的 988。plan 配到的號碼都不得等於它們。
+RC_OCCUPIED_UIDS = frozenset({989, 991, 992, 993, 994, 995})
+RC_OCCUPIED_GIDS = frozenset({988, 991, 992, 993, 994, 995})
 REQUIRED_RELEASE_ARTIFACTS = {
     "evidence/install-verification.json",
     "evidence/generated-installed-attestation.json",
@@ -506,6 +510,12 @@ def _validate_planned_account_ids(
                 _fail(
                     f"planned {name} {key} {value} is inside the distro-reserved 990-999 "
                     "band; the plan must allocate around the occupied system ids"
+                )
+            occupied = RC_OCCUPIED_UIDS if key == "uid" else RC_OCCUPIED_GIDS
+            if value in occupied:
+                _fail(
+                    f"planned {name} {key} {value} is a {key} the RC host occupied before "
+                    "the first plan"
                 )
         if row["uid_source"] != "existing" or row["gid_source"] != "existing":
             _fail(

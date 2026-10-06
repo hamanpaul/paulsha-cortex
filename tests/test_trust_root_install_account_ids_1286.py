@@ -579,11 +579,11 @@ def test_allocated_ids_now_held_by_the_same_name_account_defer_to_provenance(
 
 
 # ---------------------------------------------------------------------------
-# 升級：沒有 overlay 檔也得出與 prior receipt 相同的帳號 step
+# 升級：帳號 step 不需要 overlay（plan 層），以及 `cortex upgrade` 實際的 overlay 規則
 # ---------------------------------------------------------------------------
 
 
-def test_upgrade_plan_without_overlay_reproduces_v0113_account_steps(tmp_path: Path) -> None:
+def test_plan_without_overlay_ids_reproduces_v0113_account_steps(tmp_path: Path) -> None:
     # `_safe_config` 就是 v0.1.13 release config 的形狀：五個帳號寫死 991–995。
     prior = _plan(tmp_path, _safe_config(tmp_path), None)
     assert _ids(prior)["cortex-manager"] == (991, 991)
@@ -608,9 +608,11 @@ def test_upgrade_plan_without_overlay_reproduces_v0113_account_steps(tmp_path: P
     )
 
 
-def test_adopted_host_upgrade_without_the_overlay_file_keeps_the_account_steps(
+def test_adopted_host_plan_without_overlay_ids_keeps_the_account_steps(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # plan 層：帳號 step 不靠 overlay 也一樣。`cortex upgrade` 另外要求持久 overlay 的
+    # digest 不變，見 `test_cortex_upgrade_keeps_requiring_the_bound_overlay_file`。
     config, bundle = _release_effective(tmp_path)
     legacy_ids = {
         "cortex-manager": (1999, 1987),
@@ -703,6 +705,10 @@ def test_transactional_install_runbook_documents_the_id_source_rules() -> None:
         assert token in rules, token
     assert "只在要**指定**號碼時才需要" in rules
     assert "重新產生 plan" in rules
+    # 升級範圍（owner 裁決）：曾綁定 overlay 的主機必須保留同一份持久 overlay。
+    assert "`/var/lib/cortex-installer/host-overlay.yaml`" in rules
+    assert "digest 與上一次 plan 相同" in rules
+    assert "從未用過 overlay 的主機升級時也不需要" in rules
     assert "`account_ids`" in plan_section
 
 
@@ -714,3 +720,292 @@ def test_legacy_adoption_runbook_keeps_overlay_ids_without_remap() -> None:
     assert "**不 remap uid／gid**" in runbook
     assert "#1286" in runbook
     assert "沒有 overlay 檔也得出與 prior receipt 相同的帳號 step" in runbook
+
+
+# ---------------------------------------------------------------------------
+# `cortex upgrade` 的 plan 步驟：經 `upgrade.produce_plan` 跑真正的 plan 指令
+# ---------------------------------------------------------------------------
+
+
+def _v0113_prior(tmp_path: Path, bundle: Path, config: dict, *, overlay=None):
+    """A v0.1.13-shaped applied+qualified prior: ids pinned, no ``account_id_sources``."""
+
+    from paulsha_cortex.trust_root.install import upgrade
+    from paulsha_cortex.trust_root.install.core import InstallReceipt
+    from paulsha_cortex.trust_root.install.release_ingress import parse_version
+
+    plan = install_cli._plan_document(config, bundle, overlay=overlay)
+    plan.pop("account_id_sources")
+    plan["receipt_path"] = str(install_core.canonical_receipt_path(plan))
+    path = tmp_path / "var/lib/cortex-install-receipts" / "prior.json"
+    document = {
+        "receipt_id": "prior-receipt",
+        "plan": plan,
+        "plan_sha256": plan_sha256(plan),
+        "state": "applied",
+        "qualified": True,
+        "credentials": [],
+    }
+    return upgrade.PriorReceipt(
+        path=path,
+        receipt=InstallReceipt(document, path=path),
+        version=parse_version("0.1.11"),
+    )
+
+
+def _upgrade_harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, config: dict):
+    """Seal the bundle's candidate and run the real `plan` command in-process."""
+
+    import contextlib
+    import dataclasses
+    import io
+    import os
+
+    import upgrade_fixtures as fx
+    from paulsha_cortex.trust_root.install import upgrade
+
+    bundle = _write_bundle(tmp_path)
+    manifest = json.loads(bundle.read_text(encoding="utf-8"))
+    config_path = tmp_path / "candidate-install-config.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    sealed = dataclasses.replace(
+        fx.make_sealed(
+            tmp_path,
+            version="0.1.12",
+            commit=manifest["candidate_sha"],
+            wheel_sha256=manifest["wheel"]["sha256"],
+        ),
+        bundle=bundle,
+        install_config=config_path,
+    )
+    monkeypatch.setattr(install_cli, "_TRUST_ROOT_MAINTENANCE_ROOT", tmp_path / "installer")
+    monkeypatch.setattr(upgrade, "_OWNER_UID", os.getuid())
+    monkeypatch.setattr(upgrade, "_chown", lambda *_args: None)
+    monkeypatch.setattr(upgrade, "_lookup_account", lambda name: fx.account(65534, 65534))
+    calls: list[tuple[str, ...]] = []
+
+    def run_plan_in_process(argv, **_kwargs):
+        argv = tuple(str(arg) for arg in argv)
+        calls.append(argv)
+        assert argv[1:4] == ("install", "trust-root", "plan")
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = install_cli.main(list(argv[3:]))
+        assert code == 0
+        return subprocess.CompletedProcess(argv, 0, stdout.getvalue(), "")
+
+    monkeypatch.setattr(upgrade, "_run", run_plan_in_process)
+    return sealed, bundle, calls
+
+
+#: v0.1.13 以 991–995 裝起來的主機：那段號碼屬於 cortex 帳號，不是 Ubuntu 的系統身分。
+MINIMAL = HostAccounts(users=(("root", 0, 0),), groups=(("root", 0),))
+
+
+def _installed_host(
+    ids: dict[str, tuple[int, int]], *, base: HostAccounts = UBUNTU
+) -> HostAccounts:
+    return _with(
+        base,
+        users=tuple((name, uid, gid) for name, (uid, gid) in ids.items()),
+        groups=tuple((name, gid) for name, (_uid, gid) in ids.items()),
+    )
+
+
+def test_cortex_upgrade_on_a_host_that_never_bound_an_overlay_keeps_the_account_steps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from paulsha_cortex.trust_root.install import upgrade
+
+    release_config, _bundle = _release_effective(tmp_path)
+    v0113_config = deepcopy(release_config)
+    for offset, name in enumerate(
+        ("cortex-manager", "cortex-reviewer-planner", "cortex-builder", "cortex-gate")
+    ):
+        v0113_config["accounts"][name].update(uid=991 + offset, gid=991 + offset)
+    v0113_config["service_accounts"]["cortex-egress"].update(uid=995, gid=995)
+    sealed, bundle, calls = _upgrade_harness(tmp_path, monkeypatch, release_config)
+    prior = _v0113_prior(tmp_path, bundle, v0113_config)
+    assert "host_overlay_sha256" not in prior.plan
+    monkeypatch.setattr(
+        install_cli,
+        "_host_account_snapshot",
+        lambda: _installed_host(_ids(prior.plan), base=MINIMAL),
+    )
+
+    # 沒有持久 overlay 檔、prior 也沒綁 overlay：真正的 handoff 檢查在 produce_plan 內通過。
+    bound = upgrade.produce_plan(sealed, prior, options=upgrade.UpgradeOptions(version="0.1.12"))
+
+    assert "--host-overlay" not in calls[0]
+    assert _account_steps(bound.plan) == _account_steps(prior.plan)
+    assert all(
+        row == {"uid": "existing", "gid": "existing"}
+        for row in bound.plan["account_id_sources"].values()
+    )
+    assert bound.durable_path.is_file()
+
+
+def test_cortex_upgrade_keeps_requiring_the_bound_overlay_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 範圍（#1286 owner 裁決）：帳號 step 不需要 overlay，但曾綁定 overlay 的主機必須保留
+    # 同一份持久 `/var/lib/cortex-installer/host-overlay.yaml`，upgrade 比對它的 digest。
+    from paulsha_cortex.trust_root.install import upgrade
+
+    release_config, _bundle = _release_effective(tmp_path)
+    sealed, bundle, _calls = _upgrade_harness(tmp_path, monkeypatch, release_config)
+    adopted_ids = {
+        "cortex-manager": (1999, 1987),
+        "cortex-reviewer-planner": (1997, 1986),
+        "cortex-builder": (1995, 1985),
+        "cortex-gate": (1994, 1984),
+        "cortex-egress": (1993, 1983),
+    }
+    overlay = {
+        "accounts": {
+            name: {"uid": uid, "gid": gid}
+            for name, (uid, gid) in adopted_ids.items()
+            if name != "cortex-egress"
+        },
+        "service_accounts": {"cortex-egress": {"uid": 1993, "gid": 1983}},
+    }
+    monkeypatch.setattr(install_cli, "_host_account_snapshot", lambda: _installed_host(adopted_ids))
+    prior = _v0113_prior(tmp_path, bundle, release_config, overlay=overlay)
+    assert prior.plan["host_overlay_sha256"]
+
+    with pytest.raises(upgrade.UpgradeError, match="host overlay differs"):
+        upgrade.produce_plan(sealed, prior, options=upgrade.UpgradeOptions(version="0.1.12"))
+
+    persisted = tmp_path / "installer" / "host-overlay.yaml"
+    persisted.write_text(json.dumps(overlay), encoding="utf-8")
+    persisted.chmod(0o644)
+    bound = upgrade.produce_plan(sealed, prior, options=upgrade.UpgradeOptions(version="0.1.12"))
+
+    assert _account_steps(bound.plan) == _account_steps(prior.plan)
+    assert bound.overlay_sha256 == prior.plan["host_overlay_sha256"]
+
+
+def test_v0113_prior_receipt_hands_off_account_provenance_to_the_new_plan(
+    tmp_path: Path,
+) -> None:
+    from paulsha_cortex.trust_root.install.core import InstallReceipt
+
+    prior = _plan(tmp_path, _safe_config(tmp_path), None)
+    prior.pop("account_id_sources")
+    prior["receipt_path"] = str(install_core.canonical_receipt_path(prior))
+    document = new_install_receipt(prior).to_dict()
+    document["state"] = "applied"
+    document["qualified"] = True
+    document["journal"] = [
+        {
+            "step_id": step["step_id"],
+            "step": deepcopy(step),
+            "status": "completed",
+            "prior": {"exists": False},
+            "exists": True,
+        }
+        for step in _account_steps(prior).values()
+    ]
+    prior_receipt = InstallReceipt(document)
+    installed = _installed_host(_ids(prior), base=MINIMAL)
+    upgrade_plan = _plan(tmp_path, _without_ids(_safe_config(tmp_path)), installed)
+    upgrade_plan["repo_identity"]["commit"] = "b" * 40
+
+    report = validate_preflight(
+        upgrade_plan,
+        _facts(upgrade_plan, installed),
+        receipt=new_install_receipt(upgrade_plan),
+        prior_receipt=prior_receipt,
+    )
+
+    assert report.ok
+
+
+# ---------------------------------------------------------------------------
+# 主機快照與 NSS 單點查詢
+# ---------------------------------------------------------------------------
+
+
+def test_host_snapshot_reads_every_passwd_and_group_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    users = [
+        SimpleNamespace(pw_name="root", pw_uid=0, pw_gid=0),
+        SimpleNamespace(pw_name="systemd-resolve", pw_uid=991, pw_gid=991),
+    ]
+    groups = [
+        SimpleNamespace(gr_name="root", gr_gid=0),
+        SimpleNamespace(gr_name="render", gr_gid=992),
+    ]
+    monkeypatch.setattr(install_cli.pwd, "getpwall", lambda: list(users))
+    monkeypatch.setattr(install_cli.grp, "getgrall", lambda: list(groups))
+
+    snapshot = install_cli._host_account_snapshot()
+
+    assert snapshot.users == (("root", 0, 0), ("systemd-resolve", 991, 991))
+    assert snapshot.groups == (("root", 0), ("render", 992))
+    assert snapshot.id_in_use is not None
+
+
+def test_host_snapshot_probe_finds_ids_enumeration_misses(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(install_cli.pwd, "getpwall", lambda: [])
+    monkeypatch.setattr(install_cli.grp, "getgrall", lambda: [])
+
+    def getpwuid(uid):
+        if uid == 989:
+            return SimpleNamespace(pw_name="ldap-user")
+        raise KeyError(uid)
+
+    def getgrgid(gid):
+        if gid == 988:
+            return SimpleNamespace(gr_name="ldap-group")
+        raise KeyError(gid)
+
+    monkeypatch.setattr(install_cli.pwd, "getpwuid", getpwuid)
+    monkeypatch.setattr(install_cli.grp, "getgrgid", getgrgid)
+
+    probe = install_cli._host_account_snapshot().id_in_use
+
+    assert probe("uid", 989) and not probe("uid", 988)
+    assert probe("gid", 988) and not probe("gid", 989)
+
+
+def test_allocation_skips_ids_a_point_lookup_reports_in_use(tmp_path: Path) -> None:
+    # sssd／LDAP 關掉 enumerate 時 getpwall／getgrall 看不到目錄服務的帳號，但
+    # useradd／groupadd 的單點查詢看得到：配號時逐號單點查詢，查得到就跳過。
+    def in_directory(kind: str, number: int) -> bool:
+        return (kind, number) in {("uid", 989), ("gid", 988)}
+
+    host = HostAccounts(users=UBUNTU_USERS, groups=UBUNTU_GROUPS[:-2], id_in_use=in_directory)
+    plan = _plan(tmp_path, _without_ids(_safe_config(tmp_path)), host)
+
+    assert _ids(plan)["cortex-builder"] == (987, 987)
+    assert all(uid != 989 and gid != 988 for uid, gid in _ids(plan).values())
+
+
+def test_replaying_an_allocated_plan_with_its_own_receipt_passes_preflight(
+    tmp_path: Path,
+) -> None:
+    # 首次 apply 建好帳號後，同一份 plan＋同一張 receipt 重跑（RC 的 idempotent apply、
+    # rollback 後重裝）：配到的號碼屬於同名帳號，由 receipt journal 證明 provenance。
+    from paulsha_cortex.trust_root.install.core import InstallReceipt
+
+    plan = _plan(tmp_path, _without_ids(_safe_config(tmp_path)), UBUNTU)
+    document = new_install_receipt(plan).to_dict()
+    document["journal"] = [
+        {
+            "step_id": step["step_id"],
+            "step": deepcopy(step),
+            "status": "completed",
+            "prior": {"exists": False},
+            "exists": True,
+        }
+        for step in _account_steps(plan).values()
+    ]
+    created = _installed_host(_ids(plan))
+
+    report = validate_preflight(plan, _facts(plan, created), receipt=InstallReceipt(document))
+
+    assert report.ok

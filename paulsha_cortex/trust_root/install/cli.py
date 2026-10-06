@@ -829,16 +829,32 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _nss_id_in_use(kind: str, number: int) -> bool:
+    """The point lookup ``useradd``/``groupadd`` make before taking an id."""
+
+    try:
+        if kind == "uid":
+            pwd.getpwuid(number)
+        else:
+            grp.getgrgid(number)
+    except KeyError:
+        return False
+    return True
+
+
 def _host_account_snapshot() -> HostAccounts:
     """passwd/group as plan resolves undeclared account ids against (#1286).
 
     Read through NSS like apply's ``preflight_facts``; both databases are
     world-readable, so the unprivileged plan account sees the same rows.
+    Allocation also point-looks-up each candidate id, which catches sources
+    that do not enumerate.
     """
 
     return HostAccounts(
         users=tuple((row.pw_name, row.pw_uid, row.pw_gid) for row in pwd.getpwall()),
         groups=tuple((row.gr_name, row.gr_gid) for row in grp.getgrall()),
+        id_in_use=_nss_id_in_use,
     )
 
 

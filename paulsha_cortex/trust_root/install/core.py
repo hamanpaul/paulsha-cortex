@@ -16,7 +16,7 @@ import stat
 import tempfile
 import uuid
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import (
@@ -632,10 +632,16 @@ class HostAccounts:
     ``(name, gid)``.  Only the set of rows matters: the same snapshot in any
     order resolves to the same ids, so the plan sha stays stable.  Planning
     stays pure -- the CLI reads the host and passes the snapshot in.
+
+    ``id_in_use(kind, number)`` (``kind`` is ``"uid"`` or ``"gid"``) is the
+    point lookup ``useradd``/``groupadd`` themselves make.  An NSS source that
+    does not enumerate (sssd/LDAP with ``enumerate = false``) is missing from
+    ``users``/``groups`` but still answers it, so allocation skips such ids.
     """
 
     users: tuple[tuple[str, int, int], ...] = ()
     groups: tuple[tuple[str, int], ...] = ()
+    id_in_use: "Callable[[str, int], bool] | None" = field(default=None, compare=False)
 
 
 def _snapshot_id(value: object) -> int:
@@ -660,9 +666,9 @@ def _snapshot_rows(
     return sorted(set(users)), sorted(set(groups))
 
 
-def _first_free_id(taken: set[int], *, name: str, field: str) -> int:
+def _first_free_id(free: Callable[[int], bool], *, name: str, field: str) -> int:
     for candidate in _ALLOCATABLE_IDS:
-        if candidate not in taken:
+        if free(candidate):
             return candidate
     raise InstallPlanError(
         f"account {name}: no free system {field} in "
@@ -731,6 +737,13 @@ def _resolve_account_ids(
                 sources[name]["gid"] = "existing"
     taken_uids.update(int(row["uid"]) for row in rows if row.get("uid") is not None)
     taken_gids.update(int(row["gid"]) for row in rows if row.get("gid") is not None)
+    probe = snapshot.id_in_use
+
+    def uid_free(candidate: int) -> bool:
+        return candidate not in taken_uids and not (probe is not None and probe("uid", candidate))
+
+    def gid_free(candidate: int) -> bool:
+        return candidate not in taken_gids and not (probe is not None and probe("gid", candidate))
 
     for row in rows:
         name = str(row["name"])
@@ -741,28 +754,28 @@ def _resolve_account_ids(
                 (
                     candidate
                     for candidate in _ALLOCATABLE_IDS
-                    if candidate not in taken_uids and candidate not in taken_gids
+                    if uid_free(candidate) and gid_free(candidate)
                 ),
                 None,
             )
             if paired is not None:
                 uid = gid = paired
             else:
-                uid = _first_free_id(taken_uids, name=name, field="uid")
-                gid = _first_free_id(taken_gids, name=name, field="gid")
+                uid = _first_free_id(uid_free, name=name, field="uid")
+                gid = _first_free_id(gid_free, name=name, field="gid")
             sources[name].update(uid="allocated", gid="allocated")
         elif uid is None:
             uid = (
                 gid
-                if gid in _ALLOCATABLE_ID_SET and gid not in taken_uids
-                else _first_free_id(taken_uids, name=name, field="uid")
+                if gid in _ALLOCATABLE_ID_SET and uid_free(int(gid))
+                else _first_free_id(uid_free, name=name, field="uid")
             )
             sources[name]["uid"] = "allocated"
         elif gid is None:
             gid = (
                 uid
-                if uid in _ALLOCATABLE_ID_SET and uid not in taken_gids
-                else _first_free_id(taken_gids, name=name, field="gid")
+                if uid in _ALLOCATABLE_ID_SET and gid_free(int(uid))
+                else _first_free_id(gid_free, name=name, field="gid")
             )
             sources[name]["gid"] = "allocated"
         row["uid"] = uid

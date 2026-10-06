@@ -1326,8 +1326,8 @@ def _qualification_payload(*, candidate_sha: str, wheel_sha256: str, status: str
         "bundle": {"sha256": "b" * 64},
         "image": {"digest": "sha256:" + "c" * 64},
         "services": [
-            {"name": "cortex-manager.service", "uid": 986, "gid": 986, "active": True},
-            {"name": "cortex-monitor.service", "uid": 986, "gid": 986, "active": True},
+            {"name": "cortex-manager.service", "uid": 985, "gid": 985, "active": True},
+            {"name": "cortex-monitor.service", "uid": 985, "gid": 985, "active": True},
             {"name": "cortex-egress-proxy.service", "uid": 950, "gid": 950, "active": True},
         ],
         "providers": providers,
@@ -1391,8 +1391,8 @@ def _full_canary_qualification(
         "image": {"digest": "sha256:" + "d" * 64},
         "services": [
             {"name": "cortex-egress-proxy.service", "uid": 950, "gid": 950, "active": True},
-            {"name": "cortex-manager.service", "uid": 986, "gid": 986, "active": True},
-            {"name": "cortex-monitor.service", "uid": 986, "gid": 986, "active": True},
+            {"name": "cortex-manager.service", "uid": 985, "gid": 985, "active": True},
+            {"name": "cortex-monitor.service", "uid": 985, "gid": 985, "active": True},
         ],
         "providers": providers,
         "tests": [
@@ -1423,10 +1423,10 @@ def _full_canary_qualification(
         "account_ids": {
             name: {"uid": number, "gid": number, "uid_source": "existing", "gid_source": "existing"}
             for name, number in (
-                ("cortex-builder", 988),
-                ("cortex-gate", 987),
-                ("cortex-manager", 986),
-                ("cortex-reviewer-planner", 985),
+                ("cortex-builder", 987),
+                ("cortex-gate", 986),
+                ("cortex-manager", 985),
+                ("cortex-reviewer-planner", 984),
                 ("cortex-egress", 950),
             )
         },

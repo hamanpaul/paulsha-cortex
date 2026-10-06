@@ -583,13 +583,16 @@ release 的 install config 不寫死帳號號碼。plan 對五個帳號（`corte
 1. host overlay（`--host-overlay`）宣告的號碼，來源記為 `overlay`；手寫的 install config
    自己宣告的號碼記為 `config`。
 2. 主機已有同名帳號／群組：沿用現有號碼，來源 `existing`。升級與重跑 plan 都走這條，
-   不需要 overlay。
+   帳號 step 不需要 overlay；從未用過 overlay 的主機升級時也不需要（曾用過的見下方）。
 3. 都沒有：自動配號，來源 `allocated`。從 989 往下找第一個 uid 與 gid 都空著的號碼，
    uid＝gid；沒有同號可用時 uid、gid 分開配。範圍限 system 範圍 100–989，避開發行版
    慣用的 990–999（Ubuntu 的 `systemd-resolve` 與 udev 的 `render`／`kvm`／`sgx`／`input`
    等都在這段）。同一份 passwd／group，plan 兩次得到同一組號碼，plan sha 不變。
 
-plan 經 NSS 讀 passwd／group（非 root 也讀得到），與 apply preflight 看到的是同一份。
+plan 經 NSS 讀 passwd／group（非 root 也讀得到），與 apply preflight 看到的是同一份；自動配號
+另對每個候選號碼做 `getpwuid`／`getgrgid` 單點查詢。passwd／group 有 `files`／`systemd` 以外
+來源（sssd、LDAP）的主機，目錄服務的使用者若以某號碼當 primary gid、卻沒有同號的 group，
+這兩種查詢都看不到，這類主機請用 overlay 指定號碼。
 host overlay 只在要**指定**號碼時才需要，例如多台主機要統一號碼：
 
 ```yaml
@@ -600,7 +603,9 @@ accounts:
 要用 overlay 時，先以 `/usr/bin/sudo /usr/bin/install -o root -g root -m 0644` 存成
 `/var/lib/cortex-installer/host-overlay.yaml`，上面的 plan 指令再加
 `--host-overlay /var/lib/cortex-installer/host-overlay.yaml`。之後 `cortex upgrade` 會讀同一份
-檔案，並要求它的 digest 與上一次 plan 相同，所以 overlay 一旦用了就保留原檔。
+檔案，並要求它的 digest 與上一次 plan 相同，所以 overlay 一旦用了就保留原檔。以前從暫存路徑
+或家目錄傳 `--host-overlay` 安裝的主機，`cortex upgrade` 之前要先把**同一份**檔案（內容不變）
+以上述方式放到 `/var/lib/cortex-installer/host-overlay.yaml`，否則升級會以 overlay 不同拒絕。
 
 `account_ids` 以帳號名為 key，列出 `uid`、`gid`、`uid_source`、`gid_source`；審核時用
 `/usr/bin/python3 -I -S -m json.tool "$cortex_plan_result"` 檢視。apply preflight 在任何變更
