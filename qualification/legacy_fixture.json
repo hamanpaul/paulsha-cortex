@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "kind": "paulsha-cortex/legacy-adoption-fixture",
-  "description": "Phase 2b-shaped legacy host laid out inside the disposable qualification container: non-release account ids, a real venv directory, hand-written units with a drop-in the installer never generates, a polkit rule, ACL-bearing state with undeclared top-level items, unmanaged subdirectories and residue, job worktree pools, a non-canonical source checkout with a branch and a worktree, and fake credential files. Every value is synthetic.",
+  "description": "Phase 2b-shaped legacy host laid out inside the disposable qualification container: non-release account ids, a real venv directory, hand-written units with a drop-in the installer never generates, a polkit rule, ACL-bearing state with undeclared top-level items, unmanaged subdirectories and residue, job worktree pools, a non-canonical source checkout with a branch and a worktree, and fake credential files; plus the shapes the first real adoption hit (#1282): stale UNIX sockets (one at the state top, one inside a quarantined directory), a FIFO and a manager retry file at the top of its HOME. Every value is synthetic.",
   "accounts": [
     {"name": "cortex-manager", "uid": 1999, "gid": 1987, "home": "/var/lib/cortex-manager", "shell": "/usr/sbin/nologin"},
     {"name": "cortex-reviewer-planner", "uid": 1997, "gid": 1986, "home": "/var/lib/cortex-reviewer-planner", "shell": "/usr/sbin/nologin"},
@@ -21,9 +21,7 @@
     "quarantine_root": "/var/lib/cortex-installer/legacy-quarantine",
     "inventory_directory": "/var/lib/cortex-installer/legacy",
     "host_overlay_path": "/var/lib/cortex-installer/host-overlay.yaml",
-    "census_exceptions": [
-      {"path": "/var/lib/cortex/coordinator/review-sandboxes", "principal": "cortex-reviewer-planner"}
-    ],
+    "census_exceptions": [],
     "quarantine_paths": [
       "/var/lib/cortex-builder/.bash_history"
     ]
@@ -129,6 +127,8 @@
     {"path": "/var/lib/cortex-manager/.gitconfig", "type": "file", "owner": "root", "group": "root", "mode": "0644",
      "content": "[user]\n\tname = legacy fixture\n"},
     {"path": "/var/lib/cortex-manager/cache", "type": "directory", "owner": "cortex-manager", "group": "cortex-manager", "mode": "0700"},
+    {"path": "/var/lib/cortex-manager/retry-718-legacy.json", "type": "file", "owner": "cortex-manager", "group": "cortex-manager", "mode": "0600",
+     "content": "{\"legacy_fixture\": \"manager retry file at the top of its HOME\"}\n"},
 
     {"path": "/var/lib/cortex-builder", "type": "directory", "owner": "root", "group": "root", "mode": "0755"},
     {"path": "/var/lib/cortex-builder/.bash_history", "type": "file", "owner": "root", "group": "root", "mode": "0600",
@@ -196,6 +196,7 @@
     {"path": "/var/lib/cortex/coordinator/evidence/verification/legacy-verification.json", "type": "file", "owner": "cortex-manager", "group": "cortex-manager", "mode": "0600",
      "content": "{\"legacy_fixture\": \"durable state adopted in place\"}\n"},
     {"path": "/var/lib/cortex/coordinator/handoff", "type": "directory", "owner": "cortex-manager", "group": "cortex-manager", "mode": "0700"},
+    {"path": "/var/lib/cortex/coordinator/handoff/manager.sock", "type": "socket", "owner": "cortex-manager", "group": "cortex-manager", "mode": "0600"},
     {"path": "/var/lib/cortex/coordinator/job-prompts", "type": "directory", "owner": "cortex-manager", "group": "cortex-manager", "mode": "0755",
      "acl": ["u:cortex-builder:--x", "u:cortex-reviewer-planner:--x"]},
     {"path": "/var/lib/cortex/coordinator/jobs.json.rollback.bak", "type": "file", "owner": "cortex-manager", "group": "cortex-manager", "mode": "0600",
@@ -218,6 +219,8 @@
     {"path": "/var/lib/cortex/legacy-imported", "type": "directory", "owner": "root", "group": "root", "mode": "0700"},
     {"path": "/var/lib/cortex/legacy-imported/old.json", "type": "file", "owner": "root", "group": "root", "mode": "0600",
      "content": "{\"legacy_fixture\": \"read-only import from an older layout\"}\n"},
+    {"path": "/var/lib/cortex/legacy-imported/notify.fifo", "type": "fifo", "owner": "root", "group": "root", "mode": "0600"},
+    {"path": "/var/lib/cortex/manager-control.sock", "type": "socket", "owner": "cortex-manager", "group": "cortex-manager", "mode": "0600"},
     {"path": "/var/lib/cortex/monitor", "type": "directory", "owner": "cortex-manager", "group": "cortex-manager", "mode": "0700"},
     {"path": "/var/lib/cortex/repos", "type": "directory", "owner": "cortex-manager", "group": "cortex-manager", "mode": "0750",
      "acl": ["u:cortex-gate:r-x", "u:legacy-operator:--x"], "default_acl": ["u:cortex-gate:r-x"]},
@@ -288,6 +291,7 @@
       "/var/lib/cortex-manager/.config/gh/config.yml",
       "/var/lib/cortex-manager/.config/gh/hosts.yml",
       "/var/lib/cortex-manager/.gitconfig",
+      "/var/lib/cortex-manager/retry-718-legacy.json",
       "/var/lib/cortex-reviewer-planner/.claude",
       "/var/lib/cortex-reviewer-planner/.codex/auth.json",
       "/var/lib/cortex-reviewer-planner/.codex/hooks.json",
@@ -302,6 +306,7 @@
       "/var/lib/cortex/gate-worktree",
       "/var/lib/cortex/integration-notes.txt",
       "/var/lib/cortex/legacy-imported",
+      "/var/lib/cortex/manager-control.sock",
       "/var/lib/cortex/repos/paulsha-cortex",
       "/var/lib/cortex/specs-phase2-a",
       "/var/lib/cortex/worktree"

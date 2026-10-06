@@ -1,0 +1,1 @@
+- 進件：在 `.cortex/work-items.yaml` 登記三個 work item，並附上 accepted todo，交給 cortex 平行派工：`adoption-review-followups`（#1282 審查留下的三項）、`intake-model-flags`（#1296）、`copilot-probe-reap`（#1297）。

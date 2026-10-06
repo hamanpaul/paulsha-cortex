@@ -25,14 +25,16 @@ def main() -> int:
         },
         "operator_account": "root",
         "external_reader_account": "<absent>",
+        # #1286：帳號不寫死 uid／gid。plan 依主機 passwd／group 決定：overlay 指定的照用，
+        # 已有同名帳號就沿用，否則自動配空號（避開發行版慣用的 990–999）。
         "accounts": {
-            "cortex-manager": {"uid": 991, "gid": 991, "home": "/var/lib/cortex-manager", "shell": "/usr/sbin/nologin"},
-            "cortex-reviewer-planner": {"uid": 992, "gid": 992, "home": "/var/lib/cortex-reviewer-planner", "shell": "/usr/sbin/nologin"},
-            "cortex-builder": {"uid": 993, "gid": 993, "home": "/var/lib/cortex-builder", "shell": "/usr/sbin/nologin"},
-            "cortex-gate": {"uid": 994, "gid": 994, "home": "/var/lib/cortex-gate", "shell": "/usr/sbin/nologin"},
+            "cortex-manager": {"home": "/var/lib/cortex-manager", "shell": "/usr/sbin/nologin"},
+            "cortex-reviewer-planner": {"home": "/var/lib/cortex-reviewer-planner", "shell": "/usr/sbin/nologin"},
+            "cortex-builder": {"home": "/var/lib/cortex-builder", "shell": "/usr/sbin/nologin"},
+            "cortex-gate": {"home": "/var/lib/cortex-gate", "shell": "/usr/sbin/nologin"},
         },
         "service_accounts": {
-            "cortex-egress": {"uid": 995, "gid": 995, "home": "/var/lib/cortex-egress", "shell": "/usr/sbin/nologin"},
+            "cortex-egress": {"home": "/var/lib/cortex-egress", "shell": "/usr/sbin/nologin"},
         },
         "roots": {
             "deploy": "/opt/cortex",

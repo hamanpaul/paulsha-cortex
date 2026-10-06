@@ -46,9 +46,17 @@ IMAGE_DIGEST = "sha256:" + "4" * 64
 WHEEL_FILENAME = "paulsha_cortex-0.1.13-py3-none-any.whl"
 TOOLCHAIN_BIN = "/opt/cortex/toolchain/bin/"
 SERVICE_ACCOUNTS = {
-    "cortex-egress-proxy.service": ("cortex-egress", 995),
-    "cortex-manager.service": ("cortex-manager", 991),
-    "cortex-monitor.service": ("cortex-manager", 991),
+    "cortex-egress-proxy.service": ("cortex-egress", 983),
+    "cortex-manager.service": ("cortex-manager", 985),
+    "cortex-monitor.service": ("cortex-manager", 985),
+}
+#: #1286：plan 實際配的號碼（RC 容器已占用 991–995、uid 989、gid 988；升級沿用 existing）。
+PLANNED_ACCOUNT_IDS = {
+    "cortex-builder": 987,
+    "cortex-gate": 986,
+    "cortex-manager": 985,
+    "cortex-reviewer-planner": 984,
+    "cortex-egress": 983,
 }
 
 
@@ -130,6 +138,15 @@ def _install_evidence(path: Path) -> None:
                 },
                 "artifact_hashes": {"units/cortex-manager.service": "1" * 64},
                 "attestation": {"ok": True, "warnings": [], "failures": []},
+                "account_ids": {
+                    name: {
+                        "uid": number,
+                        "gid": number,
+                        "uid_source": "existing",
+                        "gid_source": "existing",
+                    }
+                    for name, number in PLANNED_ACCOUNT_IDS.items()
+                },
             }
         ),
         encoding="utf-8",
