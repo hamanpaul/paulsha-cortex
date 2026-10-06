@@ -716,13 +716,10 @@ def produce_plan(
 
 _CANDIDATE_ENV = {"HOME": "/root", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PYTHONNOUSERSITE": "1"}
 # The system half of the root PATH every root-side candidate-CLI call gets
-# (#1263 RC qualification, run 37336228620): the account step resolves
-# `useradd`/`groupadd` by bare name. On Debian/Ubuntu both live in
-# `/usr/sbin`, not on a venv-only PATH -- a manual `install trust-root apply`
-# under a normal root PATH never hit this because it had `/usr/sbin` already.
-# (Apply's `preflight_facts()` used to resolve `visudo`/`cvtsudoers` the same
-# way and fail closed to "universal NOPASSWD is forbidden"; it now resolves
-# them from a fixed system directory list and ignores PATH, #1122.)
+# (#1263 RC qualification, run 37336228620). Account creation and sudoers
+# inspection resolve their tools from fixed system directories in the backend,
+# not by PATH; this explicit PATH keeps the root-side CLI environment aligned
+# with the runbook and available to any installer subprocess that uses it.
 # `/usr/local/{s,}bin` is deliberately left out: the sealed candidate must
 # never pick up a host-local override.
 _CANDIDATE_SYSTEM_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
