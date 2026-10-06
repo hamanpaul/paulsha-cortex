@@ -742,6 +742,9 @@ def test_agy_launcher_emits_single_resolved_print_timeout_in_wrapper_script(
 
     monkeypatch.setattr(launcher_module.subprocess, "Popen", fake_popen)
     monkeypatch.setenv("PSC_JOB_RUNNER", "direct")
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
     prompt = 'implement; keep "quoted"'
     if override is None:
         monkeypatch.delenv(launcher_module.AGY_PRINT_TIMEOUT_ENV, raising=False)

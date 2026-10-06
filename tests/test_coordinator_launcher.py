@@ -166,9 +166,20 @@ class ArgvTests(unittest.TestCase):
             prompt="P", slice_id="s", log_dir="/lg", effective_tools=("edit",),
         )
         settings = json.loads(argv[argv.index("--settings") + 1])
-        edit_hook = settings["hooks"]["PreToolUse"][0]
+        edit_hook = next(
+            hook for hook in settings["hooks"]["PreToolUse"]
+            if hook["matcher"] == "Edit|Write|MultiEdit"
+        )
         self.assertEqual(edit_hook["matcher"], "Edit|Write|MultiEdit")
         self.assertIn("headless-hook pre-tool-use", edit_hook["hooks"][0]["command"])
+        command_hook = next(
+            hook for hook in settings["hooks"]["PreToolUse"]
+            if hook["matcher"] == "Bash"
+        )
+        self.assertIn(
+            "command-policy-hook --executor claude",
+            command_hook["hooks"][0]["command"],
+        )
 
     def test_write_forbidden_claude_does_not_project_builder_tools(self) -> None:
         launcher = SubprocessLauncher("claude").as_write_forbidden()
@@ -1338,6 +1349,7 @@ class ArgvTests(unittest.TestCase):
                 "LC_IDENTIFICATION", "LC_MEASUREMENT", "LC_MESSAGES", "LC_MONETARY",
                 "LC_NAME", "LC_NUMERIC", "LC_PAPER", "LC_TELEPHONE", "LC_TIME",
                 "LOGNAME", "PATH", "SHELL", "TMPDIR", "USER", "VIRTUAL_ENV",
+                "PSC_JOB_ID", "PSC_COMMAND_POLICY_BASELINE", "PSC_COMMAND_POLICY_EVENTS",
             },
         )
 

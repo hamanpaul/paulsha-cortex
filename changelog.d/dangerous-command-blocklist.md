@@ -1,1 +1,1 @@
-- #1283：新增 `paulsha_cortex.command_policy` 純函式核心、版本化基準政策 `coordinator/data/command-policy.yaml`，以及涵蓋高危指令阻擋／放行樣式的 corpus fixture，為後續 executor 阻擋接線提供可重用的政策資產。
+- #1283：新增 argv 政策引擎、只能加嚴且 fail-closed 的 operator overlay、版本化基準與雙向 corpus；Codex、Copilot、Antigravity builders 及 Claude reviewer 注入 PreToolUse 阻擋並留下遮蔽後稽核事件。`policy_violation` 不觸發 provider backoff；同一 run 首次自動換 identity 重派，第二次自動結束並回報 issue，status／work show 顯示違規摘要。附 executor 本機量測紀錄、套件政策資產與操作文件。

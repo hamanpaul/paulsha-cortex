@@ -9,6 +9,7 @@ from paulsha_cortex import command_policy
 
 
 BASELINE_POLICY_PATH = Path("coordinator/data/command-policy.yaml")
+PACKAGED_BASELINE_POLICY_PATH = Path("paulsha_cortex/coordinator/data/command-policy.yaml")
 CORPUS_PATH = Path("tests/fixtures/command-policy/corpus.yaml")
 
 
@@ -35,6 +36,10 @@ def test_command_policy_module_stays_yaml_free() -> None:
     source = Path(command_policy.__file__).read_text(encoding="utf-8")
     assert "import yaml" not in source
     assert "from yaml import" not in source
+
+
+def test_packaged_command_policy_asset_matches_versioned_source() -> None:
+    assert PACKAGED_BASELINE_POLICY_PATH.read_bytes() == BASELINE_POLICY_PATH.read_bytes()
 
 
 def test_command_policy_corpus_covers_every_rule_bidirectionally() -> None:
@@ -176,3 +181,38 @@ def test_command_policy_rejects_unknown_wrappers() -> None:
             bad_payload,
             source="<bad-wrapper-policy>",
         )
+
+
+def test_operator_overlay_adds_protections_and_revalidates_policy() -> None:
+    baseline = _load_policy()
+    effective = command_policy.apply_operator_overlay(
+        baseline,
+        {"add_protected_paths": ["/mnt/operator-protected"]},
+    )
+
+    assert "/mnt/operator-protected" in effective.protected_paths
+    blocked = command_policy.evaluate_command(
+        "rm -rf /mnt/operator-protected",
+        policy=effective,
+    )
+    assert not blocked.allowed
+    assert blocked.match is not None
+    assert blocked.match.rule_id == "protected-root-destruction"
+    assert command_policy.evaluate_command(
+        "rm -rf /mnt/operator-protected",
+        policy=baseline,
+    ).allowed
+
+
+@pytest.mark.parametrize(
+    "overlay",
+    [
+        {"protected_paths": ["/"]},
+        {"add_protected_paths": ["/", 1]},
+        {"rules": []},
+        {"unknown": ["/tmp"]},
+    ],
+)
+def test_operator_overlay_rejects_unknown_or_non_additive_shape(overlay) -> None:
+    with pytest.raises(command_policy.CommandPolicyError):
+        command_policy.apply_operator_overlay(_load_policy(), overlay)

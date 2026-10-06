@@ -1107,7 +1107,7 @@ class WorkflowRun:
             raise ValueError("workflow run facets 格式錯誤")
         if self.gate_status not in WORKFLOW_GATE_STATUSES:
             raise ValueError(f"workflow run gate_status 非法: {self.gate_status!r}")
-        if self.status not in {"ongoing", "done", "superseded"}:
+        if self.status not in {"ongoing", "done", "failed", "superseded"}:
             raise ValueError(f"workflow run status 非法: {self.status!r}")
         completion_values = (
             self.completion_record_path,

@@ -3138,6 +3138,19 @@ def _codex_canary_builder_sandbox_argv() -> tuple[str, ...]:
     )
 
 
+def _codex_canary_builder_command_policy_hook_argv() -> tuple[str, ...]:
+    """Mirror the Manager's mandatory command-policy hook in the bound launch contract."""
+
+    return (
+        "--enable",
+        "hooks",
+        "-c",
+        'hooks.PreToolUse = [{ matcher = "Bash|exec_command", '
+        'hooks = [{ type = "command", '
+        'command = "cortex command-policy-hook --executor codex", timeout = 30 }] }]'
+    )
+
+
 AGY_CONVERSATION_ID_RE = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 )
@@ -5297,6 +5310,7 @@ def _bound_codex_builder_spec(
         prompt,
         "--json",
         *_codex_canary_builder_sandbox_argv(),
+        *_codex_canary_builder_command_policy_hook_argv(),
         "--model",
         DEPLOYMENT_CANARY_BUILDER_MODEL,
         "-c",

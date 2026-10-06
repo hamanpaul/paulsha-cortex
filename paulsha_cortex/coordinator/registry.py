@@ -45,6 +45,45 @@ VALID_JOB_STATUSES = frozenset({"dispatched", "running", "exited", "failed"})
 ACTIVE_JOB_STATUSES = frozenset({"dispatched", "running"})
 TERMINAL_JOB_STATUSES = frozenset({"exited", "failed"})
 
+
+def _valid_command_policy_summary(value: object, *, job_id: object = None) -> bool:
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != {"count", "latest"}
+        or not isinstance(value.get("count"), int)
+        or isinstance(value.get("count"), bool)
+        or value["count"] < 1
+        or not isinstance(value.get("latest"), Mapping)
+    ):
+        return False
+    event = value["latest"]
+    expected_fields = {
+        "schema", "timestamp", "job_id", "executor", "rule_id",
+        "category", "severity", "argv", "policy_sha256",
+    }
+    if set(event) != expected_fields:
+        return False
+    if (
+        event.get("schema") != "cortex/command-policy-event/v1"
+        or (job_id is not None and event.get("job_id") != job_id)
+        or not isinstance(event.get("timestamp"), str)
+        or not event["timestamp"]
+        or event.get("executor") not in {"codex", "copilot", "agy", "claude", "unknown"}
+        or not isinstance(event.get("rule_id"), str)
+        or not event["rule_id"]
+        or event.get("category") not in {"filesystem", "identity", "device", "repository", "integrity"}
+        or event.get("severity") not in {"high", "critical"}
+        or not isinstance(event.get("argv"), list)
+        or len(event["argv"]) > 65
+        or any(not isinstance(token, str) or len(token) > 512 for token in event["argv"])
+        or not isinstance(event.get("policy_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", event["policy_sha256"]) is None
+    ):
+        return False
+    if event.get("executor") == "unknown" and event.get("category") != "integrity":
+        return False
+    return True
+
 # #545／#569：`retry-card` 受理的 phase 與該 phase 唯一合法的重派 persona。
 # build → builder（#545 的中段 builder 卡），verify／review → reviewer（#569 的
 # verification／code-review／adversarial-review 卡）。以 mapping 而非兩份散落的
@@ -2911,6 +2950,7 @@ class JobRegistry:
             "runtime_principal", "runtime_mode", "runtime_surface",
             "prompt_path",
             "template_instance",
+            "command_policy_runtime_path",
             "quota_decision_id",
         ):
             value = job.get(field)
@@ -2936,6 +2976,13 @@ class JobRegistry:
         }:
             raise ValueError(
                 f"coordinator 狀態檔 runtime_surface 非法（fail-closed）: {self._state_path}"
+            )
+        command_policy = job.get("command_policy")
+        if command_policy is not None and not _valid_command_policy_summary(
+            command_policy, job_id=job.get("job_id")
+        ):
+            raise ValueError(
+                f"coordinator 狀態檔 command_policy 格式錯誤（fail-closed）: {self._state_path}"
             )
         credential_publish = job.get("credential_publish", False)
         if not isinstance(credential_publish, bool):
@@ -4064,6 +4111,8 @@ class JobRegistry:
             # anchor because their canonical JSONL log lives in a job-writable
             # spool.  Legacy/direct rows leave this unset and use log_path.
             "control_log_path": None,
+            "command_policy_runtime_path": None,
+            "command_policy": None,
             "exit_code": exit_code,
             "subject_head": subject_head,
             "spec_hash": spec_hash,
@@ -4275,6 +4324,7 @@ class JobRegistry:
         credential_publish: bool = False,
         prompt_path: str | None = None,
         control_log_path: str | None = None,
+        command_policy_runtime_path: str | None = None,
     ) -> dict[str, Any]:
         job = self._find_job(job_id)
         if job["status"] not in ACTIVE_JOB_STATUSES:
@@ -4294,6 +4344,7 @@ class JobRegistry:
         job["credential_publish"] = credential_publish
         job["prompt_path"] = prompt_path
         job["control_log_path"] = control_log_path
+        job["command_policy_runtime_path"] = command_policy_runtime_path
         job["started_at"] = _now_iso()
         self._persist()
         return _deepcopy_json(job)
@@ -4309,6 +4360,7 @@ class JobRegistry:
         provider_outcome: Mapping[str, Any] | None = None,
         provider_outcome_reset_parser: Mapping[str, Any] | None = None,
         runtime_diagnostic: Mapping[str, Any] | None = None,
+        command_policy: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         if status not in TERMINAL_JOB_STATUSES:
             raise ValueError(
@@ -4349,6 +4401,10 @@ class JobRegistry:
             )
         ):
             raise ValueError("runtime_diagnostic 格式錯誤（fail-closed）")
+        if command_policy is not None and not _valid_command_policy_summary(
+            command_policy, job_id=job_id
+        ):
+            raise ValueError("command_policy 格式錯誤（fail-closed）")
         job = self._find_job(job_id)
         _validate_transition(
             field="job status",
@@ -4374,6 +4430,9 @@ class JobRegistry:
         )
         job["runtime_diagnostic"] = (
             dict(runtime_diagnostic) if runtime_diagnostic is not None else None
+        )
+        job["command_policy"] = (
+            _deepcopy_json(dict(command_policy)) if command_policy is not None else None
         )
         # #325：usage 抽取是盡力而為的附加資訊，任何失敗都不得影響上面已判定
         # 好的 status/exit_code/exited_at——extract_usage 本身已 fail-soft，

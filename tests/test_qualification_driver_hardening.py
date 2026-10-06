@@ -1202,6 +1202,7 @@ def test_canary_builder_argv_matches_the_production_template_launcher(
         "PROMPT",
         "--json",
         *driver._codex_canary_builder_sandbox_argv(),
+        *driver._codex_canary_builder_command_policy_hook_argv(),
         "--model",
         driver.DEPLOYMENT_CANARY_BUILDER_MODEL,
         "-c",
@@ -1212,7 +1213,7 @@ def test_canary_builder_argv_matches_the_production_template_launcher(
         str(worktree.resolve()),
     ]
     assert production == expected
-    assert "--enable" not in production
+    assert "--enable" in production
 
 
 @pytest.mark.parametrize(

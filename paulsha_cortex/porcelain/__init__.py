@@ -26,6 +26,7 @@ _FAMILY_MODULES: tuple[str, ...] = (
     "paulsha_cortex.porcelain.mechanical_acceptance",
     "paulsha_cortex.porcelain.capacity_gate",
     "paulsha_cortex.porcelain.headless_hook",
+    "paulsha_cortex.porcelain.command_policy_hook",
     "paulsha_cortex.porcelain.model_profile",
     "paulsha_cortex.porcelain.task_memory_canary",
     "paulsha_cortex.porcelain.delivery",

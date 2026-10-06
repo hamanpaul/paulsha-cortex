@@ -482,10 +482,14 @@ def test_a_headless_claude_builder_carries_the_hook_on_argv() -> None:
     assert settings is not None
     assert list(settings) == ["hooks"]  # 只加 hook，不動 permissions／sandbox
     assert [group["matcher"] for group in settings["hooks"]["PostToolUse"]] == ["Bash"]
-    assert [group["matcher"] for group in settings["hooks"]["PreToolUse"]] == ["Edit|Write|MultiEdit"]
+    assert [group["matcher"] for group in settings["hooks"]["PreToolUse"]] == [
+        "Edit|Write|MultiEdit",
+        "Bash",
+    ]
     assert _hook_commands(settings) == [
         "cortex headless-hook post-tool-use || true",
         "cortex headless-hook pre-tool-use || exit 2",
+        "cortex command-policy-hook --executor claude",
     ]
     assert settings["hooks"]["PostToolUse"][0]["hooks"][0]["timeout"] > 0
 
@@ -502,22 +506,29 @@ def test_the_hook_command_is_a_registered_porcelain_command() -> None:
     assert argv[2] == "post-tool-use"
 
 
-@pytest.mark.parametrize("mode", ["read_only", "review_only"])
-def test_read_only_personas_get_no_hook(mode: str) -> None:
-    """planner 沒有 Bash、reviewer 是 read-only 契約——兩者都不該掛 hook。"""
+def test_read_only_planner_gets_no_hook() -> None:
+    """Planner has no Bash tool, so a PreToolUse command-policy hook cannot run."""
 
-    if mode == "read_only":
-        argv = _builder_argv(read_only=True)
-    else:
-        with tempfile.TemporaryDirectory() as worktree:
-            argv = _builder_argv(
-                review_only=True,
-                worktree=worktree,
-                review_terminal_kind="workflow-review-result",
-            )
-    settings = _settings_from(argv)
+    settings = _settings_from(_builder_argv(read_only=True))
 
     assert settings is None or "hooks" not in settings
+
+
+def test_read_only_reviewer_gets_the_command_policy_hook() -> None:
+    """The reviewer keeps its read-only sandbox and receives the required Bash guard."""
+
+    with tempfile.TemporaryDirectory() as worktree:
+        argv = _builder_argv(
+            review_only=True,
+            worktree=worktree,
+            review_terminal_kind="workflow-review-result",
+        )
+    settings = _settings_from(argv)
+
+    assert settings is not None
+    pre_tool_hooks = settings["hooks"]["PreToolUse"]
+    assert [group["matcher"] for group in pre_tool_hooks] == ["Bash"]
+    assert "command-policy-hook --executor claude" in pre_tool_hooks[0]["hooks"][0]["command"]
 
 
 def test_other_executors_are_untouched() -> None:

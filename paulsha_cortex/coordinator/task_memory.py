@@ -1700,6 +1700,16 @@ def project_task_memory_read_model(
                             if isinstance(job.get("job_id"), str)
                             else None
                         ),
+                        **(
+                            {
+                                "command_policy_violation_count": job["command_policy"]["count"],
+                                "command_policy_violation_latest": dict(job["command_policy"]["latest"]),
+                            }
+                            if isinstance(job.get("command_policy"), Mapping)
+                            and isinstance(job["command_policy"].get("count"), int)
+                            and isinstance(job["command_policy"].get("latest"), Mapping)
+                            else {}
+                        ),
                     }
                     for job in run_jobs
                 ],

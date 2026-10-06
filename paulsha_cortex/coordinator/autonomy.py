@@ -1807,6 +1807,7 @@ def _attach_launch_handle(*, dispatcher, job: dict, handle: LaunchHandle) -> dic
             "credential_publish": handle.credential_publish,
             "prompt_path": handle.prompt_path,
             "control_log_path": handle.control_log_path,
+            "command_policy_runtime_path": handle.command_policy_runtime_path,
         }
         if handle.executable is not None:
             attached["executable"] = handle.executable
@@ -1825,6 +1826,7 @@ def _attach_launch_handle(*, dispatcher, job: dict, handle: LaunchHandle) -> dic
         "credential_publish": handle.credential_publish,
         "prompt_path": handle.prompt_path,
         "control_log_path": handle.control_log_path,
+        "command_policy_runtime_path": handle.command_policy_runtime_path,
     }
     # External callers and older test registries may still expose the pre-
     # runtime metadata signature.  Filter only at this duck-typed seam; the

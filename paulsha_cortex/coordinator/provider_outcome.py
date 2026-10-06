@@ -76,6 +76,7 @@ class ProviderOutcome(str, Enum):
     EXECUTABLE_NOT_FOUND = "executable_not_found"
     LAUNCH_FAILED = "launch_failed"
     TOOL_ABORTED = "tool_aborted"
+    POLICY_VIOLATION = "policy_violation"
     TRANSIENT = "transient"
     CONTENT = "content"
     UNKNOWN = "unknown"

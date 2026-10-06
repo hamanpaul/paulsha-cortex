@@ -563,6 +563,122 @@ def test_resume_workflow_run_records_backoff_before_reroute_dispatch(
     assert recorded.backoff.last_terminal_key == failed_job["job_id"]
 
 
+def test_policy_violation_switches_identity_once_then_closes_without_needs_human(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from paulsha_cortex.coordinator import executor_backoff
+
+    worktree = tmp_path / "wt"
+    _init_worktree(worktree)
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    run = _make_run(registry, workspace_root=tmp_path, steps=_build_only_steps())
+    identities = _two_builder_identities()
+    dispatcher = _ResumeDispatcher(registry, worktree)
+    coordinator_root = tmp_path / "coordinator"
+    current = time.time()
+    monkeypatch.setattr(manager, "_EXECUTOR_AUTH_CACHE", {})
+    for provider_id in ("claude", "codex"):
+        manager._EXECUTOR_AUTH_CACHE[provider_id] = runtime_preflight.ProviderFreshness(
+            provider_id=provider_id,
+            status="ok",
+            observed_at=current,
+            ttl_seconds=900.0,
+            source="snapshot",
+        )
+
+    def policy_event(job_id: str, executor: str) -> dict[str, object]:
+        return {
+            "schema": "cortex/command-policy-event/v1",
+            "timestamp": "2026-10-06T00:00:00+00:00",
+            "job_id": job_id,
+            "executor": executor,
+            "rule_id": "protected-root-destruction",
+            "category": "filesystem",
+            "severity": "critical",
+            "argv": ["rm", "-rf", "/"],
+            "policy_sha256": "a" * 64,
+        }
+
+    first = _seed_failed_job(
+        registry,
+        run=run,
+        worktree=worktree,
+        executor="codex",
+        model_id="gpt-primary",
+        domain="openai",
+    )
+    registry.update_headless_result(
+        first["job_id"],
+        status="failed",
+        exit_code=1,
+        provider_outcome={
+            "outcome": "policy_violation",
+            "authority": "structured",
+            "reason": "command policy blocked",
+            "retryable": False,
+        },
+        command_policy={"count": 1, "latest": policy_event(first["job_id"], "codex")},
+    )
+
+    switched = manager.resume_workflow_run(
+        dispatcher,
+        run_id=run.run_id,
+        identities=identities,
+        launcher_factory=_launcher_factory,
+        coordinator_root=coordinator_root,
+    )
+
+    assert switched["reason"] == "policy-violation-identity-switch"
+    replacement = registry.get_job(switched["job_id"])
+    assert (replacement["executor"], replacement["model_id"]) == (
+        "claude", "claude-primary"
+    )
+    assert registry.get_workflow_run(run.run_id).attempts["policy-violation:subagent-build"] == 1
+
+    registry.update_headless_result(
+        replacement["job_id"],
+        status="failed",
+        exit_code=1,
+        provider_outcome={
+            "outcome": "policy_violation",
+            "authority": "structured",
+            "reason": "command policy blocked",
+            "retryable": False,
+        },
+        command_policy={
+            "count": 1,
+            "latest": policy_event(replacement["job_id"], "claude"),
+        },
+    )
+    observed_comments: list[list[str]] = []
+    original_run = manager.subprocess.run
+
+    def capture_issue_comment(argv, *args, **kwargs):
+        if argv[:3] == ["gh", "api", "--method"]:
+            observed_comments.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return original_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(manager.subprocess, "run", capture_issue_comment)
+    closed = manager.resume_workflow_run(
+        dispatcher,
+        run_id=run.run_id,
+        identities=identities,
+        launcher_factory=_launcher_factory,
+        coordinator_root=coordinator_root,
+    )
+
+    final_run = registry.get_workflow_run(run.run_id)
+    assert closed["reason"] == "policy-violation-exhausted"
+    assert final_run.status == "failed"
+    assert final_run.gate_status == "failed"
+    assert "needs_human" not in final_run.facets
+    assert len(observed_comments) == 1
+    assert observed_comments[0][4] == "repos/hamanpaul/paulsha-cortex/issues/928/comments"
+    assert not (coordinator_root / executor_backoff.STATE_FILENAME).exists()
+
+
 def test_active_executor_backoff_skips_the_cooled_down_first_candidate_on_resume(
     tmp_path: Path,
 ) -> None:

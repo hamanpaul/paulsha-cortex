@@ -315,7 +315,10 @@ def _safe_tick_error_summary(exc: Exception) -> dict[str, str]:
 
 
 def _in_flight_status(
-    registry, *, candidate_base_probe: candidate_base.MirrorDistanceProbe | None = None
+    registry,
+    *,
+    candidate_base_probe: candidate_base.MirrorDistanceProbe | None = None,
+    job_rows: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """在跑的卡。
 
@@ -339,7 +342,13 @@ def _in_flight_status(
     )
     in_flight = []
     accepted_results_by_run: dict[str, list[dict[str, Any]]] = {}
-    for job in registry.list_jobs():
+    jobs = registry.list_jobs() if job_rows is None else job_rows
+    policy_by_run: dict[str, list[dict[str, Any]]] = {}
+    for row in jobs:
+        run_id = row.get("workflow_run_id")
+        if isinstance(run_id, str) and isinstance(row.get("command_policy"), dict):
+            policy_by_run.setdefault(run_id, []).append(row)
+    for job in jobs:
         status = job.get("status")
         if status not in manager.IN_FLIGHT_STATUSES:
             continue
@@ -374,6 +383,9 @@ def _in_flight_status(
             "candidate_git_base": git_base,
             **execution_identity,
         }
+        policy_summary = _command_policy_summary(policy_by_run.get(workflow_run_id, ()))
+        if policy_summary is not None:
+            row.update(policy_summary)
         log_path = job.get("log_path")
         if isinstance(log_path, str) and log_path:
             try:
@@ -389,6 +401,33 @@ def _in_flight_status(
             row["accepted_workflow_results"] = accepted_results
         in_flight.append(row)
     return in_flight
+
+
+def _command_policy_summary(jobs) -> dict[str, Any] | None:
+    total = 0
+    latest: dict[str, Any] | None = None
+    latest_timestamp = ""
+    for job in jobs:
+        summary = job.get("command_policy")
+        if not isinstance(summary, dict):
+            continue
+        count = summary.get("count")
+        event = summary.get("latest")
+        if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+            continue
+        if not isinstance(event, dict):
+            continue
+        total += count
+        timestamp = event.get("timestamp")
+        if isinstance(timestamp, str) and timestamp >= latest_timestamp:
+            latest_timestamp = timestamp
+            latest = event
+    if total == 0 or latest is None:
+        return None
+    return {
+        "command_policy_violation_count": total,
+        "command_policy_violation_latest": dict(latest),
+    }
 
 
 def _stale_job_attention(in_flight: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -773,12 +812,45 @@ def build_runtime_status_provider(
         # 還是已經壞掉。這裡把 ongoing 且 needs_human 的 run 投影進同一份
         # attention 清單（連同結構化理由）。
         list_workflow_runs = getattr(registry, "list_workflow_runs", None)
+        job_lister = getattr(registry, "list_jobs", None)
+        try:
+            status_job_rows = (
+                [row for row in job_lister() if isinstance(row, dict)]
+                if callable(job_lister)
+                else []
+            )
+        except Exception:  # noqa: BLE001 - status enrichment remains fail-soft
+            status_job_rows = []
         if callable(list_workflow_runs):
             try:
                 runs = list(list_workflow_runs())
             except Exception:  # noqa: BLE001 - 呈現面失效不得癱瘓整份 status
                 runs = []
             for run in runs:
+                if (
+                    getattr(run, "status", None) == "failed"
+                    and getattr(run, "retry_classification", None)
+                    == "policy-violation-exhausted"
+                ):
+                    summary = _command_policy_summary(
+                        row
+                        for row in status_job_rows
+                        if row.get("workflow_run_id") == run.run_id
+                    )
+                    attention.append(
+                        {
+                            "kind": "workflow_run",
+                            "run_id": run.run_id,
+                            "work_id": run.work_id,
+                            "repo": run.repo,
+                            "current_phase": run.current_phase,
+                            "slice_state": "failed",
+                            "gate_state": run.gate_status,
+                            "reason": "policy-violation-exhausted",
+                            **(summary or {}),
+                        }
+                    )
+                    continue
                 if (
                     getattr(run, "status", None) != "ongoing"
                     or "needs_human" not in getattr(run, "facets", ())
@@ -798,7 +870,9 @@ def build_runtime_status_provider(
                     )
                 )
         in_flight = _in_flight_status(
-            registry, candidate_base_probe=candidate_base_probe
+            registry,
+            candidate_base_probe=candidate_base_probe,
+            job_rows=status_job_rows,
         )
         attention.extend(_stale_job_attention(in_flight))
         return {

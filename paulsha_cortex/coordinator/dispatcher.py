@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import json
+import re
 import stat
 import subprocess
 import time
@@ -130,6 +133,115 @@ def _last_nonempty_line(path: str | None) -> str | None:
         if line.strip():
             last_line = line
     return last_line
+
+
+def _command_policy_event_summary(
+    log_path: str | None, *, job_id: str, executor: object
+) -> dict[str, object] | None:
+    if not log_path:
+        return None
+    path = Path(log_path).with_suffix(".command-policy.jsonl")
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return _audit_integrity_event(job_id=job_id, executor=executor)
+    events: list[dict[str, object]] = []
+    try:
+        with os.fdopen(descriptor, "rb") as handle:
+            info = os.fstat(handle.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 1024 * 1024:
+                return _audit_integrity_event(job_id=job_id, executor=executor)
+            raw = handle.read(1024 * 1024 + 1)
+        if len(raw) > 1024 * 1024:
+            return _audit_integrity_event(job_id=job_id, executor=executor)
+        for line in raw.splitlines():
+            if len(line) > 16384:
+                return _audit_integrity_event(job_id=job_id, executor=executor)
+            if not line.strip():
+                continue
+            row = json.loads(line.decode("utf-8"))
+            if not isinstance(row, dict) or set(row) != {
+                "schema", "timestamp", "job_id", "executor", "rule_id",
+                "category", "severity", "argv", "policy_sha256",
+            }:
+                return _audit_integrity_event(job_id=job_id, executor=executor)
+            if (
+                row.get("schema") != "cortex/command-policy-event/v1"
+                or row.get("job_id") != job_id
+                or (isinstance(executor, str) and row.get("executor") != executor)
+                or any(
+                    not isinstance(row.get(field), str) or not row[field]
+                    for field in (
+                        "timestamp", "executor", "rule_id", "category", "severity",
+                        "policy_sha256",
+                    )
+                )
+                or re.fullmatch(r"[0-9a-f]{64}", str(row.get("policy_sha256"))) is None
+                or not isinstance(row.get("argv"), list)
+                or len(row["argv"]) > 65
+                or any(
+                    not isinstance(token, str) or len(token) > 512
+                    for token in row["argv"]
+                )
+            ):
+                return _audit_integrity_event(job_id=job_id, executor=executor)
+            events.append(row)
+            if len(events) > 256:
+                return _audit_integrity_event(job_id=job_id, executor=executor)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return _audit_integrity_event(job_id=job_id, executor=executor)
+    if not events:
+        return None
+    return {"count": len(events), "latest": events[-1]}
+
+
+def _audit_integrity_event(*, job_id: str, executor: object) -> dict[str, object]:
+    event = {
+        "schema": "cortex/command-policy-event/v1",
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "job_id": job_id,
+        "executor": executor if isinstance(executor, str) and executor else "unknown",
+        "rule_id": "command-policy-audit-integrity",
+        "category": "integrity",
+        "severity": "critical",
+        "argv": [],
+        "policy_sha256": hashlib.sha256(b"command-policy-audit-integrity").hexdigest(),
+    }
+    return {"count": 1, "latest": event}
+
+
+def _cleanup_command_policy_runtime(path_text: str) -> None:
+    path = Path(path_text)
+    if (
+        not path.is_absolute()
+        or path.parent.is_symlink()
+        or path.parent.parent.is_symlink()
+    ):
+        return
+    if (
+        path.parent.name == "hooks"
+        and re.fullmatch(r"cortex-command-policy-[0-9a-f]{16}\.json", path.name)
+    ):
+        if path.is_symlink() or path.is_file():
+            path.unlink(missing_ok=True)
+        return
+    if (
+        path.parent.name == "plugins"
+        and path.parent.parent.name == "antigravity-cli"
+        and re.fullmatch(r"cortex-command-policy-[0-9a-f]{16}", path.name)
+        and path.is_dir()
+        and not path.is_symlink()
+    ):
+        for name in ("plugin.json", "hooks.json"):
+            member = path / name
+            if member.is_file() and not member.is_symlink():
+                member.unlink()
+        try:
+            path.rmdir()
+        except OSError:
+            pass
 
 
 class Dispatcher:
@@ -288,6 +400,9 @@ class Dispatcher:
         self, job_id: str, exit_code: int, log_path: str | None
     ) -> dict[str, object]:
         job = self._registry.get_job(job_id)
+        runtime_hook_path = job.get("command_policy_runtime_path")
+        if isinstance(runtime_hook_path, str):
+            _cleanup_command_policy_runtime(runtime_hook_path)
         # A downgraded Codex job publishes auth.json with a readable ACL/mode
         # before its Manager-authored exit sentinel.  The launcher records a
         # typed runtime surface; never infer a principal from workflow kind.
@@ -472,13 +587,27 @@ class Dispatcher:
             exit_code = 1
         last_jsonl_line = _last_nonempty_line(log_path)
         status = classify_completion(exit_code=exit_code, last_jsonl_line=last_jsonl_line)
+        command_policy = _command_policy_event_summary(
+            log_path,
+            job_id=str(job_id),
+            executor=job.get("executor"),
+        )
         # #384：只在真的失敗時才分類——分類器本身也會拒絕 exit_code == 0
         # （防禦性），這裡額外用 status 把「exited 但非零 exit code 目前尚未走
         # classify_completion 的 failed 分支」這種邊界情況也排除掉，避免對
         # 明明成功的 job 做無意義的 log 讀取與分類。
         provider_outcome = None
         provider_outcome_reset_parser = None
-        if status == "failed" and runtime_diagnostic is None:
+        if command_policy is not None:
+            status = "failed"
+            exit_code = 1
+            provider_outcome = {
+                "outcome": "policy_violation",
+                "authority": "structured",
+                "reason": f"command policy blocked rule {command_policy['latest']['rule_id']}",
+                "retryable": False,
+            }
+        elif status == "failed" and runtime_diagnostic is None:
             output = read_log_tail(log_path)
             classification = classify_provider_failure(
                 exit_code=exit_code,
@@ -493,6 +622,8 @@ class Dispatcher:
             "exit_code": exit_code,
             "provider_outcome": provider_outcome,
         }
+        if command_policy is not None:
+            result_kwargs["command_policy"] = command_policy
         if provider_outcome_reset_parser is not None:
             result_kwargs["provider_outcome_reset_parser"] = provider_outcome_reset_parser
         # Keep the legacy registry seam usable for pre-migration callers while

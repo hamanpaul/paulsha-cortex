@@ -5886,6 +5886,136 @@ def _provider_retry_attempt_key(card_id: str) -> str:
     return f"provider-retry:{card_id}"
 
 
+def _policy_violation_attempt_key(card_id: str) -> str:
+    return f"policy-violation:{card_id}"
+
+
+def _policy_violation_reroute(
+    run,
+    step,
+    identities: IdentityRegistry,
+    *,
+    failed_job: Mapping[str, object],
+    launcher_factory,
+    coordinator_root: str | Path | None,
+    registry,
+):
+    failed_identity = (failed_job.get("executor"), failed_job.get("model_id"))
+    candidates = [
+        candidate
+        for candidate in _workflow_identity_candidates(run, step, identities)
+        if (candidate.executor, candidate.model_id) != failed_identity
+    ]
+    if not candidates:
+        return None
+    report = _executor_backoff_admission_report(
+        candidates,
+        coordinator_root=coordinator_root,
+        now=time.time(),
+        registry=registry,
+    )
+    eligible = tuple(report["eligible"])
+    if not eligible:
+        return None
+    gate = _runtime_preflight_gate(
+        run,
+        step,
+        identities=identities,
+        launcher_factory=launcher_factory,
+        candidates=eligible,
+    )
+    if gate is None:
+        return eligible[0]
+    if gate.action == "needs_human":
+        return None
+    return gate
+
+
+def _post_policy_violation_issue_comment(run, event: Mapping[str, object]) -> None:
+    repo = getattr(run, "repo", None)
+    if not isinstance(repo, str) or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) is None:
+        return
+    refs = getattr(run, "issue_refs", ())
+    numbers: list[str] = []
+    for reference in refs if isinstance(refs, (tuple, list)) else ():
+        value = str(reference).strip()
+        match = re.fullmatch(
+            r"(?:(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#|#)?(?P<number>\d+)",
+            value,
+        )
+        if match is not None and (
+            match.group("repo") is None or match.group("repo") == repo
+        ):
+            number = match.group("number")
+            if number not in numbers:
+                numbers.append(number)
+    if not numbers:
+        return
+    rule_id = event.get("rule_id", "unknown")
+    category = event.get("category", "unknown")
+    severity = event.get("severity", "unknown")
+    argv = event.get("argv", [])
+    body = (
+        "此 workflow run 第二次命中高危指令政策，已自動停止。\n\n"
+        f"- rule: `{rule_id}`\n- category: `{category}`\n- severity: `{severity}`\n"
+        f"- argv (redacted): `{json.dumps(argv, ensure_ascii=False)}`\n"
+        f"- policy sha256: `{event.get('policy_sha256', 'unknown')}`"
+    )
+    for number in numbers:
+        try:
+            result = subprocess.run(
+                [
+                    "gh", "api", "--method", "POST",
+                    f"repos/{repo}/issues/{number}/comments",
+                    "-f", f"body={body}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            if result.returncode != 0:
+                logger.warning(
+                    "command policy issue comment rejected repo=%s issue=%s run=%s",
+                    repo,
+                    number,
+                    getattr(run, "run_id", "unknown"),
+                )
+        except (OSError, subprocess.TimeoutExpired):
+            logger.warning(
+                "command policy issue comment failed repo=%s issue=%s run=%s",
+                repo,
+                number,
+                getattr(run, "run_id", "unknown"),
+            )
+
+
+def _close_policy_violation_run(
+    registry,
+    run,
+    *,
+    event: Mapping[str, object],
+    detail: str,
+) -> dict[str, object]:
+    current = registry.get_workflow_run(run.run_id)
+    updated = registry._manager_update_workflow_run(
+        run.run_id,
+        status="failed",
+        gate_status="failed",
+        facets=tuple(facet for facet in current.facets if facet != "needs_human"),
+        needs_human_reason=None,
+        retry_classification="policy-violation-exhausted",
+    )
+    _post_policy_violation_issue_comment(updated, event)
+    return {
+        "run_id": run.run_id,
+        "current_phase": updated.current_phase,
+        "reason": "policy-violation-exhausted",
+        "detail": detail,
+        "command_policy_violation": dict(event),
+    }
+
+
 def _runtime_diagnostic_reason(runtime_diagnostic: object) -> str | None:
     if not isinstance(runtime_diagnostic, Mapping):
         return None
@@ -17870,6 +18000,15 @@ def resume_workflow_run(
         raise RuntimeError("workflow resume requires dispatcher registry")
     run = registry.get_workflow_run(run_id)
     if (
+        run.status == "failed"
+        and run.retry_classification == "policy-violation-exhausted"
+    ):
+        return {
+            "run_id": run.run_id,
+            "current_phase": run.current_phase,
+            "reason": "policy-violation-exhausted",
+        }
+    if (
         run.status == "ongoing"
         and run.current_phase == "verify"
         and run.retry_classification == "authority_restart"
@@ -18529,6 +18668,94 @@ def resume_workflow_run(
         classification = (
             provider_outcome.classification_from_job(job) if sandbox_ok else None
         )
+        if (
+            classification is not None
+            and classification.outcome is provider_outcome.ProviderOutcome.POLICY_VIOLATION
+        ):
+            summary = job.get("command_policy")
+            event = (
+                summary.get("latest")
+                if isinstance(summary, Mapping)
+                and isinstance(summary.get("latest"), Mapping)
+                else {}
+            )
+            event = dict(event)
+            if not event:
+                event = {
+                    "rule_id": "command-policy-audit-integrity",
+                    "category": "integrity",
+                    "severity": "critical",
+                    "argv": [],
+                    "policy_sha256": "0" * 64,
+                }
+            attempt_key = _policy_violation_attempt_key(step.card)
+            seen = int(run.attempts.get(attempt_key, 0))
+            if seen == 0:
+                try:
+                    target = _policy_violation_reroute(
+                        run,
+                        step,
+                        identities,
+                        failed_job=job,
+                        launcher_factory=launcher_factory,
+                        coordinator_root=coordinator_root,
+                        registry=registry,
+                    )
+                    if target is not None:
+                        replacement = dispatch_workflow_card(
+                            dispatcher,
+                            run=run,
+                            identities=identities,
+                            launcher_factory=launcher_factory,
+                            coordinator_root=coordinator_root,
+                            retry_failed=True,
+                            forced_identity=target,
+                            spawn_admission=spawn_admission,
+                            builder_todo_admission=builder_todo_admission_for(run),
+                            quota_admission_context=quota_admission_context,
+                        )
+                        if replacement is not None and classify_dispatch_result(
+                            replacement, registry=registry, run_id=run.run_id
+                        )["kind"] == "job":
+                            current = registry.get_workflow_run(run.run_id)
+                            attempts = dict(current.attempts)
+                            attempts[attempt_key] = 1
+                            updated = registry._manager_update_workflow_run(
+                                run.run_id,
+                                attempts=attempts,
+                                retry_classification="policy-violation-identity-switch",
+                            )
+                            return {
+                                "run_id": run.run_id,
+                                "current_phase": updated.current_phase,
+                                "job_id": replacement["job_id"],
+                                "reason": "policy-violation-identity-switch",
+                                "policy_violation_count": (
+                                    summary.get("count", 1)
+                                    if isinstance(summary, Mapping)
+                                    else 1
+                                ),
+                                "policy_violation_latest": event,
+                            }
+                except Exception as exc:
+                    return _close_policy_violation_run(
+                        registry,
+                        run,
+                        event=event,
+                        detail=f"identity switch failed: {type(exc).__name__}",
+                    )
+                return _close_policy_violation_run(
+                    registry,
+                    run,
+                    event=event,
+                    detail="no eligible alternate identity was available",
+                )
+            return _close_policy_violation_run(
+                registry,
+                run,
+                event=event,
+                detail="the replacement identity also triggered command policy",
+            )
         record_executor_backoff_from_job(coordinator_root, job, classification)
         if runtime_contract_failed:
             # A runtime contract failure is already a durable Manager-side

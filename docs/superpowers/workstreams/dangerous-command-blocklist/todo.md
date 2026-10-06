@@ -24,12 +24,12 @@ work_item: dangerous-command-blocklist
 
 ## Tasks
 
-- [ ] **T1 實測各 executor 的阻擋能力（先做，記錄在 PR 內）**：在本機量測目前版本的 codex（hooks.json
+- [x] **T1 實測各 executor 的阻擋能力（先做，記錄在 PR 內）**：在本機量測目前版本的 codex（hooks.json
       PreToolUse 或 execpolicy `.rules` 的 `forbidden`）、copilot（`--deny-tool 'shell(<cmd>)'` 是否優先於
       `--allow-all-tools`、`preToolUse` hook）、agy（settings deny 或 hook）、claude（PreToolUse 的 Bash
       matcher 與 `permissions.deny`）實際能否擋下 shell 指令。量不到能力的 executor 記為
       `unsupported-measured` 並附量測紀錄，不得靜默缺格。
-- [ ] **T2 政策引擎與基準政策**：新增純函式、無外部依賴的 `paulsha_cortex/command_policy.py`，以解析後的
+- [x] **T2 政策引擎與基準政策**：新增純函式、無外部依賴的 `paulsha_cortex/command_policy.py`，以解析後的
       argv 比對，不做字串 grep。涵蓋：切段、argv0 正規化、wrapper 剝殼（`sudo`、`env`、`timeout` 等）、
       `sh -c`／`bash -c` 遞迴、`python -c` 字面引數、路徑正規化與保護根、git／gh 子命令選項。基準政策
       `coordinator/data/command-policy.yaml`（versioned）；operator overlay 只能加嚴，不認得的鍵或想降級時
@@ -42,12 +42,12 @@ work_item: dangerous-command-blocklist
       `git push -f origin main`、`git push origin :main`、`gh repo delete o/r --yes`。誤判對照至少包含：
       `rm -rf build/ node_modules`、`echo "rm -rf /"`、`grep passwd /etc/group`、`sudo apt-get install -y jq`、
       `dd if=a.img of=b.img`、`python -m pytest`。import 時斷言每條規則都有雙向案例。
-- [ ] **T4 executor 阻擋接線**：依 T1 結果，把政策編譯並注入 codex、copilot、agy builder 與 claude reviewer
+- [x] **T4 executor 阻擋接線**：依 T1 結果，把政策編譯並注入 codex、copilot、agy builder 與 claude reviewer
       的命令阻擋機制（hook 或 deny 規則，經 launcher 的 argv／受管設定注入，job 無法透過改 argv 繞過）。
       新增 `EXECUTOR_POLICY_ENFORCEMENT` 覆蓋表：每個 executor × role 必須明示 `hook-enforced`／
       `deny-rules-only`／`unsupported-measured`／`not-applicable`，import 時斷言涵蓋全部 argv builder。
-- [ ] **T5 命中處置與稽核**：新增 `policy-violation` outcome（不是 transient、不燒 provider 重試額度），實作
+- [x] **T5 命中處置與稽核**：新增 `policy-violation` outcome（不是 transient、不燒 provider 重試額度），實作
       Boundary 所述的自動處置。每次決策記錄事件（rule id、類別、severity、遮蔽後的 argv、policy sha256），
       `cortex status`／`work show` 顯示違規計數與最近一筆。
-- [ ] **T6 文件**：`docs/command-policy.md` 說明政策格式、overlay 規則、各 executor 的覆蓋程度與已知限制。
+- [x] **T6 文件**：`docs/command-policy.md` 說明政策格式、overlay 規則、各 executor 的覆蓋程度與已知限制。
       新增 changelog fragment，並同步 `CHANGELOG.md [Unreleased]`。

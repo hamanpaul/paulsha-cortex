@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -8,6 +9,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import uuid
 from copy import copy
 from dataclasses import dataclass
 from pathlib import Path
@@ -442,6 +444,7 @@ def _claude_review_settings(worktree: str) -> str:
                 # `autoAllowBashIfSandboxed` 供給的放行隨 #746 關內層而消失，這裡
                 # 補等價 allow；deny 規則優先於 allow，憑證／HOME 讀取拒絕不受影響。
                 "permissions": {"allow": ["Bash"], "deny": read_denials},
+                "hooks": _claude_command_policy_hooks(),
                 # 內層 bwrap 在加固 unit 下起不來（bwrap: Can't read
                 # /proc/sys/kernel/overflowuid），且 `failIfUnavailable` 讓 8/8 命令
                 # 全滅——刻意關閉，不是放寬外層（#746）。
@@ -458,6 +461,7 @@ def _claude_review_settings(worktree: str) -> str:
         # 放行後命令仍一律在下方沙箱內執行（allowUnsandboxedCommands=false），
         # deny 規則優先於 allow，憑證讀取拒絕不受影響。
         "permissions": {"allow": ["Bash"], "deny": read_denials},
+        "hooks": _claude_command_policy_hooks(),
         "sandbox": {
             "enabled": True,
             "failIfUnavailable": True,
@@ -493,6 +497,161 @@ def _claude_review_settings(worktree: str) -> str:
 # 甚至把 stderr 回饋給模型）。
 _CLAUDE_SPOOL_HOOK_COMMAND = "cortex headless-hook post-tool-use || true"
 _CLAUDE_EDIT_GUARD_HOOK_COMMAND = "cortex headless-hook pre-tool-use || exit 2"
+_COMMAND_POLICY_HOOK_COMMAND = "cortex command-policy-hook"
+
+
+def _claude_command_policy_hooks() -> dict[str, object]:
+    return {
+        "PreToolUse": [
+            {
+                "matcher": "Bash",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": f"{_COMMAND_POLICY_HOOK_COMMAND} --executor claude",
+                        "timeout": 30,
+                    }
+                ],
+            }
+        ]
+    }
+
+
+def _install_copilot_command_policy_hook(env: Mapping[str, str], job_id: str) -> str:
+    """Install one uniquely named Copilot hook for this launched builder job."""
+
+    home_value = env.get("COPILOT_HOME") or str(Path(env.get("HOME") or str(Path.home())) / ".copilot")
+    home = Path(home_value)
+    if home.is_symlink():
+        raise ValueError("Copilot home must not be a symlink")
+    hooks_dir = home / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    if hooks_dir.is_symlink() or not hooks_dir.is_dir():
+        raise ValueError("Copilot hooks directory is not a regular directory")
+    suffix = hashlib.sha256(job_id.encode("utf-8")).hexdigest()[:16]
+    hook_path = hooks_dir / f"cortex-command-policy-{suffix}.json"
+    if hook_path.exists() or hook_path.is_symlink():
+        if hook_path.is_symlink() or not hook_path.is_file():
+            raise ValueError("existing Copilot command-policy hook has an unsafe type")
+        hook_path.unlink()
+    payload = {
+        "version": 1,
+        "hooks": {
+            "preToolUse": [
+                {
+                    "type": "command",
+                    "exec": "cortex",
+                    "args": ["command-policy-hook", "--executor", "copilot"],
+                    "timeoutSec": 5,
+                }
+            ]
+        },
+    }
+    descriptor = os.open(
+        hook_path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    return str(hook_path)
+
+
+def _install_agy_command_policy_plugin(env: Mapping[str, str], job_id: str) -> str:
+    """Stage an isolated, manager-owned Antigravity CLI hook plugin for one job."""
+
+    home_text = env.get("HOME") or str(Path.home())
+    home = Path(home_text)
+    if not home.is_absolute() or home.is_symlink():
+        raise ValueError("Antigravity home must be an absolute non-symlink directory")
+    config_root = home / ".gemini" / "antigravity-cli"
+    plugins_root = config_root / "plugins"
+    for directory in (home / ".gemini", config_root, plugins_root):
+        if not directory.exists():
+            directory.mkdir(mode=0o755)
+        if directory.is_symlink() or not directory.is_dir():
+            raise ValueError("Antigravity plugin directory must be a regular directory")
+    suffix = hashlib.sha256(job_id.encode("utf-8")).hexdigest()[:16]
+    plugin_name = f"cortex-command-policy-{suffix}-{uuid.uuid4().hex[:16]}"
+    plugin_dir = plugins_root / plugin_name
+    if plugin_dir.exists() or plugin_dir.is_symlink():
+        raise ValueError("Antigravity command-policy plugin path already exists")
+    plugin_dir.mkdir(mode=0o755)
+    descriptor_path = Path(__file__).resolve().parent / "data/command-policy-agy-hooks.json"
+    try:
+        hooks_text = descriptor_path.read_text(encoding="utf-8")
+        hooks_payload = json.loads(hooks_text)
+        if (
+            not isinstance(hooks_payload, dict)
+            or set(hooks_payload) != {"cortex-command-policy"}
+            or not isinstance(hooks_payload["cortex-command-policy"], dict)
+        ):
+            raise ValueError("Antigravity command-policy hooks asset is malformed")
+        manifest = {
+            "name": plugin_name,
+            "description": "Manager-injected per-job command policy enforcement.",
+        }
+        for name, payload in (
+            ("plugin.json", manifest),
+            ("hooks.json", hooks_payload),
+        ):
+            target = plugin_dir / name
+            descriptor = os.open(
+                target,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o644,
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(target, 0o644)
+    except BaseException:
+        for name in ("plugin.json", "hooks.json"):
+            (plugin_dir / name).unlink(missing_ok=True)
+        plugin_dir.rmdir()
+        raise
+    return str(plugin_dir)
+
+
+def _cleanup_command_policy_runtime(executor: str, path_text: str) -> None:
+    path = Path(path_text)
+    if (
+        not path.is_absolute()
+        or path.parent.is_symlink()
+        or path.parent.parent.is_symlink()
+    ):
+        return
+    if executor == "copilot":
+        if (
+            path.parent.name == "hooks"
+            and re.fullmatch(r"cortex-command-policy-[0-9a-f]{16}\.json", path.name)
+            and (path.is_file() or path.is_symlink())
+        ):
+            path.unlink(missing_ok=True)
+        return
+    if (
+        executor == "agy"
+        and path.parent.name == "plugins"
+        and path.parent.parent.name == "antigravity-cli"
+        and re.fullmatch(
+            r"cortex-command-policy-[0-9a-f]{16}-[0-9a-f]{16}", path.name
+        )
+        and path.is_dir()
+        and not path.is_symlink()
+    ):
+        for name in ("plugin.json", "hooks.json"):
+            member = path / name
+            if member.is_file() and not member.is_symlink():
+                member.unlink()
+        try:
+            path.rmdir()
+        except OSError:
+            pass
 
 # 逾時上限：hook 只寫一個本機檔案（外加最多一次本機 `git config` 讀取），秒級都嫌多；
 # 設上限是為了「hook 永不阻塞 job」這條硬約束，不是為了正常路徑。
@@ -528,7 +687,8 @@ def _claude_spool_hook_settings() -> str:
                             "command": _CLAUDE_EDIT_GUARD_HOOK_COMMAND,
                         }
                     ],
-                }
+                },
+                *_claude_command_policy_hooks()["PreToolUse"],
             ],
             "PostToolUse": [
                 {
@@ -746,6 +906,8 @@ class LaunchHandle:
     control_log_path: str | None = None
     #: 本次 job 使用的 executable；None 表示沿用 PATH 解析。
     executable: str | None = None
+    #: Exact per-job Copilot hook file created by the Manager and removed on finalize.
+    command_policy_runtime_path: str | None = None
 
 
 def _linked_worktree_git_write_dirs(worktree: str | None) -> tuple[str, ...]:
@@ -982,6 +1144,16 @@ def build_copilot_argv(
         verdict_spool_dir, read_only=read_only, review_only=review_only
     ):
         argv += ["--allow-tool", tool]
+    # These baseline rules are invariant prohibitions and Copilot CLI gives
+    # --deny-tool precedence over both --allow-all and --allow-all-tools.
+    # Path-sensitive and wrapped commands are handled by the injected hook.
+    for tool in (
+        "shell(passwd:*)",
+        "shell(useradd:*)",
+        "shell(adduser:*)",
+        "shell(gh repo delete:*)",
+    ):
+        argv += ["--deny-tool", tool]
     return argv
 
 
@@ -1199,6 +1371,8 @@ def build_codex_argv(
         if commit_required:
             for git_write_dir in _linked_worktree_git_write_dirs(worktree):
                 argv += ["--add-dir", git_write_dir]
+    if worktree is not None and not (read_only or review_only):
+        argv.extend(["--enable", "hooks", "-c", _codex_command_policy_hook_override()])
     # #714／#716：非 template/direct 的 Codex 仍按下方登記表附上 legacy Landlock。
     # codex-cli 0.157 在 Trust Root template unit 下，legacy 路徑要求 bwrap 隔離
     # app-server sockets；預設 bwrap 又被 namespace 限制擋下。因此只有已完成
@@ -1241,6 +1415,16 @@ def build_codex_argv(
     if worktree is not None:
         argv.extend(["-C", worktree])
     return argv
+
+
+def _codex_command_policy_hook_override() -> str:
+    command = f"{_COMMAND_POLICY_HOOK_COMMAND} --executor codex"
+    return (
+        'hooks.PreToolUse = [{ matcher = "Bash|exec_command", '
+        'hooks = [{ type = "command", command = "'
+        + command
+        + '", timeout = 30 }] }]'
+    )
 
 
 def _codex_inner_sandbox_argv(
@@ -1659,6 +1843,39 @@ _ARGV_BUILDERS = {
     "agy": build_agy_argv,
     "cg": build_cg_argv,
 }
+
+_EXECUTOR_ROLES = ("planner", "builder", "reviewer")
+_EXECUTOR_POLICY_STATES = frozenset(
+    {"hook-enforced", "deny-rules-only", "unsupported-measured", "not-applicable"}
+)
+EXECUTOR_POLICY_ENFORCEMENT = {
+    "copilot": {"planner": "not-applicable", "builder": "hook-enforced", "reviewer": "not-applicable"},
+    "claude": {"planner": "not-applicable", "builder": "hook-enforced", "reviewer": "hook-enforced"},
+    "codex": {"planner": "not-applicable", "builder": "hook-enforced", "reviewer": "not-applicable"},
+    "agy": {"planner": "not-applicable", "builder": "hook-enforced", "reviewer": "not-applicable"},
+    "cg": {"planner": "not-applicable", "builder": "not-applicable", "reviewer": "not-applicable"},
+}
+
+
+def _assert_executor_policy_coverage() -> None:
+    if set(EXECUTOR_POLICY_ENFORCEMENT) != set(_ARGV_BUILDERS):
+        raise RuntimeError("EXECUTOR_POLICY_ENFORCEMENT must cover every argv builder")
+    for executor, roles in EXECUTOR_POLICY_ENFORCEMENT.items():
+        if set(roles) != set(_EXECUTOR_ROLES) or any(
+            state not in _EXECUTOR_POLICY_STATES for state in roles.values()
+        ):
+            raise RuntimeError(f"EXECUTOR_POLICY_ENFORCEMENT coverage invalid: {executor}")
+    required = {
+        ("codex", "builder"),
+        ("copilot", "builder"),
+        ("agy", "builder"),
+        ("claude", "reviewer"),
+    }
+    if any(EXECUTOR_POLICY_ENFORCEMENT[executor][role] != "hook-enforced" for executor, role in required):
+        raise RuntimeError("required executor command-policy hook is not enforced")
+
+
+_assert_executor_policy_coverage()
 
 
 def build_headless_popen_kwargs(
@@ -2472,9 +2689,8 @@ class SubprocessLauncher:
                 "PSC_SLICE_ID": slice_id,
                 # #506 / D5：cortex 派工的 headless job 標記。事件 hook 以它自守
                 # ——沒有這個變數就是完全的 no-op（見 `porcelain/headless_hook.py`）。
-                # 互動 session 的環境裡不存在，因此 hook 即使被誤裝也不會有事件。
-                # reviewer 分支刻意不設：它走 read-only 契約、不掛 hook，marker 與
-                # 注入點成對出現才不會出現「有標記卻沒 hook」的半套狀態。
+                # 互動 session 的環境裡不存在，因此 hook 即使被誤裝也不會有事件；
+                # reviewer 的最小環境另由下方只加入必要的 job 與 command-policy 欄位。
                 "PSC_JOB_ID": slice_id,
                 "PSC_REPO_ROOT": str(Path(__file__).resolve().parents[2]),
             }
@@ -2482,6 +2698,20 @@ class SubprocessLauncher:
                 env["PSC_RELAY_TARGET"] = self._relay_target
             if self._executor == "copilot":
                 env.update(_copilot_credential_env(env))
+        env["PSC_JOB_ID"] = slice_id
+        env["PSC_COMMAND_POLICY_BASELINE"] = str(
+            Path(__file__).resolve().parent / "data/command-policy.yaml"
+        )
+        operator_overlay = os.environ.get("PSC_COMMAND_POLICY_OVERLAY")
+        if operator_overlay:
+            env["PSC_COMMAND_POLICY_OVERLAY"] = operator_overlay
+        else:
+            env.pop("PSC_COMMAND_POLICY_OVERLAY", None)
+        command_policy_events_path = Path(job_log_path).with_suffix(
+            ".command-policy.jsonl"
+        )
+        command_policy_events_path.unlink(missing_ok=True)
+        env["PSC_COMMAND_POLICY_EVENTS"] = str(command_policy_events_path)
         # （`log_path` 已在 argv 之前算好——#714：`-o` 的落點由它導出。）
         # 跨進程 durable 完成判定：以 bash -lc 包裝，子進程結束時把 $? 寫入 exit sentinel。
         # 用 shlex.join 安全嵌入內層 argv（prompt 含換行/空白仍為單一 token），
@@ -2734,6 +2964,16 @@ class SubprocessLauncher:
             job_runner.write_job_prompt(
                 prompt_file, prompt, account=prompt_account
             )
+        command_policy_runtime_path: str | None = None
+        if worktree is not None and not (self._read_only or self._review_only):
+            if self._executor == "copilot":
+                command_policy_runtime_path = _install_copilot_command_policy_hook(
+                    env, slice_id
+                )
+            elif self._executor == "agy":
+                command_policy_runtime_path = _install_agy_command_policy_plugin(
+                    env, slice_id
+                )
         try:
             with open(log_path, log_mode) as logf:
                 popen_kwargs["stdout"] = logf
@@ -2747,6 +2987,10 @@ class SubprocessLauncher:
         except BaseException:
             if prompt_file is not None:
                 Path(prompt_file).unlink(missing_ok=True)
+            if command_policy_runtime_path is not None:
+                _cleanup_command_policy_runtime(
+                    self._executor, command_policy_runtime_path
+                )
             raise
         if self._executor == "claude" and stdin_prompt is not None and getattr(proc, "stdin", None) is not None:
             proc.stdin.write(stdin_prompt.encode("utf-8"))
@@ -2786,6 +3030,10 @@ class SubprocessLauncher:
         except BaseException:
             if prompt_file is not None:
                 Path(prompt_file).unlink(missing_ok=True)
+            if command_policy_runtime_path is not None:
+                _cleanup_command_policy_runtime(
+                    self._executor, command_policy_runtime_path
+                )
             raise
         return LaunchHandle(
             executor=self._executor,
@@ -2805,4 +3053,5 @@ class SubprocessLauncher:
             prompt_path=prompt_file,
             control_log_path=manager_log_path if degraded else None,
             executable=resolved_executable,
+            command_policy_runtime_path=command_policy_runtime_path,
         )

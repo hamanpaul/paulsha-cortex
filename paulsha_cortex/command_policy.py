@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ast
+import hashlib
+import json
 import shlex
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -18,6 +20,14 @@ _TOP_LEVEL_KEYS = frozenset(
         "block_device_prefixes",
         "protected_refs",
         "rules",
+    }
+)
+_OPERATOR_OVERLAY_KEYS = frozenset(
+    {
+        "add_protected_paths",
+        "add_protected_sudoers_paths",
+        "add_block_device_prefixes",
+        "add_protected_refs",
     }
 )
 _RULE_KEYS = frozenset({"id", "commands", "category", "severity", "summary"})
@@ -97,6 +107,103 @@ class CommandDecision:
     command: str
     segments: tuple[tuple[str, ...], ...]
     match: CommandMatch | None = None
+
+
+def apply_operator_overlay(policy: CommandPolicy, overlay: object) -> CommandPolicy:
+    """Apply an additive-only operator overlay and revalidate the full policy.
+
+    Overlay fields add protected literals to the shipped policy. Replacing rules,
+    wrappers, severities, or any unknown field is rejected so an operator file
+    cannot silently weaken the baseline.
+    """
+
+    raw = _require_mapping(overlay, source="<operator-overlay>", label="operator overlay")
+    _assert_known_keys(
+        raw,
+        allowed=_OPERATOR_OVERLAY_KEYS,
+        source="<operator-overlay>",
+        label="operator overlay",
+    )
+    payload: dict[str, object] = {
+        "version": policy.version,
+        "wrappers": list(policy.wrappers),
+        "protected_paths": list(policy.protected_paths),
+        "protected_sudoers_paths": list(policy.protected_sudoers_paths),
+        "block_device_prefixes": list(policy.block_device_prefixes),
+        "protected_refs": list(policy.protected_refs),
+        "rules": [
+            {
+                "id": rule.id,
+                "commands": list(rule.commands),
+                "category": rule.category,
+                "severity": rule.severity,
+                "summary": rule.summary,
+            }
+            for rule in policy.rules.values()
+        ],
+    }
+    field_names = {
+        "add_protected_paths": "protected_paths",
+        "add_protected_sudoers_paths": "protected_sudoers_paths",
+        "add_block_device_prefixes": "block_device_prefixes",
+        "add_protected_refs": "protected_refs",
+    }
+    for overlay_key, policy_key in field_names.items():
+        additions = raw.get(overlay_key, [])
+        if not isinstance(additions, list) or any(
+            not isinstance(item, str) or not item.strip() for item in additions
+        ):
+            raise CommandPolicyError(
+                f"operator overlay {overlay_key} 必須是字串清單"
+            )
+        current = payload[policy_key]
+        assert isinstance(current, list)
+        payload[policy_key] = [*current, *additions]
+    validated = parse_policy(payload, source="<operator-overlay-effective>")
+    for field_name in field_names.values():
+        if not set(getattr(policy, field_name)) <= set(getattr(validated, field_name)):
+            raise CommandPolicyError(
+                f"operator overlay 不得降低基準政策保護：{field_name}"
+            )
+    if validated.rules != policy.rules or validated.wrappers != policy.wrappers:
+        raise CommandPolicyError("operator overlay 不得修改基準規則或 wrapper")
+    return validated
+
+
+def load_policy_with_overlay(base_text: str, overlay_text: str | None = None) -> CommandPolicy:
+    policy = load_policy_text(base_text, source="baseline")
+    if overlay_text is None or not overlay_text.strip():
+        return policy
+    try:
+        overlay = safe_load(overlay_text)
+    except YAMLError as exc:
+        raise CommandPolicyError(f"operator overlay YAML 解析失敗: {exc}") from exc
+    return apply_operator_overlay(policy, overlay)
+
+
+def policy_sha256(policy: CommandPolicy) -> str:
+    """Return a stable digest of the validated effective policy."""
+
+    payload = {
+        "version": policy.version,
+        "wrappers": list(policy.wrappers),
+        "protected_paths": list(policy.protected_paths),
+        "protected_sudoers_paths": list(policy.protected_sudoers_paths),
+        "block_device_prefixes": list(policy.block_device_prefixes),
+        "protected_refs": list(policy.protected_refs),
+        "rules": [
+            {
+                "id": rule.id,
+                "commands": list(rule.commands),
+                "category": rule.category,
+                "severity": rule.severity,
+                "summary": rule.summary,
+            }
+            for rule in policy.rules.values()
+        ],
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def load_policy_text(text: str, *, source: str = "<memory>") -> CommandPolicy:
