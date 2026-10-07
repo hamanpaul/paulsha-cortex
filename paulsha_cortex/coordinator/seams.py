@@ -296,6 +296,9 @@ class ScriptWorktreeCreator:
                 # hardlink 會讓 clone 的 object 與來源 repo 共用 inode——那正是本次
                 # 變更要消滅的共用面（也是 operator 實測採用的旗標）。
                 "--no-hardlinks",
+                # 本機 clone 的 ref 複製最佳化可能先帶入來源樹的所有 tag；走 Git
+                # transport 才能讓 --no-tags 穩定排除它們，再由下方明確抓取 v*。
+                "--no-local",
                 # job clone 只帶發布版本 tag；本機保存 tag 不得污染 job 的
                 # `git describe`／版本檢查結果。
                 "--no-tags",
