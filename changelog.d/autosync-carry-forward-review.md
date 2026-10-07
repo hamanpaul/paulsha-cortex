@@ -1,0 +1,1 @@
+#1356 autosync 後的 review 交付：Manager 同步會使舊 Candidate 的 verify 與 code-review 結果失效，重新派發兩張卡後才進入 ship probe。review binding 共用 #1345 的 Candidate source helper，並繼續要求 exact run、Candidate、成功狀態與 Manager typed evidence。盤點到的其他 `openspec-archive` 判定仍限定 archive 步驟及其 evidence，不屬於 Candidate source 分類。
