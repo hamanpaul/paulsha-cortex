@@ -10,6 +10,8 @@
 ### Fixed
 
 - **#1296 work 進件模型鏈旗標**：`cortex run work start/intake/rechain/supersede-attempt` 現在會把 `--planner-executor`／`--planner-model`／`--builder-executor`／`--builder-model`／`--reviewer-executor`／`--reviewer-model` 送入同一條 `extract_model_chain_override` 路徑；與 `--payload` 衝突時會明確拒絕，未成對指定時也會報錯，其他 work action 帶這些旗標則不受理。拒絕訊息使用 parser 已註冊的連字號旗標名且不會重複錯誤前綴；非支援 action 的 payload 不會被誤當成 CLI 旗標。`intake` 成功後也會輸出完整解析的 planner／builder／reviewer executor 與 model，標示各段來自 run override 或 shared default，且 preview 與派工共用 primary planner 選取，方便 operator 核對。
+- **cortex 進件：#1336 自動同步後 verification 找不到來源 job、#1338 被終止的 repair build 無法恢復**：登記 work item `main-sync-reverify-builder-context`、`retry-build-killed-repair` 與 accepted todo，交給 cortex 派工（見 `changelog.d/cortex-intake-1336.md`）。
+- **cortex 進件：#1334 clean-behind 自動同步的 committer 身分**：登記 work item `main-sync-committer-identity` 與 accepted todo，交給 cortex 派工（見 `changelog.d/cortex-intake-1334.md`）。
 - **cortex 進件：#1322 ship 在 preflight 後重新取得 WorkAuthority**：登記 work item `delivery-authority-refresh` 與 accepted todo，交給 cortex 派工（見 `changelog.d/cortex-intake-1322.md`）。
 - **#1311 ship clean-behind 自動同步**：Manager 在受控 ship clone 合入已 probe 的 exact `origin/main`，只重跑 verify 與 ship probe 並沿用原 foreign review；每 run 預設上限 3 次（`PSC_MAIN_SYNC_AUTOSYNC_MAX` 可設 0–10），main SHA、次數、新 Candidate 與停止原因寫入 evidence，`cortex work show` 可檢視。
 - **cortex 進件：派工穩定性第二批 #1311–#1314、#1319–#1321**：登記七個 work item 與 accepted todo，交給 cortex 平行派工（見 `changelog.d/cortex-intake-batch-20261006c.md`）。
