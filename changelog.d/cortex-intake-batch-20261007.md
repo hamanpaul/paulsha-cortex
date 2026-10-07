@@ -1,0 +1,1 @@
+- 進件：`pr-change-authority-rebind`（#1339）、`qualification-test-fixed-clock`（#1340）、`copilot-fix-round-accounting`（#1342），交給 cortex 平行派工。

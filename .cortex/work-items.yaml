@@ -1753,3 +1753,51 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/workstreams/main-sync-committer-identity/todo.md'
     excludes: []
+  main-sync-reverify-builder-context:
+    title: 'main-sync-reverify-builder-context'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1336'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/main-sync-reverify-builder-context/todo.md'
+    excludes: []
+  retry-build-killed-repair:
+    title: 'retry-build-killed-repair'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1338'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/retry-build-killed-repair/todo.md'
+    excludes: []
+  pr-change-authority-rebind:
+    title: 'pr-change-authority-rebind'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1339'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/pr-change-authority-rebind/todo.md'
+    excludes: []
+  qualification-test-fixed-clock:
+    title: 'qualification-test-fixed-clock'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1340'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/qualification-test-fixed-clock/todo.md'
+    excludes: []
+  copilot-fix-round-accounting:
+    title: 'copilot-fix-round-accounting'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1342'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/copilot-fix-round-accounting/todo.md'
+    excludes: []
+  autosync-source-job-unify:
+    title: 'autosync-source-job-unify'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1345'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/autosync-source-job-unify/todo.md'
+    excludes: []

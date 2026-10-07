@@ -96,7 +96,7 @@ class ScriptWorktreeCreator:
     clone 完成後的工作區狀態，與 worktree 模型下逐字相同：`origin` 指向**真正的
     上游**（來源 repo 的 `origin` URL），指向來源 repo 的暫時 remote 一律移除，
     `<branch>` 沒有 upstream（`worktree add -b` 也不設），來源 repo 的
-    `refs/remotes/origin/*` 與本地 `user.name`／`user.email` 一併複製過去
+    `refs/remotes/origin/*` 與來源 checkout 實際生效的 `user.name`／`user.email` 一併複製過去
     （clone 不繼承來源的 local config，少了它 builder 的 `git commit` 會直接失敗）。
 
     任何一步失敗都會把**已做的變更全部還原**（部分 clone 目錄刪除、branch 回到
@@ -364,10 +364,11 @@ class ScriptWorktreeCreator:
         for key in (f"branch.{branch}.remote", f"branch.{branch}.merge"):
             self._run(["-C", str(target), "config", "--unset-all", key])
 
-        # clone **不繼承**來源 repo 的 local config。identity 缺席時 builder 的
-        # `git commit` 會直接失敗，而 worktree 模型下它是共用的——複製過去。
+        # clone **不繼承**來源 repo 的 local config，也不會沿用 manager 啟動時的
+        # global config。讀取來源 checkout 實際生效的 identity（含 global），再明確
+        # 寫入 clone 的 local config，讓後續 builder commit 有一致的身分。
         for key in ("user.name", "user.email"):
-            probe = self._source(["config", "--local", "--get", key])
+            probe = self._source(["config", "--get", key])
             value = probe.stdout.strip() if probe.returncode == 0 else ""
             if value:
                 self._run(["-C", str(target), "config", key, value])
