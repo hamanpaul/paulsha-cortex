@@ -1809,3 +1809,11 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/workstreams/autosync-carry-forward-review/todo.md'
     excludes: []
+  pr-authority-rebind-v2:
+    title: 'pr-authority-rebind-v2'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1360'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/pr-authority-rebind-v2/todo.md'
+    excludes: []

@@ -9,6 +9,7 @@
 
 ### Fixed
 
+- **cortex 進件：#1360 PR 已存在的 run 的 resume（#1339 重做）**：登記 work item `pr-authority-rebind-v2` 與 accepted todo（見 `changelog.d/cortex-intake-1360.md`）。
 - **#1356 autosync 後以新 Candidate 重跑 review**：自動同步會同時重開 verify 與 code-review、清除舊 foreign-review，再以新 Candidate 進入 ship probe；Candidate 來源分類改用 #1345 共用 helper，保留 exact-run／Candidate／成功狀態與 evidence 驗證（見 `changelog.d/autosync-carry-forward-review.md`）。
 - **cortex 進件：#1345 自動同步後 review 收割與 repair build 不認 autosync job**：登記 work item `autosync-source-job-unify` 與 accepted todo（見 `changelog.d/cortex-intake-1345.md`）。
 - **#1345 自動同步 candidate source 統一**：成功的 `main-sync-autosync` Manager ship job 與 `openspec-archive` 同為 review binding、verification context 及 retry-build branch/base 的合法來源；保留 exact run/repo/Candidate、成功狀態與 typed ship evidence 檢查（見 `changelog.d/autosync-source-job-unify.md`）。
