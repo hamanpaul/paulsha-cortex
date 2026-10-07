@@ -1745,3 +1745,11 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/workstreams/delivery-authority-refresh/todo.md'
     excludes: []
+  main-sync-committer-identity:
+    title: 'main-sync-committer-identity'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1334'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/main-sync-committer-identity/todo.md'
+    excludes: []
