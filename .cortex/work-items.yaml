@@ -1737,3 +1737,11 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/workstreams/reviewer-sandbox-retention/todo.md'
     excludes: []
+  delivery-authority-refresh:
+    title: 'delivery-authority-refresh'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1322'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/delivery-authority-refresh/todo.md'
+    excludes: []

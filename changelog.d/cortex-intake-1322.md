@@ -1,0 +1,1 @@
+- 進件：`delivery-authority-refresh`（#1322），ship 在 preflight 後重新取得 WorkAuthority，stale 失敗不再讓每輪 tick 重跑 preflight。
