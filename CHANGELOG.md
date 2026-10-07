@@ -10,6 +10,7 @@
 ### Fixed
 
 - **#1338 已有 PR 的 repair build 被終止後可用 `retry-build` 恢復**：build phase 的 admission 與 registry reset 共用最新 builder job 判準，接受無已採信 evidence 的 terminal failure，保留 exact-Candidate CAS、retry-build receipt 與 Builder 派工；`next_actions` 隨可受理的 retry lane 列出 `retry-build`，不再退回必然失敗的 `resume`（見 `changelog.d/retry-build-killed-repair.md`）。
+- **cortex 進件：#1345 自動同步後 review 收割與 repair build 不認 autosync job**：登記 work item `autosync-source-job-unify` 與 accepted todo（見 `changelog.d/cortex-intake-1345.md`）。
 - **cortex 進件：#1339、#1340、#1342**：PR 變動後 resume 失效、依賴牆鐘的測試、Copilot 修正輪數把同步 main 算進去；登記三個 work item 與 accepted todo（見 `changelog.d/cortex-intake-batch-20261007.md`）。
 - **#1336 clean-behind 自動同步後派出 verification**：成功的 `main-sync-autosync` Manager job 可作為 exact Candidate 的 reviewer 來源，verify tick 會沿用其 branch 並把新 Candidate 當作後續 build base；同步前 build ledger 綁定舊 Candidate，不會傳給 verifier，verification 對合併後 Candidate 自行執行檢查（見 `changelog.d/main-sync-reverify-builder-context.md`）。
 - **#1334 clean-behind 自動同步的 Git 身分**：merge 以 `-c user.name`／`-c user.email` 明確帶入設定的 `PSC_MAIN_SYNC_GIT_IDENTITY`（`Name <email>`）或來源 checkout 的有效身分；ship clone 複製來源 checkout 實際生效的身分；上限只計成功建立新 Candidate 的同步。
