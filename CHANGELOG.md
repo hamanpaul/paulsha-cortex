@@ -9,6 +9,10 @@
 
 ### Fixed
 
+- **#1336 clean-behind 自動同步後派出 verification**：成功的 `main-sync-autosync` Manager job 可作為 exact Candidate 的 reviewer 來源，verify tick 會沿用其 branch 並把新 Candidate 當作後續 build base；同步前 build ledger 綁定舊 Candidate，不會傳給 verifier，verification 對合併後 Candidate 自行執行檢查（見 `changelog.d/main-sync-reverify-builder-context.md`）。
+- **#1334 clean-behind 自動同步的 Git 身分**：merge 以 `-c user.name`／`-c user.email` 明確帶入設定的 `PSC_MAIN_SYNC_GIT_IDENTITY`（`Name <email>`）或來源 checkout 的有效身分；ship clone 複製來源 checkout 實際生效的身分；上限只計成功建立新 Candidate 的同步。
+- **cortex 進件：#1336 自動同步後 verification 找不到來源 job、#1338 被終止的 repair build 無法恢復**：登記 work item `main-sync-reverify-builder-context`、`retry-build-killed-repair` 與 accepted todo，交給 cortex 派工（見 `changelog.d/cortex-intake-1336.md`）。
+- **cortex 進件：#1334 clean-behind 自動同步的 committer 身分**：登記 work item `main-sync-committer-identity` 與 accepted todo，交給 cortex 派工（見 `changelog.d/cortex-intake-1334.md`）。
 - **cortex 進件：#1322 ship 在 preflight 後重新取得 WorkAuthority**：登記 work item `delivery-authority-refresh` 與 accepted todo，交給 cortex 派工（見 `changelog.d/cortex-intake-1322.md`）。
 - **#1311 ship clean-behind 自動同步**：Manager 在受控 ship clone 合入已 probe 的 exact `origin/main`，只重跑 verify 與 ship probe 並沿用原 foreign review；每 run 預設上限 3 次（`PSC_MAIN_SYNC_AUTOSYNC_MAX` 可設 0–10），main SHA、次數、新 Candidate 與停止原因寫入 evidence，`cortex work show` 可檢視。
 - **cortex 進件：派工穩定性第二批 #1311–#1314、#1319–#1321**：登記七個 work item 與 accepted todo，交給 cortex 平行派工（見 `changelog.d/cortex-intake-batch-20261006c.md`）。
