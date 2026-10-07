@@ -1,1 +1,2 @@
 - 進件：`main-sync-reverify-builder-context`（#1336），clean-behind 自動同步後 verification 卡要能找到 candidate 的來源 job。
+- 進件：`retry-build-killed-repair`（#1338），repair build 被外力終止後，PR 已存在的 run 要有可受理的恢復動作。
