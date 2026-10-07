@@ -15568,11 +15568,14 @@ def _workflow_stage_execution_builder_context(
     同步，等於重現本票要修的那個 bug。
 
     回傳 ``(builder_jobs, builder_job_id, manager_gate_ledger)``：
-    ``builder_jobs`` 是本 run 目前綁定 candidate 的完整 builder job 列表
+    ``builder_jobs`` 是本 run 目前綁定 candidate 的成功來源 job 列表：builder
+    jobs，以及 `openspec-archive`／`main-sync-autosync` Manager jobs
     （`_dispatch_workflow_card` 後續還要拿它推 branch／base 等，不是只有
     這裡用），``builder_job_id`` 是其中最新一筆的 job_id（沒有則 None），
-    ``manager_gate_ledger`` 只在 ``step.phase == "verify"`` 且找得到對應
-    build 卡的 gate ledger 時才非 None。
+    ``manager_gate_ledger`` 只在 ``step.phase == "verify"`` 且找得到 exact
+    Candidate 對應 build 卡的 gate ledger 時才非 None。自動同步會產生新的
+    Candidate；舊 build ledger 不再提供給 verifier，verification 卡須自行對新
+    Candidate 執行檢查。
     """
 
     builder_jobs = [
@@ -15584,7 +15587,8 @@ def _workflow_stage_execution_builder_context(
             or (
                 job.get("persona") == "manager"
                 and job.get("workflow_phase") == "ship"
-                and job.get("workflow_card") == "openspec-archive"
+                and job.get("workflow_card")
+                in {"openspec-archive", "main-sync-autosync"}
             )
         )
         and job.get("status") == "exited"
@@ -16826,8 +16830,9 @@ def _dispatch_workflow_card(
             # authority map／input snapshot／output baseline／sandbox clone 源／tree
             # snapshot 五個用途全部拿到同一棵樹，順序問題因此不是被「解決」而是**不存在**。
             #
-            # branch 與底下 job 記錄用的那一個是同一條推導（前一張 build 卡的 branch；
-            # post-archive 時是 `_record_manager_ship_job()` 記在 archive 卡上的那一條）。
+            # branch 與底下 job 記錄用的那一個是同一條推導：exact Candidate 的
+            # source job 可是前一張 build 卡，也可是 archive／main-sync autosync
+            # 的 Manager ship job。
             reviewer_branch = (
                 str(builder_jobs[-1]["branch"])
                 if builder_jobs and isinstance(builder_jobs[-1].get("branch"), str)

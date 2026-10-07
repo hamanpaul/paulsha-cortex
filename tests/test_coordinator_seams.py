@@ -56,6 +56,37 @@ def test_worktree_creator_reuses_existing_branch_only_when_it_is_base_ancestor(
     assert _git(target, "branch", "--show-current") == branch
 
 
+def test_worktree_creator_copies_effective_global_identity_to_clone_local_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _repo(tmp_path)
+    global_config = tmp_path / "global.gitconfig"
+    global_config.write_text(
+        "[user]\n"
+        "\tname = Global Source Identity\n"
+        "\temail = global-source@example.invalid\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    for key in ("user.name", "user.email"):
+        _git(repo, "config", "--local", "--unset-all", key)
+
+    target = Path(
+        ScriptWorktreeCreator(repo=repo, wt_root=tmp_path / "worktrees").create(
+            "feature/31-terminal-lifecycle-canary",
+            job_id="31-terminal-lifecycle-canary",
+        )
+    )
+
+    assert _git(target, "config", "--local", "--get", "user.name") == "Global Source Identity"
+    assert (
+        _git(target, "config", "--local", "--get", "user.email")
+        == "global-source@example.invalid"
+    )
+
+
 def test_worktree_creator_rejects_diverged_existing_branch_without_moving_it(
     tmp_path: Path,
 ) -> None:
