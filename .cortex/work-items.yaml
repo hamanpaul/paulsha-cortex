@@ -1801,3 +1801,11 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/workstreams/autosync-source-job-unify/todo.md'
     excludes: []
+  autosync-carry-forward-review:
+    title: 'autosync-carry-forward-review'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1356'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/autosync-carry-forward-review/todo.md'
+    excludes: []
