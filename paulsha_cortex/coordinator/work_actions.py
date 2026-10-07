@@ -4748,7 +4748,7 @@ def _candidate_tree_matching_archive_entries(
 
 
 _MAIN_SYNC_RETRYABLE_REASONS = frozenset(
-    {"candidate-behind-main", "candidate-conflicts-with-main"}
+    {"candidate-behind-main", "candidate-conflicts-with-main", "main-moving-too-fast"}
 )
 _MAIN_SYNC_STOP_REASONS = _MAIN_SYNC_RETRYABLE_REASONS | {"main-sync-unavailable"}
 

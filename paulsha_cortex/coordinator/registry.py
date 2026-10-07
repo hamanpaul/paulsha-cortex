@@ -6027,6 +6027,95 @@ class JobRegistry:
         self._persist()
         return self._copy_workflow_run(updated)
 
+    def _manager_reset_workflow_for_main_sync(
+        self,
+        run_id: str,
+        *,
+        expected_candidate: str,
+        expected_updated_at: str,
+        candidate_head: str,
+        steps: tuple[WorkflowStep, ...],
+        gate_refs: tuple[GateEvidenceRef, ...],
+        evidence_refs: tuple[str, ...],
+    ) -> WorkflowRun:
+        """Reopen only verify after Manager merged the probed exact main commit."""
+
+        index = self._find_workflow_run_index(run_id)
+        current = self._workflows[index]
+        verify_steps = [step for step in steps if step.phase == "verify"]
+        review_steps = [step for step in steps if step.phase == "review"]
+        if (
+            current.status != "ongoing"
+            or current.current_phase != "review"
+            or current.updated_at != expected_updated_at
+            or current.candidate_head != expected_candidate
+            or current.verified_head != expected_candidate
+            or not expected_candidate
+            or not candidate_head
+            or candidate_head == expected_candidate
+            or len(steps) != len(current.steps)
+            or {(step.phase, step.card, step.persona) for step in steps}
+            != {(step.phase, step.card, step.persona) for step in current.steps}
+            or not verify_steps
+            or not review_steps
+            or not all(step.gate_result == "passed" for step in verify_steps)
+            or not all(step.gate_result == "passed" for step in review_steps)
+            or any(
+                job.get("workflow_run_id") == current.run_id
+                and job.get("status") in ACTIVE_JOB_STATUSES
+                for job in self._jobs
+            )
+        ):
+            raise ValueError("main-sync Candidate reset compare-and-set failed")
+        next_steps = tuple(
+            replace(step, gate_result="pending") if step.phase == "verify" else step
+            for step in steps
+        )
+        refs_by_kind = {
+            ref.kind: ref for ref in gate_refs if ref.kind in {"brainstorm", "foreign-review"}
+        }
+        if "foreign-review" not in refs_by_kind:
+            raise ValueError("main-sync Candidate reset requires foreign review evidence")
+        receipts = dict(current.stage_reuse_receipts or {})
+        for step in current.steps:
+            if step.phase != "verify":
+                continue
+            prior = receipts.get(step.card)
+            if prior is None and step.gate_result == "pending":
+                continue
+            receipt: dict[str, Any] = {
+                "decision": "ineligible",
+                "receipt_schema_version": STAGE_REUSE_RECEIPT_SCHEMA_VERSION,
+                "reason": "main-sync-autosync",
+            }
+            if isinstance(prior, Mapping):
+                prior_key = prior.get("stage_execution_key") or prior.get("superseded_key")
+                if (
+                    isinstance(prior_key, str)
+                    and len(prior_key) == 64
+                    and all(char in "0123456789abcdef" for char in prior_key)
+                ):
+                    receipt["superseded_key"] = prior_key
+            receipts[step.card] = receipt
+        updated = replace(
+            current,
+            current_phase="verify",
+            steps=next_steps,
+            attempts={**current.attempts, "verify": current.attempts.get("verify", 0) + 1},
+            stage_reuse_receipts=receipts if receipts else current.stage_reuse_receipts,
+            gate_refs=tuple(refs_by_kind[kind] for kind in ("brainstorm", "foreign-review") if kind in refs_by_kind),
+            evidence_refs=tuple(dict.fromkeys((*current.evidence_refs, *evidence_refs))),
+            candidate_head=candidate_head,
+            verified_head=None,
+            facets=(),
+            needs_human_reason=None,
+            gate_status="running",
+            updated_at=_now_iso(),
+        )
+        self._workflows[index] = updated
+        self._persist()
+        return self._copy_workflow_run(updated)
+
     def _manager_reset_workflow_for_retry_build(
         self,
         run_id: str,

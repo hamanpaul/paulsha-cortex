@@ -19706,6 +19706,7 @@ def apply_workflow_action(
         main_sync = trusted.get("main_sync")
         evidence_ref = trusted.get("ref")
         evidence_hash = trusted.get("hash")
+        autosync = trusted.get("main_sync_autosync")
         context: dict[str, object] = {}
         evidence_refs: tuple[str, ...] = ()
         updated_evidence_refs = current.evidence_refs
@@ -19737,6 +19738,26 @@ def apply_workflow_action(
                 context["main_sync_evidence_hash"] = evidence_hash
                 result["evidence_hash"] = evidence_hash
             result["main_sync"] = dict(main_sync)
+        if isinstance(autosync, dict):
+            autosync_refs = tuple(
+                value
+                for value in (
+                    autosync.get("probe_evidence_ref"),
+                    autosync.get("evidence_ref"),
+                )
+                if isinstance(value, str) and value
+            )
+            evidence_refs = tuple(dict.fromkeys((*evidence_refs, *autosync_refs)))
+            updated_evidence_refs = tuple(
+                dict.fromkeys((*updated_evidence_refs, *autosync_refs))
+            )
+            context["main_sync_autosync"] = json.dumps(
+                autosync,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            result["main_sync_autosync"] = dict(autosync)
         diagnostic_code = (
             delivery_reason
             if delivery_reason in {"review-disposition-required", "review-threads-unresolved"}
@@ -19760,6 +19781,65 @@ def apply_workflow_action(
             ),
             result,
         )
+
+    def try_main_sync_autosync(
+        *,
+        current,
+        run_view,
+        candidate: str | None,
+        trusted: dict[str, object],
+        steps,
+        gate_refs,
+    ) -> dict[str, object] | None:
+        main_sync = trusted.get("main_sync")
+        if (
+            trusted.get("reason") != "candidate-behind-main"
+            or not isinstance(main_sync, dict)
+            or main_sync.get("outcome") != "clean-behind"
+            or not isinstance(candidate, str)
+        ):
+            return None
+        callback = getattr(ship_validator, "main_sync_autosync", None)
+        if not callable(callback):
+            return None
+        autosync = callback(run=run_view, candidate=candidate, stop=trusted)
+        if not isinstance(autosync, dict):
+            return None
+        trusted["main_sync_autosync"] = autosync
+        trusted["reason"] = autosync.get("reason") or "candidate-behind-main"
+        if autosync.get("outcome") != "merged":
+            return None
+        new_candidate = autosync.get("candidate_after")
+        evidence_refs = tuple(
+            value
+            for value in (
+                autosync.get("probe_evidence_ref"),
+                autosync.get("evidence_ref"),
+            )
+            if isinstance(value, str) and value
+        )
+        if (
+            not isinstance(new_candidate, str)
+            or not evidence_refs
+            or not isinstance(autosync.get("evidence_ref"), str)
+        ):
+            raise ValueError("main-sync autosync returned incomplete Candidate evidence")
+        updated = registry._manager_reset_workflow_for_main_sync(
+            current.run_id,
+            expected_candidate=candidate,
+            expected_updated_at=current.updated_at,
+            candidate_head=new_candidate,
+            steps=tuple(steps),
+            gate_refs=tuple(gate_refs),
+            evidence_refs=evidence_refs,
+        )
+        return {
+            "run_id": updated.run_id,
+            "current_phase": updated.current_phase,
+            "reason": "main-sync-autosync-reverify",
+            "candidate_head": updated.candidate_head,
+            "main_sync_autosync": autosync,
+        }
 
     if action == "refresh-completion":
         if not trusted_terminal:
@@ -19883,6 +19963,16 @@ def apply_workflow_action(
                         "reason": "delivery-in-progress",
                     }
                 if status == "needs_human":
+                    autosync_result = try_main_sync_autosync(
+                        current=current,
+                        run_view=current,
+                        candidate=current.candidate_head,
+                        trusted=trusted,
+                        steps=current.steps,
+                        gate_refs=current.gate_refs,
+                    )
+                    if autosync_result is not None:
+                        return autosync_result
                     (
                         delivery_reason,
                         evidence_refs,
@@ -20192,6 +20282,17 @@ def apply_workflow_action(
                             "reason": trusted.get("reason")
                             or ("delivery-in-progress" if status == "pending" else "delivery-needs-human"),
                         }
+                if status == "needs_human":
+                    autosync_result = try_main_sync_autosync(
+                        current=current,
+                        run_view=validation_run,
+                        candidate=candidate,
+                        trusted=trusted,
+                        steps=updated_steps,
+                        gate_refs=validation_run.gate_refs,
+                    )
+                    if autosync_result is not None:
+                        return autosync_result
                 if status == "passed":
                     review_kind = trusted["review_kind"]
                     by_kind.pop("maintainer-review" if review_kind == "copilot" else "copilot", None)
