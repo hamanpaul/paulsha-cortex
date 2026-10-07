@@ -10,6 +10,7 @@
 ### Fixed
 
 - **#1305 規劃依據與 workflow builder 寫入隔離**：brainstorm evidence 凍結完整規劃 artifact manifest（含 primary integration 未改寫的既有檔案），重驗改用其不可變內容並保留舊 run 相容路徑；direct、commit-required builder 以 bubblewrap 將 executor 寫入限制在自己的 worktree 與 linked Git 寫入目錄。job 結束時記錄 operator checkout 的 Git status 與規劃檔雜湊差異，並在 status／work show 顯示 job、變更欄位、狀態雜湊與受影響規劃檔（見 `changelog.d/worktree-containment-authority.md`）。
+- **cortex 進件：#1339、#1340、#1342**：PR 變動後 resume 失效、依賴牆鐘的測試、Copilot 修正輪數把同步 main 算進去；登記三個 work item 與 accepted todo（見 `changelog.d/cortex-intake-batch-20261007.md`）。
 - **#1336 clean-behind 自動同步後派出 verification**：成功的 `main-sync-autosync` Manager job 可作為 exact Candidate 的 reviewer 來源，verify tick 會沿用其 branch 並把新 Candidate 當作後續 build base；同步前 build ledger 綁定舊 Candidate，不會傳給 verifier，verification 對合併後 Candidate 自行執行檢查（見 `changelog.d/main-sync-reverify-builder-context.md`）。
 - **#1334 clean-behind 自動同步的 Git 身分**：merge 以 `-c user.name`／`-c user.email` 明確帶入設定的 `PSC_MAIN_SYNC_GIT_IDENTITY`（`Name <email>`）或來源 checkout 的有效身分；ship clone 複製來源 checkout 實際生效的身分；上限只計成功建立新 Candidate 的同步。
 - **cortex 進件：#1336 自動同步後 verification 找不到來源 job、#1338 被終止的 repair build 無法恢復**：登記 work item `main-sync-reverify-builder-context`、`retry-build-killed-repair` 與 accepted todo，交給 cortex 派工（見 `changelog.d/cortex-intake-1336.md`）。
