@@ -289,6 +289,9 @@ class WorkReadModelStore:
             stage_reuse = self._stage_reuse(item.repo, item.work_id)
             if stage_reuse:
                 envelope["stage_reuse"] = stage_reuse
+            main_sync_autosync = self._main_sync_autosync(item.repo, item.work_id)
+            if main_sync_autosync:
+                envelope["main_sync_autosync"] = main_sync_autosync
             return envelope
 
     def _stage_reuse(self, repo: str, work_id: str) -> dict:
@@ -299,6 +302,21 @@ class WorkReadModelStore:
             if not isinstance(observations, Mapping):
                 continue
             rows = observations.get("stage_reuse", {})
+            if not isinstance(rows, Mapping):
+                continue
+            found = rows.get(work_id)
+            if isinstance(found, Mapping) and found:
+                return dict(found)
+        return {}
+
+    def _main_sync_autosync(self, repo: str, work_id: str) -> dict:
+        for provider_id, provider in self._snapshot.providers.items():
+            if not provider_id.startswith("workflow:") or _provider_repo(provider_id) != repo:
+                continue
+            observations = provider.observations
+            if not isinstance(observations, Mapping):
+                continue
+            rows = observations.get("main_sync_autosync", {})
             if not isinstance(rows, Mapping):
                 continue
             found = rows.get(work_id)
