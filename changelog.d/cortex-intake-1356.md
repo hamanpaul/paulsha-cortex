@@ -1,0 +1,1 @@
+- 進件：`autosync-carry-forward-review`（#1356），autosync 後沿用舊 review 的 run 要能交付，review 與交付兩端語意一致。
