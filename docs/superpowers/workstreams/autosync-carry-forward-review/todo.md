@@ -16,9 +16,9 @@ work_item: autosync-carry-forward-review
 
 ## Tasks
 
-- [ ] **T1 RED**：端到端重現兩條路徑在交付端的失敗：A 的 `delivery requires the reviewed exact-candidate builder job`、B 的 `delivery requires one canonical review evidence job`。
-- [ ] **T2 全面稽核**：逐一檢查上列 14 處（以及任何以 `workflow_phase == "build"`／`persona == "builder"` 判定 candidate 來源的地方），凡是語意屬於「candidate 的來源 job」者，一律改用 #1345 的共用 helper；不屬於的，在 PR 中逐處說明理由。
-- [ ] **T3 選定路徑 B 的語意**（二選一，在 PR 中寫明理由）：(a) autosync 後一律重跑 code-review；或 (b) 交付端接受「review 針對 autosync 前的 candidate，且新 candidate 是它的 autosync 後代（candidate 自身 diff 不變）」，並在 evidence 記錄這條鏈。review 與交付兩端必須一致。
-- [ ] **T4 端到端到合併**：A 與 B 兩條路徑都要有測試，一路走到 ship 的 merge 判定（不能只到 review）；#1345 的行為不退化。
-- [ ] **T5 設計說明**：更新 #1311 相關文件，寫明 autosync 後重跑哪些卡，以及「candidate 來源 job」的單一定義。
-- [ ] **T6 文件**：新增 changelog fragment，並同步 `CHANGELOG.md [Unreleased]`。
+- [x] **T1 RED**：端到端重現兩條路徑在交付端的失敗：A 的 `delivery requires the reviewed exact-candidate builder job`、B 的 `delivery requires one canonical review evidence job`。
+- [x] **T2 全面稽核**：逐一檢查上列 14 處（以及任何以 `workflow_phase == "build"`／`persona == "builder"` 判定 candidate 來源的地方），凡是語意屬於「candidate 的來源 job」者，一律改用 #1345 的共用 helper；不屬於的，在 PR 中逐處說明理由。
+- [x] **T3 選定路徑 B 的語意**（二選一，在 PR 中寫明理由）：(a) autosync 後一律重跑 code-review；或 (b) 交付端接受「review 針對 autosync 前的 candidate，且新 candidate 是它的 autosync 後代（candidate 自身 diff 不變）」，並在 evidence 記錄這條鏈。review 與交付兩端必須一致。
+- [x] **T4 端到端到合併**：A 與 B 兩條路徑都要有測試，一路走到 ship 的 merge 判定（不能只到 review）；#1345 的行為不退化。
+- [x] **T5 設計說明**：更新 #1311 相關文件，寫明 autosync 後重跑哪些卡，以及「candidate 來源 job」的單一定義。
+- [x] **T6 文件**：新增 changelog fragment，並同步 `CHANGELOG.md [Unreleased]`。
