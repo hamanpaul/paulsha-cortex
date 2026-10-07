@@ -1,0 +1,1 @@
+- 進件：`main-sync-committer-identity`（#1334），clean-behind 自動同步的 merge 明確帶 committer 身分，ship worktree 繼承實際生效的身分。

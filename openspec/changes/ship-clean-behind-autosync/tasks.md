@@ -1,22 +1,3 @@
----
-status: accepted
-work_item: ship-clean-behind-autosync
----
-
-# ship 遇到 clean-behind 時自動同步 main，只重跑 verify 與 ship probe
-
-## Boundary
-
-- Issue：`hamanpaul/paulsha-cortex#1311`。
-- 現況：`paulsha_cortex/coordinator/work_bridge.py` 的 `_main_sync_stop_result` 把 main-sync probe 的 relation
-  `clean-behind`（落後 main、沒有衝突）轉成 needs_human `candidate-behind-main`，`next_actions` 只有
-  `retry-build`／`abandon`。之後要整輪重跑 build、verify、review，一輪約一小時。
-- 2026-10-06 dogfood 現場：`copilot-probe-reap`（#1297，PR #1301）跑了三輪 build → verify → review → ship，
-  每次到 ship 都落後 main；`upgrade-venv-umask`（#1295）、`system-deploy-ops-defects`（#1291）、
-  `installer-launch-authorities`（#1289）也都遇到，每次都要 operator 手動送 `retry-build`。
-- exact-candidate 純度不變：merge 的仍必須是 verify 過的那個 exact Candidate。
-- 有衝突（`candidate-conflicts-with-main`）或 probe 失敗時，維持現行行為。
-
 ## Tasks
 
 - [x] **T1 RED**：新增測試，固定以下行為（現行應失敗）：

@@ -18,6 +18,7 @@ import yaml
 
 from paulsha_cortex.config import paths
 from paulsha_cortex.coordinator import candidate_base
+from paulsha_cortex.coordinator import verification
 from paulsha_cortex.coordinator import quota_admission as quota_admission_module
 from paulsha_cortex.coordinator.diagnostics import diagnostic_reason
 from paulsha_cortex.github_rate_limit import is_auth_signal, is_rate_limit_signal
@@ -528,6 +529,7 @@ class WorkflowRegistryProvider:
             candidate_git_bases: dict[str, dict[str, object]] = {}
             quota_decisions: dict[str, dict[str, object]] = {}
             stage_reuse: dict[str, dict[str, object]] = {}
+            main_sync_autosync: dict[str, dict[str, object]] = {}
             diagnostics: list[str] = []
             validated_completions: dict[str, list[dict[str, object]]] = {}
             for row in rows:
@@ -616,6 +618,21 @@ class WorkflowRegistryProvider:
                         stage_reuse[work_id] = {"run_id": run_id, **reuse_projection}
                     elif work_id not in stage_reuse:
                         stage_reuse[work_id] = {"run_id": run_id, **reuse_projection}
+                autosync_projection = _main_sync_autosync_row(
+                    row,
+                    state_path=self.state_path,
+                )
+                if autosync_projection is not None:
+                    if row.get("status", "ongoing") not in _TERMINAL_WORKFLOW_RUN_STATUSES:
+                        main_sync_autosync[work_id] = {
+                            "run_id": run_id,
+                            **autosync_projection,
+                        }
+                    elif work_id not in main_sync_autosync:
+                        main_sync_autosync[work_id] = {
+                            "run_id": run_id,
+                            **autosync_projection,
+                        }
                 # #731 (C)：候選 git base（真的那個 40-hex commit SHA）與落後
                 # mirror 上 origin/main 的距離。同樣走 observations 通道，理由
                 # 與上面兩段一致（新增 row 欄位會讓整份 projection degraded）。
@@ -690,6 +707,7 @@ class WorkflowRegistryProvider:
             "candidate_git_bases": candidate_git_bases,
             "quota_decisions": quota_decisions,
             "stage_reuse": stage_reuse,
+            "main_sync_autosync": main_sync_autosync,
         }
         if workflow_next_actions:
             observations["workflow_next_actions"] = workflow_next_actions
@@ -849,6 +867,96 @@ def _stage_reuse_row(row: Mapping[str, Any]) -> dict[str, object] | None:
             for card, receipt in receipts.items()
             if isinstance(receipt, Mapping)
         }
+    }
+
+
+def _main_sync_autosync_row(
+    row: Mapping[str, Any], *, state_path: str | Path
+) -> dict[str, object] | None:
+    """Validate and project run-linked clean-behind synchronization evidence."""
+
+    run_id = row.get("run_id")
+    refs = row.get("evidence_refs")
+    if not isinstance(run_id, str) or not isinstance(refs, (list, tuple)):
+        return None
+    directory = Path(state_path).resolve().parent / "evidence" / "main-sync-autosync"
+    events: list[dict[str, object]] = []
+    for reference in refs:
+        if not isinstance(reference, str) or "/evidence/main-sync-autosync/" not in reference:
+            continue
+        path = Path(reference)
+        if (
+            not path.is_absolute()
+            or path.parent != directory
+            or path.is_symlink()
+            or not path.is_file()
+            or re.fullmatch(r"[0-9a-f]{64}\.json", path.name) is None
+        ):
+            continue
+        try:
+            envelope = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        payload = envelope.get("payload") if isinstance(envelope, Mapping) else None
+        if (
+            not isinstance(envelope, Mapping)
+            or set(envelope) != {"payload", "hash"}
+            or not isinstance(payload, Mapping)
+            or payload.get("schema") != "cortex-main-sync-autosync/v1"
+            or payload.get("run_id") != run_id
+            or payload.get("outcome") not in {
+                "merged",
+                "limit-exceeded",
+                "autosync-disabled",
+                "autosync-limit-invalid",
+                "main-advanced-during-sync",
+                "merge-failed",
+                "harvest-failed",
+            }
+            or isinstance(payload.get("sync_number"), bool)
+            or not isinstance(payload.get("sync_number"), int)
+            or payload.get("sync_number") < 1
+        ):
+            continue
+        digest = verification.canonical_json_hash(dict(payload))
+        if envelope.get("hash") != digest or path.stem != digest:
+            continue
+        before = payload.get("candidate_before")
+        main_head = payload.get("main_head")
+        after = payload.get("candidate_after")
+        if (
+            not isinstance(before, str)
+            or verification.SAFE_SHA_RE.fullmatch(before) is None
+            or not isinstance(main_head, str)
+            or verification.SAFE_SHA_RE.fullmatch(main_head) is None
+            or (
+                payload.get("outcome") == "merged"
+                and (not isinstance(after, str) or verification.SAFE_SHA_RE.fullmatch(after) is None)
+            )
+            or (payload.get("outcome") != "merged" and after is not None)
+        ):
+            continue
+        event: dict[str, object] = {
+            "sync_number": payload["sync_number"],
+            "outcome": payload["outcome"],
+            "candidate_before": before,
+            "main_head": main_head,
+            "candidate_after": after,
+        }
+        for key in ("failure_reason", "failure_detail", "observed_main_head", "limit"):
+            value = payload.get(key)
+            if value is not None:
+                event[key] = value
+        events.append(event)
+    if not events:
+        return None
+    return {
+        "count": sum(event["outcome"] == "merged" for event in events),
+        "limit": next(
+            (event["limit"] for event in reversed(events) if "limit" in event),
+            None,
+        ),
+        "events": events,
     }
 
 
