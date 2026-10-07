@@ -8962,6 +8962,50 @@ def _operator_checkout_violation(
     }
 
 
+def _operator_checkout_violation_diagnostic_context(
+    event: Mapping[str, object],
+) -> dict[str, str]:
+    """Project useful, path-safe audit details into the workflow run reason."""
+
+    context: dict[str, str] = {}
+    for snapshot_name, suffix in (("baseline", "before"), ("current", "after")):
+        snapshot = event.get(snapshot_name)
+        if not isinstance(snapshot, Mapping):
+            continue
+        digest = snapshot.get("git_status_sha256")
+        if isinstance(digest, str) and digest:
+            context[f"operator_checkout_git_status_{suffix}"] = digest
+
+    baseline = event.get("baseline")
+    current = event.get("current")
+    before_rows = baseline.get("planning_authority") if isinstance(baseline, Mapping) else None
+    after_rows = current.get("planning_authority") if isinstance(current, Mapping) else None
+
+    def _authority_map(rows: object) -> dict[str, str]:
+        if not isinstance(rows, (list, tuple)):
+            return {}
+        return {
+            row["ref"]: row["sha256"]
+            for row in rows
+            if isinstance(row, Mapping)
+            and isinstance(row.get("ref"), str)
+            and isinstance(row.get("sha256"), str)
+        }
+
+    before = _authority_map(before_rows)
+    after = _authority_map(after_rows)
+    changed_refs = sorted(
+        ref for ref in set(before) | set(after) if before.get(ref) != after.get(ref)
+    )
+    if changed_refs:
+        shown = changed_refs[:4]
+        rendered = ",".join(shown)
+        if len(changed_refs) > len(shown):
+            rendered += f",+{len(changed_refs) - len(shown)} more"
+        context["operator_checkout_planning_authority_refs"] = rendered
+    return context
+
+
 def _record_operator_checkout_violation(registry, run, job) -> dict[str, object] | None:
     baseline = job.get("workflow_operator_checkout_baseline")
     if not isinstance(baseline, Mapping):
@@ -8977,11 +9021,23 @@ def _record_operator_checkout_violation(registry, run, job) -> dict[str, object]
         )
     current = registry.get_workflow_run(run.run_id)
     existing_reason = current.needs_human_reason
-    if not (
+    changed_fields = ",".join(str(item) for item in event["changed_fields"])
+    audit_context = _operator_checkout_violation_diagnostic_context(event)
+    projected_context = {
+        "job_id": str(job.get("job_id") or ""),
+        "changed_fields": changed_fields,
+        **audit_context,
+    }
+    existing_context = (
+        existing_reason.get("context") if isinstance(existing_reason, Mapping) else None
+    )
+    context_is_current = (
         isinstance(existing_reason, Mapping)
         and existing_reason.get("reason") == "operator-checkout-mutated"
-    ):
-        changed_fields = ",".join(str(item) for item in event["changed_fields"])
+        and isinstance(existing_context, Mapping)
+        and all(existing_context.get(key) == value for key, value in projected_context.items())
+    )
+    if not context_is_current:
         registry._manager_update_workflow_run(
             run.run_id,
             facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
@@ -8994,6 +9050,7 @@ def _record_operator_checkout_violation(registry, run, job) -> dict[str, object]
                 card=job.get("workflow_card"),
                 job_id=job.get("job_id"),
                 changed_fields=changed_fields,
+                **audit_context,
             ),
         )
     return {

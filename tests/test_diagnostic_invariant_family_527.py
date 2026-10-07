@@ -1173,3 +1173,65 @@ def test_issue_527_work_show_text_mode_prints_the_reason(capsys) -> None:
     assert "worktree target already exists" in out
     assert "run_id: workflow-abc" in out
     assert "evidence: /tmp/evidence/planning-recovery/x.json" in out
+
+
+def test_operator_checkout_violation_details_reach_status_and_work_show(capsys) -> None:
+    from paulsha_cortex import cli
+    from paulsha_cortex.porcelain import inspect as porcelain_inspect
+
+    blocking_reason = {
+        "reason": "operator-checkout-mutated",
+        "detail": "builder job completed after the operator checkout changed",
+        "source": "manager.resume_workflow_run:operator-checkout",
+        "context": {
+            "job_id": "job-1305",
+            "changed_fields": "git_status,planning_authority",
+            "operator_checkout_git_status_before": "a" * 64,
+            "operator_checkout_git_status_after": "b" * 64,
+            "operator_checkout_planning_authority_refs": "todo.md",
+        },
+    }
+    porcelain_inspect._print_status(
+        {
+            "updated_at": "2026-10-07T00:00:00Z",
+            "attention": [
+                {
+                    "kind": "workflow_run",
+                    "run_id": "workflow-1305",
+                    "slice_state": "needs_human",
+                    "blocking_reason": blocking_reason,
+                }
+            ],
+        }
+    )
+    status_output = capsys.readouterr().out
+    assert "operator_checkout_violation: job_id=job-1305" in status_output
+    assert "changed_fields=git_status,planning_authority" in status_output
+    assert "operator_checkout_git_status: baseline=" in status_output
+    assert "operator_checkout_planning_authority: changed_refs=todo.md" in status_output
+
+    class _FakeClient:
+        def request(self, request):
+            assert request["kind"] == "get_work_item"
+            return {
+                "ok": True,
+                "data": {
+                    "item": {
+                        "work_id": "worktree-containment-authority",
+                        "state": "on-going",
+                        "title": "Containment audit",
+                        "repo": "hamanpaul/paulsha-cortex",
+                        "phase": "build",
+                    },
+                    "blocking_reason": {"run_id": "workflow-1305", **blocking_reason},
+                },
+            }
+
+    assert cli._work_read_main(
+        ["work", "show", "worktree-containment-authority"], work_client=_FakeClient()
+    ) == 0
+    work_output = capsys.readouterr().out
+    assert "operator_checkout_violation: job_id=job-1305" in work_output
+    assert "changed_fields=git_status,planning_authority" in work_output
+    assert "operator_checkout_git_status: baseline=" in work_output
+    assert "operator_checkout_planning_authority: changed_refs=todo.md" in work_output

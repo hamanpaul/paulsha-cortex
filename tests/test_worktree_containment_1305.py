@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from types import SimpleNamespace
 from pathlib import Path
+
+import pytest
 
 from paulsha_cortex.coordinator import manager
 from paulsha_cortex.coordinator.launcher import (
@@ -11,6 +14,43 @@ from paulsha_cortex.coordinator.launcher import (
     _direct_builder_state_dir,
 )
 from paulsha_cortex.coordinator.registry import JobRegistry
+
+
+@pytest.mark.parametrize("executor_name", ("claude", "codex", "copilot", "agy"))
+def test_installed_executor_version_runs_under_direct_builder_containment(
+    executor_name: str,
+    tmp_path: Path,
+) -> None:
+    if shutil.which("bwrap") is None:
+        pytest.skip("bubblewrap is not installed")
+    executable = shutil.which(executor_name)
+    if executable is None:
+        pytest.skip(f"{executor_name} is not installed")
+
+    worktree = tmp_path / "candidate"
+    (worktree / ".git").mkdir(parents=True)
+    env = {
+        **os.environ,
+        "PSC_REPO_ROOT": str(worktree),
+        "PSC_JOB_ID": f"containment-smoke-{executor_name}",
+    }
+    result = subprocess.run(
+        _bubblewrap_worktree_argv([executable, "--version"], str(worktree)),
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+    )
+
+    if (
+        executor_name == "copilot"
+        and result.returncode == 77
+        and "copilot is disabled by the owner" in result.stderr
+    ):
+        pytest.skip("Copilot is explicitly disabled by the local owner wrapper")
+    assert result.returncode == 0, result.stderr
+    assert (result.stdout or result.stderr).strip()
 
 
 def test_direct_builder_can_write_its_worktree_but_not_operator_checkout(
@@ -154,7 +194,10 @@ def test_operator_checkout_drift_is_recorded_on_job_and_workflow(
         work_id="work-item",
         current_phase="build",
         facets=(),
-        needs_human_reason=None,
+        needs_human_reason={
+            "reason": "operator-checkout-mutated",
+            "context": {"job_id": "work-item-1", "changed_fields": "git_status,planning_authority"},
+        },
     )
 
     class _Registry:
@@ -187,3 +230,9 @@ def test_operator_checkout_drift_is_recorded_on_job_and_workflow(
     }
     assert "needs_human" in run.facets
     assert run.needs_human_reason["reason"] == "operator-checkout-mutated"
+    context = run.needs_human_reason["context"]
+    assert context["job_id"] == "work-item-1"
+    assert context["changed_fields"] == "git_status,planning_authority"
+    assert context["operator_checkout_git_status_before"] == baseline["git_status_sha256"]
+    assert context["operator_checkout_git_status_after"] == event["current"]["git_status_sha256"]
+    assert context["operator_checkout_planning_authority_refs"] == "todo.md"

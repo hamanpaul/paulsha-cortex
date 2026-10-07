@@ -9,6 +9,7 @@ from typing import Any, Sequence
 from paulsha_cortex.config import paths
 from paulsha_cortex.control.client import read_status
 from paulsha_cortex.coordinator import autonomy
+from paulsha_cortex.coordinator.diagnostics import operator_checkout_violation_lines
 from paulsha_cortex.coordinator.registry import JobRegistry
 from paulsha_cortex.doctor import run_doctor
 from paulsha_cortex.monitor.config import default_socket_path, load_config
@@ -146,6 +147,8 @@ def _print_status(status: dict[str, Any]) -> None:
             f"  needs_human[{subject}]: {blocking.get('reason')}: {blocking.get('detail')} "
             f"(source={blocking.get('source')})\n"
         )
+        for line in operator_checkout_violation_lines(blocking):
+            sys.stdout.write(line + "\n")
         for ref in blocking.get("evidence_refs") or []:
             sys.stdout.write(f"    evidence: {ref}\n")
     # #840：quota-aware admission 決策與額度等待來源。文字模式比照上面

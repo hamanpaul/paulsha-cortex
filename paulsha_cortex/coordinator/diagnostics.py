@@ -294,6 +294,44 @@ def diagnostic_reason(
     )
 
 
+def operator_checkout_violation_lines(
+    reason_payload: Mapping[str, Any] | None,
+    *,
+    indent: str = "  ",
+) -> tuple[str, ...]:
+    """Render the bounded operator-checkout audit summary for status/work show."""
+
+    if (
+        not isinstance(reason_payload, Mapping)
+        or reason_payload.get("reason") != "operator-checkout-mutated"
+    ):
+        return ()
+    context = reason_payload.get("context")
+    if not isinstance(context, Mapping):
+        return ()
+
+    job_id = context.get("job_id")
+    changed_fields = context.get("changed_fields")
+    if not isinstance(job_id, str) or not job_id:
+        job_id = "-"
+    if not isinstance(changed_fields, str) or not changed_fields:
+        changed_fields = "-"
+    lines = [
+        f"{indent}operator_checkout_violation: job_id={job_id} changed_fields={changed_fields}"
+    ]
+
+    baseline = context.get("operator_checkout_git_status_before")
+    current = context.get("operator_checkout_git_status_after")
+    if isinstance(baseline, str) or isinstance(current, str):
+        lines.append(
+            f"{indent}operator_checkout_git_status: baseline={baseline or '-'} current={current or '-'}"
+        )
+    changed_refs = context.get("operator_checkout_planning_authority_refs")
+    if isinstance(changed_refs, str) and changed_refs:
+        lines.append(f"{indent}operator_checkout_planning_authority: changed_refs={changed_refs}")
+    return tuple(lines)
+
+
 def coerce_diagnostic_reason(value: object) -> DiagnosticReason | None:
     """把 registry 呼叫端傳進來的值正規化成 :class:`DiagnosticReason`。
 

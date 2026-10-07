@@ -11,6 +11,8 @@ from importlib import resources
 from pathlib import Path
 from typing import Sequence
 
+from paulsha_cortex.coordinator.diagnostics import operator_checkout_violation_lines
+
 _USAGE = "usage: cortex [-h] [--version] <command> [<args>...]\n"
 _HELP = """\
 usage: cortex [-h] [--version] <command> [<args>...]
@@ -495,6 +497,8 @@ def _work_read_main(
             print(f"  source: {blocking.get('source')}")
             if blocking.get("run_id"):
                 print(f"  run_id: {blocking.get('run_id')}")
+            for line in operator_checkout_violation_lines(blocking):
+                print(line)
             for ref in blocking.get("evidence_refs") or []:
                 print(f"  evidence: {ref}")
         # #731 (C)：候選 git base。過去這個事實只存在於候選 worktree 的 `.git`
