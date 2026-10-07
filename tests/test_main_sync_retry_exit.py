@@ -19,6 +19,9 @@ from test_main_probe_gate_987 import (
 
 
 def _main_sync_stop(tmp_path, monkeypatch):
+    # These cases exercise the manual retry-build fallback after autosync is
+    # explicitly disabled; clean-behind now synchronizes automatically by default.
+    monkeypatch.setenv("PSC_MAIN_SYNC_AUTOSYNC_MAX", "0")
     harness = _ship_harness(
         tmp_path,
         monkeypatch,
