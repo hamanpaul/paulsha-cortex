@@ -8,7 +8,6 @@ import multiprocessing
 import os
 from pathlib import Path
 from types import SimpleNamespace
-import time
 
 import pytest
 
@@ -24,6 +23,18 @@ FIXTURES = Path(__file__).parent / "fixtures" / "patchmud"
 REPORT_PATH = FIXTURES / "report-v2" / "positive.json"
 REPORT_REVISION = "421fadc7dc16b6ee9020bdc2333ff6fe856accaa"
 NOW = "2026-09-26T00:00:01Z"
+
+
+def _freeze_qualification_clock(monkeypatch) -> datetime:
+    from paulsha_cortex.coordinator import qualification_lifecycle
+
+    parse_now = qualification_lifecycle._parse_now
+
+    def parse_fixed_default(now=None):
+        return parse_now(NOW if now is None else now)
+
+    monkeypatch.setattr(qualification_lifecycle, "_parse_now", parse_fixed_default)
+    return datetime.fromisoformat(NOW.replace("Z", "+00:00"))
 
 
 def _report() -> dict:
@@ -845,7 +856,7 @@ def test_q04_operator_approve_cli_requires_confirmation_and_writes_receipt(
         "paulsha_cortex.coordinator.qualification_lifecycle.QualificationStore",
         lambda: store,
     )
-    now = datetime.now(timezone.utc)
+    now = _freeze_qualification_clock(monkeypatch)
     reviewed = now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
     expiry = (now.replace(microsecond=0) + timedelta(days=1)).isoformat().replace("+00:00", "Z")
     args = [
@@ -895,6 +906,7 @@ def test_q04_operator_approve_revoke_cli_survives_manager_only_receipt_index_acl
         "paulsha_cortex.coordinator.qualification_lifecycle.QualificationStore",
         lambda: store,
     )
+    now = _freeze_qualification_clock(monkeypatch)
 
     registry_path = store.paths.operator_receipt_registry_path
     registry_path.parent.mkdir(parents=True, exist_ok=True)
@@ -903,9 +915,15 @@ def test_q04_operator_approve_revoke_cli_survives_manager_only_receipt_index_acl
     )
     registry_path.chmod(0o000)
     try:
-        now = datetime.now(timezone.utc)
         reviewed = now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
         expiry = (now.replace(microsecond=0) + timedelta(days=1)).isoformat().replace("+00:00", "Z")
+        future_reviewed = (now + timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
+        with pytest.raises(ValueError, match="reviewed_at timestamp is in the future"):
+            store.issue_operator_receipt(
+                imported["candidate_id"], verdict="approved", actor="operator-acl-sep",
+                reason="future timestamp is rejected", policy_revision="qualification-policy-v3",
+                reviewed_at=future_reviewed, expires_at=expiry,
+            )
         approve_args = [
             "qualification", "approve", imported["candidate_id"], "--actor", "operator-acl-sep",
             "--reason", "ACL 分離下驗證 operator 仍能核可", "--policy-revision", "qualification-policy-v3",
@@ -928,9 +946,7 @@ def test_q04_operator_approve_revoke_cli_survives_manager_only_receipt_index_acl
             for entry in roster_entries
         )
 
-        # revoked_at 不可晚於真實牆鐘時間（CLI 未傳 now= 覆寫，issue_operator_receipt
-        # 一律用 datetime.now() 校驗「reviewed_at 不能在未來」)；沿用 approve 當下的
-        # reviewed 時間即可，此刻已是過去。
+        # CLI 未傳 now=；沿用 approve 當下的 reviewed 時間，並由固定時鐘驗證邊界。
         revoke_args = [
             "qualification", "revoke", imported["candidate_id"], "--actor", "operator-acl-sep-revoke",
             "--reason", "ACL 分離下驗證 operator 仍能撤銷", "--policy-revision", "qualification-policy-v3",
@@ -1704,6 +1720,7 @@ def test_manager_reads_exact_roster_query_not_identity_attribute(monkeypatch) ->
 def test_q01_live_store_lookup_allows_then_revoke_blocks_manager_enforce(tmp_path: Path, monkeypatch) -> None:
     from paulsha_cortex.coordinator import manager, qualification_lifecycle
 
+    reviewed_at = _freeze_qualification_clock(monkeypatch).replace(microsecond=0)
     identity = SimpleNamespace(
         executor="copilot", model_id="fixture-model", capabilities=("build",),
         independence_domain="builder-a",
@@ -1734,7 +1751,6 @@ def test_q01_live_store_lookup_allows_then_revoke_blocks_manager_enforce(tmp_pat
     candidate = json.loads(
         (store.paths.candidates_root / f"{imported['candidate_id']}.json").read_text(encoding="utf-8")
     )["payload"]
-    reviewed_at = datetime.now(timezone.utc).replace(microsecond=0)
     reviewed = reviewed_at.isoformat().replace("+00:00", "Z")
     expires = (reviewed_at + timedelta(days=1)).isoformat().replace("+00:00", "Z")
     _review(

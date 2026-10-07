@@ -52,7 +52,7 @@
   - [x] RED：依 accepted `execution-profile-schema-core` plan 新增 `tests/test_execution_profile_schema_core.py`，鎖定虛構 descriptor／原生 effort、三層 plane round-trip 與 observed/actual key 缺口；目前 production module 尚未實作，focused pytest 以 6 failures／exit 1 呈現 RED，T01/T02 source 與後續 GREEN 仍待完成。
   - [x] GREEN：新增 `paulsha_cortex/coordinator/execution_profile.py` 純 schema／canonical-key core，完成 immutable descriptor/profile、原生 effort grammar、三層 tagged values、typed D4 projection／framing、actual unknown fail-closed 與 D5 bounded validation；focused pytest 6 passed。production routing、qualification、migration、installed/live 仍未完成。
 - [ ] 3.4 實作 PatchMUD versioned report consumer、legacy migration 與 profile/cohort/role/coverage 驗證。
-- [ ] 3.5 由 #842 實作 qualification candidate→review receipt→approved roster 發布鏈；保留 operator 核可與 independence policy，不擴 #581 原scope。
+- [x] 3.5 由 #842 實作 qualification candidate→review receipt→approved roster 發布鏈；保留 operator 核可與 independence policy，不擴 #581 原scope。
 - [ ] 3.6 實作安全 model register/probe 操作面與 TTL、角色擴充契約；探活不暗中消耗無上限額度。
 - [ ] 3.7 定義 pool/account 非機敏 identity、instance authority 與所有權邊界，為共享 admission 建 fixture。
 

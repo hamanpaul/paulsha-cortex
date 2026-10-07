@@ -13,6 +13,6 @@ work_item: qualification-test-fixed-clock
 
 ## Tasks
 
-- [ ] **T1 固定時鐘**：測試改為注入固定的 `now`（或可控的 clock），以固定值驗證 `reviewed_at` 的上下界。
-- [ ] **T2 掃描同類**：同一檔案及相關 helper 中其他依賴牆鐘的比較，一併改為注入。
-- [ ] **T3 文件**：新增 changelog fragment，並同步 `CHANGELOG.md [Unreleased]`。
+- [x] **T1 固定時鐘**：測試改為注入固定的 `now`（或可控的 clock），以固定值驗證 `reviewed_at` 的上下界。
+- [x] **T2 掃描同類**：同一檔案及相關 helper 中其他依賴牆鐘的比較，一併改為注入。
+- [x] **T3 文件**：新增 changelog fragment，並同步 `CHANGELOG.md [Unreleased]`。
