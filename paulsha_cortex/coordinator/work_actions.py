@@ -656,8 +656,14 @@ def _intake_action(
         # after their real workflow cards are dispatched. The preview marks
         # shared defaults explicitly so a partial run override cannot look like
         # an unresolved or incomplete model chain in the intake response.
-        resolved_chain = resolve_model_chain(run.get("model_chain_override"))
-        result["resolved_model_chain"] = resolved_chain
+        try:
+            resolved_chain = resolve_model_chain(run.get("model_chain_override"))
+        except (RuntimeError, ValueError) as exc:
+            # The claim is already durable. A preview failure must not turn a
+            # successful intake into an apparent action failure or hide its run.
+            result["resolved_model_chain_error"] = str(exc)
+        else:
+            result["resolved_model_chain"] = resolved_chain
     return result
 
 

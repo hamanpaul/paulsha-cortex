@@ -5721,6 +5721,39 @@ def test_intake_without_link_args_starts_using_existing_confirmed_authority(
     assert len(registry.list_workflow_runs()) == 1
 
 
+def test_intake_model_chain_preview_failure_is_best_effort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+
+    def unresolved_chain(*_args, **_kwargs):
+        raise ValueError("reviewer identity cannot be resolved")
+
+    monkeypatch.setattr(work_actions, "resolve_model_chain", unresolved_chain)
+
+    intake = work_actions.execute_work_action(
+        args={"action": "intake", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=tmp_path / "runs.json",
+        now=lambda: 200,
+        workflow_registry=registry,
+        workflow_starter=work_actions._fallback_workflow_starter(
+            registry, tmp_path / "runs.json"
+        ),
+    )
+
+    result = intake["result"]
+    assert result["action"] == "claim"
+    assert result["run"]["run_id"]
+    assert result["resolved_model_chain_error"] == (
+        "reviewer identity cannot be resolved"
+    )
+    assert "resolved_model_chain" not in result
+    assert len(registry.list_workflow_runs()) == 1
+
+
 def test_intake_writes_missing_link_then_claims_using_preexisting_issue_authority(
     tmp_path: Path,
 ) -> None:
