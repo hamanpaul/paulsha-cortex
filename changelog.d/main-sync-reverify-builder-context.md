@@ -1,0 +1,1 @@
+#1336 clean-behind 自動同步後派出 verification：將成功且綁定新 Candidate 的 `main-sync-autosync` Manager job 納入 reviewer 來源，讓 verification tick 可取得 builder context、branch 與 candidate base。同步前 build ledger 綁的是舊 Candidate，不傳給 verifier；verification 對合併後 Candidate 自行執行檢查。

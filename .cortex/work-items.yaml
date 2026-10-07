@@ -1737,3 +1737,35 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/workstreams/reviewer-sandbox-retention/todo.md'
     excludes: []
+  delivery-authority-refresh:
+    title: 'delivery-authority-refresh'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1322'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/delivery-authority-refresh/todo.md'
+    excludes: []
+  main-sync-committer-identity:
+    title: 'main-sync-committer-identity'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1334'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/main-sync-committer-identity/todo.md'
+    excludes: []
+  main-sync-reverify-builder-context:
+    title: 'main-sync-reverify-builder-context'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1336'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/main-sync-reverify-builder-context/todo.md'
+    excludes: []
+  retry-build-killed-repair:
+    title: 'retry-build-killed-repair'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1338'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/retry-build-killed-repair/todo.md'
+    excludes: []
