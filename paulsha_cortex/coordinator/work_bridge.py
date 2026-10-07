@@ -3355,44 +3355,72 @@ def build_production_ship_validator(
             candidate=candidate,
         ) in {"merged", "done"}
         if not closure_only:
-            existing = _run_exact_candidate_preflight(
-                worktree=worktree,
-                branch=branch,
-                candidate=candidate,
-                command=load_preflight_command(),
-                request=PreflightRequest(
-                    pr_number=number,
-                    skip_tests=_candidate_skip_tests_request(
-                        worktree=worktree, candidate=candidate, now=now
-                    ),
-                ),
-                runner=runner,
-                now=now,
+            from . import work_actions
+
+            candidate_tree = subprocess.run(
+                ["git", "-C", str(worktree), "rev-parse", f"{candidate}^{{tree}}"],
+                shell=False,
+                capture_output=True,
+                text=True,
             )
-            if not existing.passed or existing.head != candidate:
-                return _preflight_result_evidence(
-                    state_root=state_root,
-                    run=run,
-                    candidate=candidate,
-                    stage="existing-pr",
-                    preflight=existing,
-                    status="needs_human",
-                    reason="pr-preflight-blocked",
-                    next_action="resume-after-preflight-fix",
+            tree_hash = candidate_tree.stdout.strip().lower()
+            authorized_preflight = (
+                candidate_tree.returncode == 0
+                and verification.SAFE_SHA_RE.fullmatch(tree_hash) is not None
+                and work_actions.has_merge_authorized_preflight(
+                    state_path=state_root / "delivery-journal.json",
+                    run_id=run.run_id,
+                    authority=authority,
+                    binding={
+                        "pr_number": number,
+                        "change": authority.mapped_openspec[0]
+                        if len(authority.mapped_openspec) == 1
+                        else None,
+                        "todo_paths": list(authority.mapped_todo_paths),
+                    },
+                    head=candidate,
+                    tree_hash=tree_hash,
                 )
-            second_probe = post_preflight_main_sync()
-            if second_probe is not None:
-                return second_probe
-            _push_exact_candidate(
-                registry=registry,
-                run=run,
-                authority=authority,
-                state_root=state_root,
-                worktree=worktree,
-                branch=branch,
-                candidate=candidate,
-                runner=runner,
             )
+            if not authorized_preflight:
+                existing = _run_exact_candidate_preflight(
+                    worktree=worktree,
+                    branch=branch,
+                    candidate=candidate,
+                    command=load_preflight_command(),
+                    request=PreflightRequest(
+                        pr_number=number,
+                        skip_tests=_candidate_skip_tests_request(
+                            worktree=worktree, candidate=candidate, now=now
+                        ),
+                    ),
+                    runner=runner,
+                    now=now,
+                )
+                if not existing.passed or existing.head != candidate:
+                    return _preflight_result_evidence(
+                        state_root=state_root,
+                        run=run,
+                        candidate=candidate,
+                        stage="existing-pr",
+                        preflight=existing,
+                        status="needs_human",
+                        reason="pr-preflight-blocked",
+                        next_action="resume-after-preflight-fix",
+                    )
+                second_probe = post_preflight_main_sync()
+                if second_probe is not None:
+                    return second_probe
+                _push_exact_candidate(
+                    registry=registry,
+                    run=run,
+                    authority=authority,
+                    state_root=state_root,
+                    worktree=worktree,
+                    branch=branch,
+                    candidate=candidate,
+                    runner=runner,
+                )
         from . import work_actions
         from . import review as review_evidence
 
@@ -3443,6 +3471,7 @@ def build_production_ship_validator(
             now=now,
             state_path=state_root / "delivery-journal.json",
             workflow_registry=registry,
+            snapshot_path=snapshot_path,
         )
         if action.get("action") == "archive-applied-needs-commit":
             reset = _commit_archive_and_require_reverification(
