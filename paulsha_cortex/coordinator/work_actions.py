@@ -5488,7 +5488,11 @@ def _phase_recovery_actions(
         )
     ):
         actions.append("review-attest")
-    if reason_code in {"review-disposition-required", "review-threads-unresolved"}:
+    if reason_code in {
+        "review-disposition-required",
+        "review-threads-unresolved",
+        "copilot-finding-budget-exhausted",
+    }:
         actions.append("review-disposition")
     try:
         from . import manager as workflow_manager
@@ -9618,6 +9622,89 @@ def _repair_budget_status(
     }
 
 
+def _main_sync_only_candidate_transition(
+    *,
+    run: Any,
+    previous_head: str,
+    candidate_head: str,
+    state_path: Path,
+    repo_root: str | Path,
+    runner: Runner,
+) -> bool:
+    """Whether this exact HEAD movement consists only of a recorded main sync.
+
+    Autosync evidence is manager-owned and content-addressed. A retry-build main
+    sync is recognized only when the current HEAD is the pinned main commit or
+    the exact merge commit joining the previous Candidate and pinned main. A
+    later Candidate commit therefore remains countable as a repair.
+    """
+
+    from . import work_bridge
+
+    events = work_bridge._read_main_sync_autosync_events(
+        state_root=state_path.resolve().parent,
+        run_id=str(getattr(run, "run_id", "")),
+        evidence_refs=getattr(run, "evidence_refs", ()),
+    )
+    previous = previous_head.lower()
+    cursor = candidate_head.lower()
+    moved = False
+    for event in reversed(events):
+        if event.get("outcome") != "merged":
+            continue
+        if str(event.get("candidate_after", "")).lower() != cursor:
+            if moved:
+                break
+            continue
+        cursor = str(event.get("candidate_before", "")).lower()
+        moved = True
+        if cursor == previous:
+            return True
+
+    binding = getattr(run, "main_sync_repair", None)
+    if not isinstance(binding, dict):
+        return False
+    main_head = binding.get("main_head")
+    if (
+        binding.get("candidate") != previous
+        or not isinstance(main_head, str)
+        or re.fullmatch(r"[0-9a-f]{40,64}", main_head) is None
+    ):
+        return False
+    main_head = main_head.lower()
+    if candidate_head.lower() == main_head:
+        ancestry = runner(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "merge-base",
+                "--is-ancestor",
+                previous_head,
+                candidate_head,
+            ],
+            shell=False,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return getattr(ancestry, "returncode", 1) == 0
+    parents = runner(
+        ["git", "-C", str(repo_root), "show", "-s", "--format=%P", candidate_head],
+        shell=False,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if getattr(parents, "returncode", 1) != 0:
+        return False
+    parent_ids = (getattr(parents, "stdout", "") or "").strip().lower().split()
+    return len(parent_ids) == 2 and set(parent_ids) == {
+        previous_head.lower(),
+        main_head,
+    }
+
+
 def _ship_action(
     *,
     args: dict[str, Any],
@@ -10301,45 +10388,26 @@ def _ship_action(
             disposition=disposition,
         )
         _save_runs(state_path, state)
-    if previous_head is not None and previous_head != preflight.head:
+    if (
+        previous_head is not None
+        and previous_head != preflight.head
+        and ship is not None
+        and ship.get("phase") == "needs-fix"
+        and not _main_sync_only_candidate_transition(
+            run=canonical_run,
+            previous_head=previous_head,
+            candidate_head=preflight.head,
+            state_path=state_path,
+            repo_root=repo_root,
+            runner=runner,
+        )
+        and fix_rounds < max_fix_rounds
+    ):
+        # Count a new Candidate only after an exact-HEAD Copilot finding. Main
+        # sync movements are not repairs, and a Candidate at the exhausted
+        # budget still gets a fresh Copilot review for operator disposition.
         fix_rounds += 1
         active["repair_rounds"] = fix_rounds
-        if fix_rounds > max_fix_rounds:
-            active.pop("copilot_review_rearm_permit", None)
-            active["ship"] = {
-                **ship,
-                "phase": "needs_human",
-                "reason": "copilot-finding-budget-exhausted",
-                "head": preflight.head,
-                "fix_rounds": fix_rounds,
-            }
-            _save_runs(state_path, state)
-            workflow_registry._manager_update_workflow_run(
-                canonical_run.run_id,
-                facets=("needs_human",),
-                gate_status="running",
-                needs_human_reason=diagnostic_reason(
-                    "copilot-finding-budget-exhausted",
-                    f"Copilot review 修復輪次已達上限（{fix_rounds}/{max_fix_rounds}），"
-                    "不再自動重跑",
-                    source="work_actions._ship_action:copilot-budget",
-                    run_id=canonical_run.run_id,
-                    work_id=canonical_run.work_id,
-                    head=preflight.head,
-                    fix_rounds=str(fix_rounds),
-                ),
-            )
-            return _copilot_ship_needs_human_response(
-                reason="copilot-finding-budget-exhausted",
-                run=canonical_run,
-                authority=authority,
-                workflow_registry=workflow_registry,
-                extra=_repair_budget_status(
-                    fix_rounds=fix_rounds,
-                    max_fix_rounds=max_fix_rounds,
-                    current_phase=canonical_run.current_phase,
-                ),
-            )
     if (
         not ship
         or previous_head != preflight.head
@@ -10563,7 +10631,21 @@ def _ship_action(
         _save_runs(state_path, state)
         return {"action": "fix-required", "reason": copilot.reason, "findings": finding_count}
     if copilot.action != "passed":
-        active["ship"] = {**ship, "phase": "needs_human", "reason": copilot.reason}
+        if copilot.reason == "copilot-finding-budget-exhausted":
+            # Keep the exact review findings in the disposition-compatible
+            # state. The operator can resolve the threads and record an
+            # exact-HEAD review-disposition; no further repair round is opened.
+            active["ship"] = {
+                **ship,
+                "phase": "needs-fix",
+                "head": preflight.head,
+                "review_id": review.review_id,
+                "finding_count": finding_count,
+                "findings": findings,
+                "fix_rounds": fix_rounds,
+            }
+        else:
+            active["ship"] = {**ship, "phase": "needs_human", "reason": copilot.reason}
         _save_runs(state_path, state)
         workflow_registry._manager_update_workflow_run(
             canonical_run.run_id,
@@ -10589,6 +10671,19 @@ def _ship_action(
             if copilot.reason == "copilot-finding-budget-exhausted"
             else {}
         )
+        if copilot.reason == "copilot-finding-budget-exhausted":
+            return {
+                "action": "needs_human",
+                "reason": copilot.reason,
+                **extra,
+                "head": preflight.head,
+                "next_actions": ["review-disposition"],
+                "next_step_hint": (
+                    "先確認 PR review threads 全部 resolved，再由 operator 提交 exact-HEAD 裁決："
+                    f"cortex work review-disposition {canonical_run.work_id} "
+                    f"--repo {authority.repo} --actor <operator> --reason '<理由>'"
+                ),
+            }
         res = {"action": "needs_human", "reason": copilot.reason, **extra}
         if str(copilot.reason or "").startswith("copilot-"):
             return _copilot_ship_needs_human_response(

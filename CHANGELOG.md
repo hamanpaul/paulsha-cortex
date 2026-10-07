@@ -11,6 +11,7 @@
 
 - **cortex 進件：#1345 自動同步後 review 收割與 repair build 不認 autosync job**：登記 work item `autosync-source-job-unify` 與 accepted todo（見 `changelog.d/cortex-intake-1345.md`）。
 - **cortex 進件：#1339、#1340、#1342**：PR 變動後 resume 失效、依賴牆鐘的測試、Copilot 修正輪數把同步 main 算進去；登記三個 work item 與 accepted todo（見 `changelog.d/cortex-intake-batch-20261007.md`）。
+- **#1342 Copilot 修正輪數與裁決出口**：只將回應 finding 的修正計入 repair budget；main autosync 與 retry-build 純 main merge 不計入。budget 用完後仍要求新 HEAD 的 Copilot review，若仍有 findings 則提供 exact-HEAD `review-disposition`（見 `changelog.d/copilot-fix-round-accounting.md`）。
 - **#1336 clean-behind 自動同步後派出 verification**：成功的 `main-sync-autosync` Manager job 可作為 exact Candidate 的 reviewer 來源，verify tick 會沿用其 branch 並把新 Candidate 當作後續 build base；同步前 build ledger 綁定舊 Candidate，不會傳給 verifier，verification 對合併後 Candidate 自行執行檢查（見 `changelog.d/main-sync-reverify-builder-context.md`）。
 - **#1334 clean-behind 自動同步的 Git 身分**：merge 以 `-c user.name`／`-c user.email` 明確帶入設定的 `PSC_MAIN_SYNC_GIT_IDENTITY`（`Name <email>`）或來源 checkout 的有效身分；ship clone 複製來源 checkout 實際生效的身分；上限只計成功建立新 Candidate 的同步。
 - **cortex 進件：#1336 自動同步後 verification 找不到來源 job、#1338 被終止的 repair build 無法恢復**：登記 work item `main-sync-reverify-builder-context`、`retry-build-killed-repair` 與 accepted todo，交給 cortex 派工（見 `changelog.d/cortex-intake-1336.md`）。
