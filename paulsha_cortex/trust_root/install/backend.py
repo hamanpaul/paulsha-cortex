@@ -974,7 +974,9 @@ _REPOSITORY_MUTATION_CONFIG = (
 #   installer's own fetch refspec (``manager.py:1854``,
 #   ``claim_readiness.py:354``, ``autonomy.py:1068``,
 #   ``github_delivery.py:443-449``);
-#   ``refs/tags/archive/<work>-<sha8>`` -- ``work_actions.py:6057,6075``;
+#   ``refs/archive/<work>-<sha8>`` -- ``work_actions.py``; legacy
+#   ``refs/tags/archive/<work>-<sha8>`` refs remain accepted for existing
+#   source trees and are no longer created;
 #   ``refs/cortex/reclaimed/<workspace>/<stamp>-<sha12>`` --
 #   ``job_workspace.py:118,1224-1225``;
 #   ``refs/cortex/main-sync{,-quarantine}/<run>`` --
@@ -1018,6 +1020,8 @@ _RUNTIME_REF_PATTERNS = tuple(
     for pattern in (
         rf"refs/heads/feature/{_RUNTIME_REF_SEGMENTS}",
         rf"refs/remotes/origin/{_RUNTIME_REF_SEGMENTS}",
+        r"refs/archive/[A-Za-z0-9._-]+-[0-9a-f]{8}",
+        # Compatibility for saved refs created before archive refs left tags.
         r"refs/tags/archive/[A-Za-z0-9._-]+-[0-9a-f]{8}",
         r"refs/cortex/reclaimed/[A-Za-z0-9][A-Za-z0-9_.-]*"
         r"/[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}",

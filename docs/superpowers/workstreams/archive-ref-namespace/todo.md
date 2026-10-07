@@ -16,7 +16,7 @@ work_item: archive-ref-namespace
 
 ## Tasks
 
-- [ ] **T1 RED**：測試 abandon reclaim 建立的保存參考會讓 `git describe --tags` 受影響（現行行為）。
-- [ ] **T2 改用非 tag 命名空間**：保存參考改用 `refs/archive/<work>-<sha8>`（或其他非 tag 命名空間），保留「commit 可達」的目的；同步更新 trust_root backend 允許的 ref 形狀，並說明既有 `refs/tags/archive/*` 的相容或遷移方式。
-- [ ] **T3 job clone 不複製非發布 tag**：建立 job 工作目錄時，不複製非 `v*` 的本機 tag；或 cortex 自己的版本檢查一律只看 `v*`（`--match 'v*'`）。
-- [ ] **T4 文件**：新增 changelog fragment，並同步 `CHANGELOG.md [Unreleased]`。
+- [x] **T1 RED**：測試 abandon reclaim 建立的保存參考會讓 `git describe --tags` 受影響（現行行為）。
+- [x] **T2 改用非 tag 命名空間**：保存參考改用 `refs/archive/<work>-<sha8>`（或其他非 tag 命名空間），保留「commit 可達」的目的；同步更新 trust_root backend 允許的 ref 形狀，並說明既有 `refs/tags/archive/*` 的相容或遷移方式。
+- [x] **T3 job clone 不複製非發布 tag**：建立 job 工作目錄時，不複製非 `v*` 的本機 tag；或 cortex 自己的版本檢查一律只看 `v*`（`--match 'v*'`）。
+- [x] **T4 文件**：新增 changelog fragment，並同步 `CHANGELOG.md [Unreleased]`。

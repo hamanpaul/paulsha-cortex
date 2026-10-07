@@ -6653,38 +6653,37 @@ def _reclaim_abandoned_build_worktrees(run, workflow_registry, *, state_path: Pa
         logger.warning("build-branch-reclaim-count-invalid run_id=%s branch=%s", run.run_id, branch)
         return
 
-    archive_tag = None
+    archive_ref = None
     if has_unbased_commits:
         safe_work_id = re.sub(r"[^A-Za-z0-9._-]+", "-", str(run.work_id)).strip(".-") or "work"
-        archive_tag = f"archive/{safe_work_id}-{branch_sha[:8]}"
-        tag_ref = f"refs/tags/{archive_tag}"
-        if git("check-ref-format", tag_ref).returncode != 0:
+        archive_ref = f"refs/archive/{safe_work_id}-{branch_sha[:8]}"
+        if git("check-ref-format", archive_ref).returncode != 0:
             logger.warning(
-                "build-branch-reclaim-archive-tag-invalid run_id=%s tag=%s",
-                run.run_id, archive_tag,
+                "build-branch-reclaim-archive-ref-invalid run_id=%s ref=%s",
+                run.run_id, archive_ref,
             )
             return
-        existing = git("show-ref", "--verify", "--quiet", tag_ref)
+        existing = git("show-ref", "--verify", "--quiet", archive_ref)
         if existing.returncode == 0:
-            existing_sha = git("rev-parse", "--verify", f"{tag_ref}^{{commit}}")
+            existing_sha = git("rev-parse", "--verify", f"{archive_ref}^{{commit}}")
             if existing_sha.returncode != 0 or existing_sha.stdout.strip().lower() != branch_sha:
                 logger.warning(
-                    "build-branch-reclaim-archive-tag-conflict run_id=%s tag=%s",
-                    run.run_id, archive_tag,
+                    "build-branch-reclaim-archive-ref-conflict run_id=%s ref=%s",
+                    run.run_id, archive_ref,
                 )
                 return
         elif existing.returncode == 1:
-            created = git("tag", archive_tag, branch_sha)
+            created = git("update-ref", archive_ref, branch_sha, "0" * len(branch_sha))
             if created.returncode != 0:
                 logger.warning(
-                    "build-branch-reclaim-archive-tag-failed run_id=%s tag=%s detail=%s",
-                    run.run_id, archive_tag, created.stderr.strip()[:200],
+                    "build-branch-reclaim-archive-ref-failed run_id=%s ref=%s detail=%s",
+                    run.run_id, archive_ref, created.stderr.strip()[:200],
                 )
                 return
         else:
             logger.warning(
-                "build-branch-reclaim-archive-tag-check-failed run_id=%s tag=%s detail=%s",
-                run.run_id, archive_tag, existing.stderr.strip()[:200],
+                "build-branch-reclaim-archive-ref-check-failed run_id=%s ref=%s detail=%s",
+                run.run_id, archive_ref, existing.stderr.strip()[:200],
             )
             return
 
@@ -6696,8 +6695,8 @@ def _reclaim_abandoned_build_worktrees(run, workflow_registry, *, state_path: Pa
         )
         return
     logger.info(
-        "build-branch-reclaimed run_id=%s branch=%s sha=%s archive_tag=%s",
-        run.run_id, branch, branch_sha, archive_tag or "none",
+        "build-branch-reclaimed run_id=%s branch=%s sha=%s archive_ref=%s",
+        run.run_id, branch, branch_sha, archive_ref or "none",
     )
 
 

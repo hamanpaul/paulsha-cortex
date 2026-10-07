@@ -89,6 +89,7 @@ def _abandon_branch(
 ):
     repo = _init_repo(tmp_path / "source")
     base_sha = _git(repo, "rev-parse", "main").strip()
+    _git(repo, "tag", "v0.1.0", base_sha)
     run = _abandoned_run(repo, base_sha)
     branch = manager.workflow_build_branch(run)
     worktree = tmp_path / "build-worktree"
@@ -103,6 +104,10 @@ def _abandon_branch(
             "commit", "-qm", "candidate change",
         )
     branch_sha = _git(repo, "rev-parse", f"refs/heads/{branch}").strip()
+    if commit:
+        # Reproduce a reclaimed candidate that is now in main's ancestry: an
+        # archive tag here wins `git describe --tags` over the release tag.
+        _git(repo, "merge", "--ff-only", branch)
     monkeypatch.setenv("PSC_REPO_ROOT", str(repo))
     jobs = [
             {
@@ -139,11 +144,13 @@ def test_abandon_reclaims_build_branch_and_archives_commits_outside_base(
     repo, branch, worktree, branch_sha = _abandon_branch(
         tmp_path, monkeypatch, commit=True
     )
-    archive_tag = f"archive/demo-{branch_sha[:8]}"
+    archive_ref = f"refs/archive/demo-{branch_sha[:8]}"
 
     assert not worktree.exists()
     assert _run_git(repo, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}").returncode == 1
-    assert _run_git(repo, "rev-parse", f"refs/tags/{archive_tag}").stdout.strip() == branch_sha
+    assert _run_git(repo, "rev-parse", archive_ref).stdout.strip() == branch_sha
+    assert _run_git(repo, "show-ref", "--verify", "--quiet", f"refs/tags/archive/demo-{branch_sha[:8]}").returncode == 1
+    assert _run_git(repo, "describe", "--tags", "--abbrev=0").stdout.strip() == "v0.1.0"
 
 
 def test_abandon_deletes_build_branch_without_archive_when_it_has_no_new_commit(

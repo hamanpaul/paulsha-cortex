@@ -156,7 +156,9 @@ def simulate_manager_runtime(upgrade: RepositoryUpgrade) -> None:
     # 以 canonical refspec 順帶更新的 remote-tracking ref。
     git("-C", repository, "update-ref", "refs/cortex/main-sync/run-1124", old)
     git("-C", repository, "update-ref", "refs/remotes/origin/main", old)
-    # work_actions.py:6057-6075：回收 build branch 前的封存 tag。
+    # work_actions.py：回收 build branch 前的 refs/archive 保存 ref。
+    git("-C", repository, "update-ref", f"refs/archive/repository-runtime-{old[:8]}", old)
+    # Legacy tags stay accepted for already-installed source trees.
     git("-C", repository, "tag", f"archive/repository-runtime-{old[:8]}", old)
     # review.py:510：foreign review 的 linked worktree 開在來源樹內。
     git(

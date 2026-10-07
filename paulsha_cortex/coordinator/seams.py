@@ -296,6 +296,9 @@ class ScriptWorktreeCreator:
                 # hardlink 會讓 clone 的 object 與來源 repo 共用 inode——那正是本次
                 # 變更要消滅的共用面（也是 operator 實測採用的旗標）。
                 "--no-hardlinks",
+                # job clone 只帶發布版本 tag；本機保存 tag 不得污染 job 的
+                # `git describe`／版本檢查結果。
+                "--no-tags",
                 "--origin",
                 job_workspace.SOURCE_REMOTE,
                 "--branch",
@@ -307,6 +310,21 @@ class ScriptWorktreeCreator:
         )
         if cloned.returncode != 0:
             raise ValueError(f"git worktree add failed: {cloned.stderr.strip()}")
+
+        # Preserve version discovery while excluding operator-local tags such
+        # as historical refs/tags/archive/* entries from every new job clone.
+        version_tags = self._run(
+            [
+                "-C",
+                str(target),
+                "fetch",
+                "--no-tags",
+                job_workspace.SOURCE_REMOTE,
+                "+refs/tags/v*:refs/tags/v*",
+            ]
+        )
+        if version_tags.returncode != 0:
+            raise ValueError(f"git worktree add failed: {version_tags.stderr.strip()}")
 
         origin_url = self._source(["remote", "get-url", "origin"])
         upstream = origin_url.stdout.strip() if origin_url.returncode == 0 else ""

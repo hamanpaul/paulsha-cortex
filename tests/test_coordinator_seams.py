@@ -56,6 +56,22 @@ def test_worktree_creator_reuses_existing_branch_only_when_it_is_base_ancestor(
     assert _git(target, "branch", "--show-current") == branch
 
 
+def test_job_clone_copies_only_release_version_tags(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    _git(repo, "tag", "v0.1.0")
+    _git(repo, "tag", "archive/old-work-1234abcd")
+    _git(repo, "tag", "operator-local-tag")
+
+    target = Path(
+        ScriptWorktreeCreator(repo=repo, wt_root=tmp_path / "worktrees").create(
+            "feature/32-release-tags", job_id="32-release-tags"
+        )
+    )
+
+    tags = _git(target, "tag", "--list").splitlines()
+    assert tags == ["v0.1.0"]
+
+
 def test_worktree_creator_rejects_diverged_existing_branch_without_moving_it(
     tmp_path: Path,
 ) -> None:

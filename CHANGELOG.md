@@ -9,6 +9,7 @@
 
 ### Fixed
 
+- **#1314 abandon 保存 ref 與 job clone tag 範圍**：abandon 把未合入 base 的 build commit 保存在 `refs/archive/<work>-<sha8>`，不再建立會影響 `git describe --tags` 的 archive tag；trust-root 繼續接受既有 `refs/tags/archive/*`，但新 job clone 只取得 `v*` 發布 tag（見 `changelog.d/archive-ref-namespace.md`）。
 - **cortex 進件：#1334 clean-behind 自動同步的 committer 身分**：登記 work item `main-sync-committer-identity` 與 accepted todo，交給 cortex 派工（見 `changelog.d/cortex-intake-1334.md`）。
 - **cortex 進件：#1322 ship 在 preflight 後重新取得 WorkAuthority**：登記 work item `delivery-authority-refresh` 與 accepted todo，交給 cortex 派工（見 `changelog.d/cortex-intake-1322.md`）。
 - **#1311 ship clean-behind 自動同步**：Manager 在受控 ship clone 合入已 probe 的 exact `origin/main`，只重跑 verify 與 ship probe 並沿用原 foreign review；每 run 預設上限 3 次（`PSC_MAIN_SYNC_AUTOSYNC_MAX` 可設 0–10），main SHA、次數、新 Candidate 與停止原因寫入 evidence，`cortex work show` 可檢視。

@@ -884,7 +884,7 @@ installer 把下表這些**執行期狀態**正規化後，再與 prior receipt 
 | --- | --- | --- |
 | local git config | `[user]` 的 `name`／`email`（單行純值） | per-job clone 從來源樹 local config 複製 commit identity |
 | linked worktree | `.psc-review-worktrees/<name>`、`.psc-verification-worktrees/<name>`，detached；`.git/worktrees/<id>` 的 `gitdir` 指回同一路徑；目錄已刪的 prunable registry 也接受 | foreign review 與 verification base checkout |
-| ref | `refs/heads/feature/*`、`refs/remotes/origin/*`、`refs/tags/archive/<work>-<sha8>`、`refs/cortex/{reclaimed,main-sync,main-sync-quarantine,mirror}/…` | provision `branch -f`、bundle 回收、`fetch origin <branch>`、封存 tag／ref、main-sync pin、Monitor git mirror |
+| ref | `refs/heads/feature/*`、`refs/remotes/origin/*`、`refs/archive/<work>-<sha8>`、相容既有 `refs/tags/archive/<work>-<sha8>`、`refs/cortex/{reclaimed,main-sync,main-sync-quarantine,mirror}/…` | provision `branch -f`、bundle 回收、`fetch origin <branch>`、封存 ref、main-sync pin、Monitor git mirror |
 
 `FETCH_HEAD`、object pack、reflog 等檔案不另列：它們與整棵樹（含上表的 linked worktree）
 一樣受 owner／group、world-writable、symlink 逃逸檢查，這組檢查沒有任何放寬。刻意**不**
