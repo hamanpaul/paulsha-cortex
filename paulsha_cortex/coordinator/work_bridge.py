@@ -962,6 +962,58 @@ def _main_sync_isolated_git_env() -> dict[str, str]:
     return env
 
 
+def _main_sync_autosync_git_identity(source_repo: Path) -> tuple[str, str] | None:
+    """Resolve the identity for a Manager-owned clean-behind merge.
+
+    ``PSC_MAIN_SYNC_GIT_IDENTITY`` accepts the conventional ``Name <email>`` form
+    and takes precedence. Otherwise resolve the source checkout's effective Git
+    config before entering the isolated merge environment.
+    """
+
+    configured = os.environ.get("PSC_MAIN_SYNC_GIT_IDENTITY")
+    if configured is not None:
+        if any(char in configured for char in "\r\n\0"):
+            return None
+        match = re.fullmatch(r"([^<>]+?)\s*<([^<>]+)>", configured.strip())
+        if match is None:
+            return None
+        name, email = (part.strip() for part in match.groups())
+        return (name, email) if name and email else None
+
+    values: list[str] = []
+    identity_env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_COMMON_DIR",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        }
+    }
+    try:
+        for key in ("user.name", "user.email"):
+            result = subprocess.run(
+                ["git", "-C", str(source_repo), "config", "--get", key],
+                shell=False,
+                capture_output=True,
+                text=True,
+                timeout=MAIN_SYNC_AUTOSYNC_TIMEOUT_SECONDS,
+                env=identity_env,
+            )
+            if result.returncode != 0:
+                return None
+            value = result.stdout.strip()
+            if not value or any(char in value for char in "\r\n\0"):
+                return None
+            values.append(value)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return values[0], values[1]
+
+
 def _probe_main_sync(
     *,
     worktree: Path,
@@ -1370,6 +1422,16 @@ def _main_sync_autosync_limit() -> int:
     if value > MAIN_SYNC_AUTOSYNC_MAX_BOUND:
         raise ValueError("PSC_MAIN_SYNC_AUTOSYNC_MAX must be an integer from 0 to 10")
     return value
+
+
+def _main_sync_autosync_completed_count(events: Iterable[Mapping[str, object]]) -> int:
+    """The limit counts successful syncs that create a new Candidate.
+
+    A failed merge does not move the Candidate and therefore does not consume the
+    per-run clean-behind movement budget.
+    """
+
+    return sum(event.get("outcome") == "merged" for event in events)
 
 
 def _read_main_sync_autosync_events(
@@ -3568,7 +3630,7 @@ def build_production_ship_validator(
             review_hash=foreign_ref.sha256,
             source_repo=run.workspace_root,
         )
-        completed_count = sum(event.get("outcome") == "merged" for event in events)
+        completed_count = _main_sync_autosync_completed_count(events)
         review_candidate = (
             str(chain[0]["review_candidate"]).lower() if chain else candidate.lower()
         )
@@ -3655,6 +3717,17 @@ def build_production_ship_validator(
             )
 
         source_repo = Path(run.workspace_root)
+        git_identity = _main_sync_autosync_git_identity(source_repo)
+        if git_identity is None:
+            return write_attempt(
+                outcome="merge-failed",
+                reason="main-sync-identity-missing",
+                limit=limit,
+                failure_detail=(
+                    "PSC_MAIN_SYNC_GIT_IDENTITY or effective source checkout "
+                    "user.name/user.email is required"
+                ),
+            )
         pin_ref = main_sync_run_ref(MAIN_SYNC_AUTOSYNC_PIN_REF_PREFIX, run.run_id)
 
         def run_git(args: list[str]):
@@ -3724,7 +3797,17 @@ def build_production_ship_validator(
                     failure_detail="origin/main advanced after the clean-behind probe",
                 )
             merged = run_git(
-                ["merge", "--no-edit", "--no-ff", "--no-stat", probe.main_head.lower()]
+                [
+                    "-c",
+                    f"user.name={git_identity[0]}",
+                    "-c",
+                    f"user.email={git_identity[1]}",
+                    "merge",
+                    "--no-edit",
+                    "--no-ff",
+                    "--no-stat",
+                    probe.main_head.lower(),
+                ]
             )
             if merged.returncode != 0:
                 clean = clean_workspace()

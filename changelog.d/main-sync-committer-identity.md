@@ -1,0 +1,1 @@
+- **#1334 clean-behind 自動同步的 Git 身分**：merge 以 `-c user.name`／`-c user.email` 明確帶入設定的 `PSC_MAIN_SYNC_GIT_IDENTITY`（`Name <email>`）或來源 checkout 的有效身分；ship clone 複製來源 checkout 實際生效的身分；上限只計成功建立新 Candidate 的同步。
