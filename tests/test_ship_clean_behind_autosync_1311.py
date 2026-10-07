@@ -3,12 +3,23 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
+import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from paulsha_cortex.coordinator import manager, work_bridge, work_actions
+from paulsha_cortex.coordinator import (
+    gate_ledger,
+    manager,
+    runtime_preflight,
+    terminal_contract,
+    work_bridge,
+    work_actions,
+)
+from paulsha_cortex.coordinator.launcher import LaunchHandle
 from paulsha_cortex.coordinator.model_identities import IdentityRegistry
 from paulsha_cortex.coordinator.workflow import WorkflowStep
 from paulsha_cortex.monitor.providers import WorkflowRegistryProvider
@@ -37,6 +48,76 @@ class _ShipWorkspaceCreator:
         self.created.append(workspace)
         assert _git(workspace, "rev-parse", "HEAD") == base_sha
         return workspace
+
+
+class _VerificationLauncher:
+    def __init__(self, executor: str, model_id: str) -> None:
+        self.executor = executor
+        self.model_id = model_id
+        self.calls: list[dict[str, str]] = []
+
+    def as_read_only(self):
+        return self
+
+    def as_review_only(self, *, terminal_kind: str):
+        return self
+
+    def executor_environment(self) -> runtime_preflight.ExecutorEnvironment:
+        return runtime_preflight.ExecutorEnvironment(
+            name=f"{self.executor}-workflow",
+            interpreter=(sys.executable,),
+            path=os.environ.get("PATH", ""),
+            home=os.path.expanduser("~"),
+            provider_identity=self.executor,
+        )
+
+    def launch(self, *, slice_id, prompt, worktree, log_dir):
+        self.calls.append({"slice_id": slice_id, "prompt": prompt, "worktree": worktree})
+        return LaunchHandle(
+            executor=self.executor,
+            model_id=self.model_id,
+            session_name=slice_id,
+            pid=4242,
+            log_path=str(Path(log_dir) / f"{slice_id}.jsonl"),
+        )
+
+
+def _seed_candidate_bound_build_ledger(
+    harness,
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Seed a valid build ledger so autosync must reject it for the new Candidate."""
+
+    build_job = next(
+        job
+        for job in harness.registry.list_jobs()
+        if job.get("workflow_run_id") == harness.run_id
+        and job.get("workflow_phase") == "build"
+        and job.get("persona") == "builder"
+    )
+    log_path = harness.state_root / "logs" / "original-build.jsonl"
+    build_job = {
+        **build_job,
+        "log_path": str(log_path),
+        "workflow_test_policy": "focused",
+    }
+    payload = gate_ledger.build_ledger(
+        [
+            {
+                "name": terminal_contract.RED_REQUIRED_TEST_GATE_NAME,
+                "command": "pytest -q",
+                "exit_code": 0,
+                "status": "passed",
+            }
+        ],
+        slice_id=str(build_job["job_id"]),
+        worktree_state={"probe": "ok", "head": harness.candidate.lower()},
+    )
+    gate_ledger.write_ledger_payload(
+        terminal_contract.gate_ledger_path(log_path), payload
+    )
+    context = manager._verification_gate_ledger_context(harness.run, build_job)
+    assert context is not None
+    return build_job, context
 
 
 class _IdentitylessShipWorkspaceCreator(_ShipWorkspaceCreator):
@@ -92,11 +173,21 @@ def test_clean_behind_main_is_merged_by_manager_and_only_verify_is_reopened(
         archived_change=True,
         probe_runner=subprocess.run,
     )
+    initial = harness.run
+    initial_steps = tuple(
+        replace(step, card="verification") if step.phase == "verify" else step
+        for step in initial.steps
+    )
+    harness.registry._manager_update_workflow_run(
+        initial.run_id,
+        steps=initial_steps,
+    )
     origin = _wire_local_origin(harness, tmp_path / "origin")
     main_head = _advance_origin_main(origin, tmp_path / "main-advance")
     creator = _ShipWorkspaceCreator(harness.repo, tmp_path / "ship-workspaces")
     validator = _production_validator(harness, tmp_path, creator=creator)
     before_jobs = harness.registry.list_jobs()
+    original_builder, original_gate_ledger = _seed_candidate_bound_build_ledger(harness)
 
     result = _advance_to_ship(harness, validator)
 
@@ -142,6 +233,78 @@ def test_clean_behind_main_is_merged_by_manager_and_only_verify_is_reopened(
     assert not any(call and call[0] == "preflight" for call in harness.runner.calls)
     assert not harness.runner.saw_push()
     assert not harness.runner.saw_gh()
+
+    autosync_job = next(
+        job for job in new_jobs if job["workflow_card"] == "main-sync-autosync"
+    )
+
+    monkeypatch.setattr(manager, "_EXECUTOR_AUTH_CACHE", {})
+    manager._EXECUTOR_AUTH_CACHE["claude"] = runtime_preflight.ProviderFreshness(
+        provider_id="claude",
+        status="ok",
+        observed_at=time.time(),
+        ttl_seconds=900.0,
+        source="snapshot",
+    )
+    monkeypatch.setattr(
+        manager,
+        "_validated_brainstorm_planning_authority",
+        lambda bound_run, **_kwargs: (
+            bound_run.planning_authority,
+            bound_run.planning_source_revision,
+        ),
+    )
+    current = harness.registry.get_workflow_run(updated.run_id)
+    dispatcher = SimpleNamespace(
+        _registry=harness.registry,
+        _git_runner=None,
+        poll_headless_done=lambda job_id: harness.registry.get_job(job_id),
+    )
+    launcher = _VerificationLauncher("claude", "sonnet-main-sync")
+
+    tick = manager.resume_workflow_run(
+        dispatcher,
+        run_id=current.run_id,
+        identities=IdentityRegistry.from_rows(
+            [
+                {
+                    "executor": "claude",
+                    "model_id": "sonnet-main-sync",
+                    "independence_domain": "anthropic",
+                    "capabilities": ["review"],
+                }
+            ]
+        ),
+        launcher_factory=lambda _identity: launcher,
+        coordinator_root=harness.state_root,
+    )
+
+    assert tick["reason"] == "in-flight"
+    verify_job = harness.registry.get_job(str(tick["job_id"]))
+    verify_step = next(step for step in current.steps if step.phase == "verify")
+    builder_jobs, builder_job_id, manager_gate_ledger = (
+        manager._workflow_stage_execution_builder_context(
+            current, verify_step, harness.registry
+        )
+    )
+    # The previous build ledger is valid for the pre-sync candidate only. The verify card
+    # must run its own checks against the merged candidate instead of inheriting stale gate
+    # evidence whose worktree_state.head still names the pre-sync commit.
+    assert original_gate_ledger["candidate"] == harness.candidate
+    assert manager._verification_gate_ledger_context(current, original_builder) is None
+    assert [job["workflow_card"] for job in builder_jobs] == ["main-sync-autosync"]
+    assert builder_job_id == autosync_job["job_id"]
+    assert builder_jobs[-1]["branch"] == "feature/14-work"
+    assert manager._workflow_build_handoff_base(
+        current, builder_jobs=builder_jobs, card="post-sync-build"
+    ) == current.candidate_head
+    assert manager_gate_ledger is None
+    assert verify_job["workflow_card"] == "verification"
+    assert verify_job["subject_head"] == updated.candidate_head
+    assert verify_job["workflow_builder_job_id"] == autosync_job["job_id"]
+    assert verify_job["branch"] == autosync_job["branch"]
+    assert launcher.calls
+    assert original_gate_ledger["sha256"] not in launcher.calls[0]["prompt"]
 
 
 def test_autosync_real_git_merge_uses_source_identity_when_ship_clone_has_none(
