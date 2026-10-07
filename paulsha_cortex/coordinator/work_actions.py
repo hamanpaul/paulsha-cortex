@@ -4990,7 +4990,10 @@ def _retry_build_admission_error(
         )
         if run.repo != authority.repo or run.work_id != authority.work_id or run.issue_refs != expected_issues:
             return reject(RuntimeError, "retry-build issue is not authorized by WorkAuthority")
-    from .registry import ACTIVE_JOB_STATUSES
+    from .registry import (
+        ACTIVE_JOB_STATUSES,
+        _retry_build_terminal_job_is_recoverable,
+    )
 
     if any(
         job.get("workflow_run_id") == run.run_id
@@ -5025,16 +5028,13 @@ def _retry_build_admission_error(
         ):
             return reject(ValueError, "retry-build reset requires only the final builder card pending")
         repair_card = build_steps[-1].card
-        terminal_repairs = [
-            job for job in jobs
-            if job.get("workflow_run_id") == run.run_id
-            and job.get("workflow_phase") == "build"
-            and job.get("workflow_card") == repair_card
-            and job.get("status") == "exited"
-            and job.get("exit_code") == 0
-        ]
-        if not terminal_repairs or terminal_repairs[-1].get("workflow_evidence") is not None:
-            return reject(ValueError, "retry-build reset requires unbound terminal builder evidence")
+        if not _retry_build_terminal_job_is_recoverable(
+            jobs, run_id=run.run_id, card=repair_card
+        ):
+            return reject(
+                ValueError,
+                "retry-build reset requires a recoverable terminal builder job without accepted evidence",
+            )
     elif any(step.gate_result != "passed" for step in build_steps):
         return reject(ValueError, "retry-build reset requires completed build phase")
 

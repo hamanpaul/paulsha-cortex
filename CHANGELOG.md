@@ -9,6 +9,7 @@
 
 ### Fixed
 
+- **#1338 已有 PR 的 repair build 被終止後可用 `retry-build` 恢復**：build phase 的 admission 與 registry reset 共用最新 builder job 判準，接受無已採信 evidence 的 terminal failure，保留 exact-Candidate CAS、retry-build receipt 與 Builder 派工；`next_actions` 隨可受理的 retry lane 列出 `retry-build`，不再退回必然失敗的 `resume`（見 `changelog.d/retry-build-killed-repair.md`）。
 - **cortex 進件：#1336 自動同步後 verification 找不到來源 job、#1338 被終止的 repair build 無法恢復**：登記 work item `main-sync-reverify-builder-context`、`retry-build-killed-repair` 與 accepted todo，交給 cortex 派工（見 `changelog.d/cortex-intake-1336.md`）。
 - **cortex 進件：#1334 clean-behind 自動同步的 committer 身分**：登記 work item `main-sync-committer-identity` 與 accepted todo，交給 cortex 派工（見 `changelog.d/cortex-intake-1334.md`）。
 - **cortex 進件：#1322 ship 在 preflight 後重新取得 WorkAuthority**：登記 work item `delivery-authority-refresh` 與 accepted todo，交給 cortex 派工（見 `changelog.d/cortex-intake-1322.md`）。

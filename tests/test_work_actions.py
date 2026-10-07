@@ -773,8 +773,12 @@ def test_retry_build_preserves_only_manager_owned_archive_authority(
     )
 
 
-def test_retry_build_recovers_unbound_builder_terminalization(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    ("job_status", "exit_code"),
+    [("exited", 0), ("failed", 1)],
+)
+def test_retry_build_recovers_unbound_or_failed_builder_terminalization(
+    tmp_path: Path, job_status: str, exit_code: int
 ) -> None:
     snapshot = _snapshot(
         tmp_path / "snapshot.json",
@@ -837,9 +841,9 @@ def test_retry_build_recovers_unbound_builder_terminalization(
         "workflow_input_root": str(tmp_path),
         "source_revision": initial.source_revision,
     }
-    failed_job = registry.create_job(**job_args)
+    terminal_job = registry.create_job(**job_args)
     registry.update_headless_result(
-        failed_job["job_id"], status="failed", exit_code=1
+        terminal_job["job_id"], status=job_status, exit_code=exit_code
     )
     action_args = {
         "action": "retry-build",
@@ -849,23 +853,7 @@ def test_retry_build_recovers_unbound_builder_terminalization(
         "actor": "operator",
         "expected_candidate": HEAD,
     }
-    with pytest.raises(ValueError, match="unbound terminal builder evidence"):
-        work_actions.execute_work_action(
-            args=action_args,
-            requested_by="operator",
-            snapshot_path=snapshot,
-            state_path=tmp_path / "runs.json",
-            workflow_registry=registry,
-        )
-    # #1215：投影只在同一份 admission 會受理時宣告 retry-build。
-    assert "retry-build" not in work_actions._phase_recovery_actions(
-        registry.get_workflow_run(initial.run_id), registry
-    )
-
-    successful_job = registry.create_job(**job_args)
-    registry.update_headless_result(
-        successful_job["job_id"], status="exited", exit_code=0
-    )
+    # #1338：被外力終止的最新 builder job 也能走 exact-Candidate retry-build。
     assert "retry-build" in work_actions._phase_recovery_actions(
         registry.get_workflow_run(initial.run_id), registry
     )
@@ -883,7 +871,7 @@ def test_retry_build_recovers_unbound_builder_terminalization(
     assert reset.candidate_head == HEAD
     assert reset.facets == ()
     assert reset.attempts["build"] == 3
-    assert registry.get_job(successful_job["job_id"])["workflow_evidence"] is None
+    assert registry.get_job(terminal_job["job_id"])["workflow_evidence"] is None
     assert "declared input snapshots" in str(
         next(step for step in reset.steps if step.card == repair_card).action
     )

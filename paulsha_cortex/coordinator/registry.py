@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from paulsha_cortex.config import paths
 from . import terminal_contract, verification
@@ -44,6 +44,38 @@ _UNSET_HISTORY_LIMIT = object()
 VALID_JOB_STATUSES = frozenset({"dispatched", "running", "exited", "failed"})
 ACTIVE_JOB_STATUSES = frozenset({"dispatched", "running"})
 TERMINAL_JOB_STATUSES = frozenset({"exited", "failed"})
+
+
+def _retry_build_terminal_job_is_recoverable(
+    jobs: Iterable[Mapping[str, Any]], *, run_id: str, card: str
+) -> bool:
+    """Whether the final builder job may be reopened without replacing evidence.
+
+    Preserve the existing exit-0-but-unbound terminalization recovery and also admit a
+    terminal failed attempt, such as a build process killed before it wrote terminal
+    evidence. Only the newest job for the final builder card matters; accepted evidence
+    on that job remains immutable and blocks this path.
+    """
+
+    matching = [
+        job
+        for job in jobs
+        if job.get("workflow_run_id") == run_id
+        and job.get("workflow_phase") == "build"
+        and job.get("workflow_card") == card
+    ]
+    if not matching:
+        return False
+    latest = matching[-1]
+    if latest.get("workflow_evidence") is not None:
+        return False
+    status = latest.get("status")
+    if status == "exited":
+        # Exit 0 is the established unbound-terminalization case. A nonzero exit is
+        # the terminal failure case; a missing or malformed code is not enough proof.
+        exit_code = latest.get("exit_code")
+        return isinstance(exit_code, int) and not isinstance(exit_code, bool)
+    return status == "failed"
 
 # #545／#569：`retry-card` 受理的 phase 與該 phase 唯一合法的重派 persona。
 # build → builder（#545 的中段 builder 卡），verify／review → reviewer（#569 的
@@ -6059,21 +6091,11 @@ class JobRegistry:
                 raise ValueError(
                     "retry-build reset requires only the final builder card pending"
                 )
-            terminal_repairs = [
-                job
-                for job in self._jobs
-                if job.get("workflow_run_id") == current.run_id
-                and job.get("workflow_phase") == "build"
-                and job.get("workflow_card") == repair_card
-                and job.get("status") == "exited"
-                and job.get("exit_code") == 0
-            ]
-            if (
-                not terminal_repairs
-                or terminal_repairs[-1].get("workflow_evidence") is not None
+            if not _retry_build_terminal_job_is_recoverable(
+                self._jobs, run_id=current.run_id, card=repair_card
             ):
                 raise ValueError(
-                    "retry-build reset requires unbound terminal builder evidence"
+                    "retry-build reset requires a recoverable terminal builder job without accepted evidence"
                 )
         elif any(step.gate_result != "passed" for step in build_steps):
             raise ValueError("retry-build reset requires completed build phase")
