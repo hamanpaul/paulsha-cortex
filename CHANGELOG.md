@@ -11,6 +11,7 @@
 
 - **#1339 PR authority 更新不再讓已驗證的 build resume 失效**：resume 與 review-disposition 僅在 PR 仍綁定同一 issue／Todo／OpenSpec、issue 仍開啟，且 Manager 交付 journal 與 GitHub readback 證明 PR HEAD 為 Candidate 或其 Manager autosync 後代時，重新綁定變動過的 PR authority 並保存 receipt；PR 改綁、Todo source 改寫或 issue 關閉時 fail closed。（見 `changelog.d/pr-change-authority-rebind.md`）
 - **cortex 進件：#1345 自動同步後 review 收割與 repair build 不認 autosync job**：登記 work item `autosync-source-job-unify` 與 accepted todo（見 `changelog.d/cortex-intake-1345.md`）。
+- **#1345 自動同步 candidate source 統一**：成功的 `main-sync-autosync` Manager ship job 與 `openspec-archive` 同為 review binding、verification context 及 retry-build branch/base 的合法來源；保留 exact run/repo/Candidate、成功狀態與 typed ship evidence 檢查（見 `changelog.d/autosync-source-job-unify.md`）。
 - **cortex 進件：#1339、#1340、#1342**：PR 變動後 resume 失效、依賴牆鐘的測試、Copilot 修正輪數把同步 main 算進去；登記三個 work item 與 accepted todo（見 `changelog.d/cortex-intake-batch-20261007.md`）。
 - **#1336 clean-behind 自動同步後派出 verification**：成功的 `main-sync-autosync` Manager job 可作為 exact Candidate 的 reviewer 來源，verify tick 會沿用其 branch 並把新 Candidate 當作後續 build base；同步前 build ledger 綁定舊 Candidate，不會傳給 verifier，verification 對合併後 Candidate 自行執行檢查（見 `changelog.d/main-sync-reverify-builder-context.md`）。
 - **#1334 clean-behind 自動同步的 Git 身分**：merge 以 `-c user.name`／`-c user.email` 明確帶入設定的 `PSC_MAIN_SYNC_GIT_IDENTITY`（`Name <email>`）或來源 checkout 的有效身分；ship clone 複製來源 checkout 實際生效的身分；上限只計成功建立新 Candidate 的同步。
