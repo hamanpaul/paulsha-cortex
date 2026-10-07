@@ -1,0 +1,1 @@
+- **#1321 reviewer sandbox 採信前保留**：重派只在新 reviewer job 成功啟動後回收舊 sandbox；terminal 採信失敗時保留 sandbox，採信證據綁定後才清理。sandbox 提前消失時明確回報 `reviewer-sandbox-discarded-before-adoption`，並提供 `retry-card` recovery。

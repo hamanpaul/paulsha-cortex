@@ -646,7 +646,7 @@ def test_periodic_runner_preserves_explicit_stop_reason(tmp_path: Path) -> None:
     assert reason["evidence_refs"] == [str(log_path)]
 
 
-def test_explicit_stop_discards_reviewer_sandbox_with_candidate_drift_guard(
+def test_explicit_stop_preserves_reviewer_sandbox_until_retry_dispatch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -681,13 +681,7 @@ def test_explicit_stop_discards_reviewer_sandbox_with_candidate_drift_guard(
     result = _resume(registry, run.run_id, coordinator_root=coordinator_root)
 
     assert result["reason"] == "review-terminal-explicit-stop"
-    assert calls == [
-        {
-            "job_id": review_job["job_id"],
-            "coordinator_root": str(coordinator_root),
-            "require_candidate_unchanged": True,
-        }
-    ]
+    assert calls == []
 
 
 def test_reviewer_candidate_drift_becomes_needs_human_instead_of_raising(
@@ -710,10 +704,13 @@ def test_reviewer_candidate_drift_becomes_needs_human_instead_of_raising(
         ),
     )
 
-    def drift(*args, **kwargs):
-        raise ValueError("workflow reviewer modified Candidate checkout")
+    registry._find_job(str(review_job["job_id"]))["workflow_sandbox_hash"] = "0" * 64
+    registry._persist()
 
-    monkeypatch.setattr(manager, "_discard_reviewer_sandbox", drift)
+    def drift(_job):
+        return False
+
+    monkeypatch.setattr(manager, "_reviewer_candidate_unchanged", drift)
 
     result = _resume(registry, run.run_id, coordinator_root=coordinator_root)
 

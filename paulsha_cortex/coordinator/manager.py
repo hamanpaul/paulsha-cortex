@@ -9258,17 +9258,70 @@ def _discard_reviewer_sandbox(
     repo_root = job.get("workflow_repo_root")
     if not isinstance(repo_root, str):
         raise ValueError("reviewer candidate root missing")
-    candidate_root = Path(repo_root).resolve()
-    expected = str(job["workflow_sandbox_hash"])
     sandbox = _reviewer_sandbox_path(job, coordinator_root)
     if not sandbox.exists() and not sandbox.is_symlink():
         return
-    unchanged = candidate_root.is_dir() and planning_runtime._tree_snapshot(candidate_root) == expected
+    unchanged = _reviewer_candidate_unchanged(job)
     shutil.rmtree(sandbox, ignore_errors=True)
     if sandbox.exists() or sandbox.is_symlink():
         raise ValueError("reviewer sandbox cleanup incomplete")
     if require_candidate_unchanged and not unchanged:
         raise ValueError("workflow reviewer modified Candidate checkout")
+
+
+def _reviewer_candidate_unchanged(job: Mapping[str, object]) -> bool:
+    """Check the candidate tree bound to a reviewer sandbox without deleting it."""
+
+    if job.get("persona") != "reviewer" or not isinstance(job.get("workflow_sandbox_hash"), str):
+        return True
+    repo_root = job.get("workflow_repo_root")
+    if not isinstance(repo_root, str):
+        return False
+    candidate_root = Path(repo_root).resolve()
+    return (
+        candidate_root.is_dir()
+        and planning_runtime._tree_snapshot(candidate_root)
+        == str(job["workflow_sandbox_hash"])
+    )
+
+
+def _reviewer_sandbox_present(
+    job: Mapping[str, object], *, coordinator_root: str | Path
+) -> bool:
+    sandbox = _reviewer_sandbox_path(job, coordinator_root)
+    return sandbox.exists() or sandbox.is_symlink()
+
+
+def _reviewer_job_is_current_for_adoption(registry, job: Mapping[str, object]) -> bool:
+    """Limit the missing-sandbox diagnosis to the current, latest card attempt."""
+
+    run_id = job.get("workflow_run_id")
+    job_id = job.get("job_id")
+    if not isinstance(run_id, str) or not isinstance(job_id, str):
+        return True
+    try:
+        run = registry.get_workflow_run(run_id)
+        step = _current_workflow_step(run)
+        if (
+            step is None
+            or run.current_phase != job.get("workflow_phase")
+            or step.card != job.get("workflow_card")
+            or run.candidate_head != job.get("subject_head")
+            or job.get("workflow_claim_key") not in (None, run.claim_key)
+        ):
+            return False
+        matching = [
+            row
+            for row in registry.list_jobs()
+            if row.get("workflow_run_id") == run_id
+            and row.get("workflow_card") == job.get("workflow_card")
+            and row.get("workflow_phase") == job.get("workflow_phase")
+            and row.get("subject_head") == job.get("subject_head")
+            and row.get("workflow_claim_key") in (None, run.claim_key)
+        ]
+    except Exception:  # noqa: BLE001 - inability to prove supersession keeps fail-closed diagnosis
+        return True
+    return bool(matching and matching[-1].get("job_id") == job_id)
 
 
 def _reclaim_superseded_era_reviewer_sandboxes(
@@ -9317,6 +9370,18 @@ def terminalize_workflow_job(
     """Create and atomically bind canonical evidence for one terminal workflow job."""
 
     job = registry.get_job(job_id)
+    reviewer_sandbox_path: Path | None = None
+    if (
+        job.get("workflow_evidence") is None
+        and job.get("persona") == "reviewer"
+        and isinstance(job.get("workflow_sandbox_hash"), str)
+        and _reviewer_job_is_current_for_adoption(registry, job)
+    ):
+        reviewer_sandbox_path = _reviewer_sandbox_path(job, coordinator_root)
+        if not reviewer_sandbox_path.is_dir():
+            raise ValueError("reviewer-sandbox-discarded-before-adoption")
+        if not _reviewer_candidate_unchanged(job):
+            raise ValueError("workflow reviewer modified Candidate checkout")
     _WorkflowReportPublicationTransaction.reconcile(
         registry=registry,
         job=job,
@@ -9550,12 +9615,6 @@ def terminalize_workflow_job(
         input_snapshot,
         coordinator_root=coordinator_root,
     )
-    if job.get("persona") == "reviewer":
-        _discard_reviewer_sandbox(
-            job,
-            coordinator_root=coordinator_root,
-            require_candidate_unchanged=True,
-        )
     baseline_rows = job.get("workflow_output_baseline")
     if not isinstance(baseline_rows, list):
         raise ValueError("workflow job output baseline missing")
@@ -9682,6 +9741,12 @@ def terminalize_workflow_job(
         )
     if sandbox_path is not None:
         shutil.rmtree(sandbox_path, ignore_errors=True)
+    if reviewer_sandbox_path is not None:
+        _discard_reviewer_sandbox(
+            job,
+            coordinator_root=coordinator_root,
+            require_candidate_unchanged=False,
+        )
     return bound
 
 
@@ -15973,18 +16038,25 @@ def _dispatch_workflow_card(
     )
     if reusable and not retryable_latest:
         return reusable[-1]
-    # #569：reviewer 卡的強制重派要先回收被取代 job 的 sandbox。sandbox 目錄名
-    # 現在以 `sha256(run_id:card:candidate:job_id)` 綁 job；legacy
-    # `sha256(run_id:card:candidate)` 名只保留為容忍／回收面。`require_candidate_unchanged=True`
-    # 讓「reviewer 動過 candidate」fail closed——重派不得成為蓋掉這個事實的名義。刻意只掛在
-    # forced 路徑上：其餘既有路徑的 sandbox 已由 terminalize／resume 的既有回收
-    # 點處理，行為一個字節都不動。
-    if force_new_card and matching and step.persona == "reviewer":
-        _discard_reviewer_sandbox(
-            matching[-1],
-            coordinator_root=coordinator_root,
-            require_candidate_unchanged=True,
-        )
+    superseded_reviewer_job = None
+    if step.persona == "reviewer":
+        if reusable and retryable_latest and reusable[-1].get("status") in TERMINAL_STATUSES:
+            superseded_reviewer_job = reusable[-1]
+        elif (
+            force_new_card
+            and matching
+            and matching[-1].get("status") in TERMINAL_STATUSES
+        ):
+            superseded_reviewer_job = matching[-1]
+        if (
+            superseded_reviewer_job is not None
+            and isinstance(superseded_reviewer_job.get("workflow_sandbox_hash"), str)
+            and _reviewer_sandbox_present(
+                superseded_reviewer_job, coordinator_root=coordinator_root
+            )
+            and not _reviewer_candidate_unchanged(superseded_reviewer_job)
+        ):
+            raise ValueError("workflow reviewer modified Candidate checkout")
     if step.persona == "reviewer":
         _reclaim_superseded_era_reviewer_sandboxes(
             matching,
@@ -17223,7 +17295,6 @@ def _dispatch_workflow_card(
                     adapter.confirm_context_delivered(prepared),
                     coordinator_root=coordinator_root,
                 )
-        return attached_job
     except BaseException as launch_exc:
         launch_classification = provider_outcome.classify_launch_failure(
             exc=launch_exc,
@@ -17292,6 +17363,13 @@ def _dispatch_workflow_card(
             except Exception as cleanup_exc:
                 raise cleanup_exc from launch_exc
         raise
+    if superseded_reviewer_job is not None:
+        _discard_reviewer_sandbox(
+            superseded_reviewer_job,
+            coordinator_root=coordinator_root,
+            require_candidate_unchanged=True,
+        )
+    return attached_job
 
 
 def dispatch_workflow_card(
@@ -18033,20 +18111,6 @@ def resume_workflow_run(
                 )
             ):
                 recovery_job_id = str(latest_recovery["job_id"])
-            if recovery_job_id is not None:
-                try:
-                    _discard_reviewer_sandbox(
-                        latest_recovery,
-                        coordinator_root=coordinator_root,
-                        require_candidate_unchanged=True,
-                    )
-                except ValueError:
-                    return {
-                        "run_id": run.run_id,
-                        "current_phase": run.current_phase,
-                        "job_id": recovery_jobs[-1].get("job_id"),
-                        "reason": "reviewer-candidate-drift",
-                    }
         run = registry._manager_update_workflow_run(
             run.run_id,
             facets=tuple(facet for facet in run.facets if facet != "needs_human"),
@@ -18514,13 +18578,11 @@ def resume_workflow_run(
         if runtime_contract_failed:
             failure_reason = "runtime-contract-failed"
         sandbox_ok = True
-        try:
-            _discard_reviewer_sandbox(
-                job,
-                coordinator_root=coordinator_root,
-                require_candidate_unchanged=True,
-            )
-        except ValueError:
+        if (
+            job.get("persona") == "reviewer"
+            and isinstance(job.get("workflow_sandbox_hash"), str)
+            and not _reviewer_candidate_unchanged(job)
+        ):
             failure_reason = "reviewer-candidate-drift"
             sandbox_ok = False
         # #260 R6：失敗回報附帶唯讀 terminal 診斷（observed HEAD／job id／失敗
@@ -18712,11 +18774,12 @@ def resume_workflow_run(
         log_path = job.get("log_path")
         evidence_refs = (log_path,) if isinstance(log_path, str) and log_path else ()
         try:
-            _discard_reviewer_sandbox(
-                job,
-                coordinator_root=coordinator_root,
-                require_candidate_unchanged=True,
-            )
+            if (
+                job.get("persona") == "reviewer"
+                and isinstance(job.get("workflow_sandbox_hash"), str)
+                and not _reviewer_candidate_unchanged(job)
+            ):
+                raise ValueError("workflow reviewer modified Candidate checkout")
         except ValueError as exc:
             current = registry.get_workflow_run(run.run_id)
             updated = registry._manager_update_workflow_run(
@@ -18875,10 +18938,19 @@ def resume_workflow_run(
             if step.phase == "review"
             else {}
         )
-        _discard_reviewer_sandbox(
-            registry.get_job(str(job["job_id"])),
-            coordinator_root=coordinator_root,
-            require_candidate_unchanged=True,
+        sandbox_was_discarded = (
+            isinstance(exc, ValueError)
+            and str(exc) == "reviewer-sandbox-discarded-before-adoption"
+        )
+        failure_reason = (
+            "reviewer-sandbox-discarded-before-adoption"
+            if sandbox_was_discarded
+            else "terminalize-workflow-job-failed"
+        )
+        failure_detail = (
+            "reviewer sandbox 在 terminal 採信前已不存在；請以 retry-card 重派這張卡。"
+            if sandbox_was_discarded
+            else f"採信 terminal envelope 時擲出例外：{summarize_exception(exc)}"
         )
         current = registry.get_workflow_run(run.run_id)
         registry._manager_update_workflow_run(
@@ -18886,8 +18958,8 @@ def resume_workflow_run(
             facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
             gate_status="running",
             needs_human_reason=diagnostic_reason(
-                "terminalize-workflow-job-failed",
-                f"採信 terminal envelope 時擲出例外：{summarize_exception(exc)}",
+                failure_reason,
+                failure_detail,
                 source="manager._poll_workflow_job:terminalize",
                 run_id=run.run_id,
                 work_id=run.work_id,

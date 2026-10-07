@@ -14,7 +14,7 @@ work_item: reviewer-sandbox-retention
 
 ## Tasks
 
-- [ ] **T1 RED**：重現「reviewer job 已結束、未採信，resume 的派卡擲出例外」之後 sandbox 被刪除、下一輪收割失敗。
-- [ ] **T2 延後丟棄**：sandbox 只在新卡成功派出，或 terminal 已採信（evidence 落地）之後才丟棄；派卡失敗時保留，下一輪可直接採信既有的 terminal。
-- [ ] **T3 明確錯誤**：terminal 的 sandbox 已不存在時，needs_human 的 reason 明說（例如 `reviewer-sandbox-discarded-before-adoption`），next_actions 含 `retry-card`。
-- [ ] **T4 文件**：新增 changelog fragment，並同步 `CHANGELOG.md [Unreleased]`。
+- [x] **T1 RED**：重現「reviewer job 已結束、未採信，resume 的派卡擲出例外」之後 sandbox 被刪除、下一輪收割失敗。
+- [x] **T2 延後丟棄**：sandbox 只在新卡成功派出，或 terminal 已採信（evidence 落地）之後才丟棄；派卡失敗時保留，下一輪可直接採信既有的 terminal。
+- [x] **T3 明確錯誤**：terminal 的 sandbox 已不存在時，needs_human 的 reason 明說（例如 `reviewer-sandbox-discarded-before-adoption`），next_actions 含 `retry-card`。
+- [x] **T4 文件**：新增 changelog fragment，並同步 `CHANGELOG.md [Unreleased]`。
