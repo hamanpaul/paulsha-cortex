@@ -1,0 +1,1 @@
+- 進件：`autosync-source-job-unify`（#1345），自動同步的 candidate 來源 job 判定統一，review 收割與 repair build 也要認 autosync job。
