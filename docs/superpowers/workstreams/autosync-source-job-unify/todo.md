@@ -15,7 +15,7 @@ work_item: autosync-source-job-unify
 
 ## Tasks
 
-- [ ] **T1 RED**：以端到端測試重現兩個失敗：自動同步後 code-review 收割的 binding mismatch；自動同步後 retry-build 的 branch outside base。
-- [ ] **T2 單一判定 helper**：抽出「candidate 的來源 job」判定 helper，`_workflow_stage_execution_builder_context`、`_review_builder_job_binding`、repair build 推導 base／branch 的地方一律共用；自動同步的 manager job 與 openspec-archive 同等對待。
-- [ ] **T3 端到端**：clean-behind → 自動同步 → verification 通過 → code-review 收割通過 → 進入 ship；自動同步後 retry-build 能派出 repair build。
-- [ ] **T4 文件**：新增 changelog fragment，並同步 `CHANGELOG.md [Unreleased]`。
+- [x] **T1 RED**：以端到端測試重現兩個失敗：自動同步後 code-review 收割的 binding mismatch；自動同步後 retry-build 的 branch outside base。
+- [x] **T2 單一判定 helper**：抽出「candidate 的來源 job」判定 helper，`_workflow_stage_execution_builder_context`、`_review_builder_job_binding`、repair build 推導 base／branch 的地方一律共用；自動同步的 manager job 與 openspec-archive 同等對待。
+- [x] **T3 端到端**：clean-behind → 自動同步 → verification 通過 → code-review 收割通過 → 進入 ship；自動同步後 retry-build 能派出 repair build。
+- [x] **T4 文件**：新增 changelog fragment，並同步 `CHANGELOG.md [Unreleased]`。

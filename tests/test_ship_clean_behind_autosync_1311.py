@@ -25,6 +25,7 @@ from paulsha_cortex.coordinator.workflow import WorkflowStep
 from paulsha_cortex.monitor.providers import WorkflowRegistryProvider
 from paulsha_cortex.monitor.work_api import WorkReadModelStore
 
+from diagnostic_fixtures import fixture_needs_human_reason
 from git_fixtures import make_job_clone
 from test_preflight_closeout_order import _ship_harness
 from test_monitor_work_api import _item, _snapshot
@@ -62,6 +63,9 @@ class _VerificationLauncher:
     def as_review_only(self, *, terminal_kind: str):
         return self
 
+    def as_commit_required(self):
+        return self
+
     def executor_environment(self) -> runtime_preflight.ExecutorEnvironment:
         return runtime_preflight.ExecutorEnvironment(
             name=f"{self.executor}-workflow",
@@ -80,6 +84,22 @@ class _VerificationLauncher:
             pid=4242,
             log_path=str(Path(log_dir) / f"{slice_id}.jsonl"),
         )
+
+
+class _CandidateCheckingBuildWorkspaceCreator:
+    def __init__(self, repo: Path, root: Path) -> None:
+        self.repo = repo
+        self.root = root
+        self.calls: list[tuple[str, str, str]] = []
+
+    def create(self, branch: str, *, job_id: str, base_sha: str, **_kwargs) -> Path:
+        target = self.root / job_id
+        workspace = make_job_clone(self.repo, target, branch=branch)
+        actual_head = _git(workspace, "rev-parse", "HEAD")
+        self.calls.append((branch, base_sha, actual_head))
+        if actual_head != base_sha:
+            raise ValueError("existing worktree branch has commits outside requested base")
+        return workspace
 
 
 def _seed_candidate_bound_build_ledger(
@@ -305,6 +325,102 @@ def test_clean_behind_main_is_merged_by_manager_and_only_verify_is_reopened(
     assert verify_job["branch"] == autosync_job["branch"]
     assert launcher.calls
     assert original_gate_ledger["sha256"] not in launcher.calls[0]["prompt"]
+    bound_source, autosync_author = manager._review_builder_job_binding(
+        harness.registry,
+        run=current,
+        builder_job_id=autosync_job["job_id"],
+        candidate=updated.candidate_head,
+    )
+    assert bound_source["job_id"] == autosync_job["job_id"]
+    assert autosync_author is True
+
+
+def test_retry_build_after_autosync_uses_autosynced_candidate_branch_and_base(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _ship_harness(
+        tmp_path,
+        monkeypatch,
+        active_change=False,
+        archived_change=True,
+        probe_runner=subprocess.run,
+    )
+    origin = _wire_local_origin(harness, tmp_path / "origin")
+    _advance_origin_main(origin, tmp_path / "main-advance")
+    ship_creator = _ShipWorkspaceCreator(harness.repo, tmp_path / "ship-workspaces")
+    result = _advance_to_ship(
+        harness,
+        _production_validator(harness, tmp_path, creator=ship_creator),
+    )
+    assert result["main_sync_autosync"]["outcome"] == "merged"
+    candidate = str(result["candidate_head"])
+
+    run = harness.registry._manager_update_workflow_run(
+        harness.run_id,
+        facets=("needs_human",),
+        needs_human_reason=fixture_needs_human_reason(),
+    )
+    run = harness.registry._manager_reset_workflow_for_retry_build(
+        run.run_id,
+        expected_candidate=candidate,
+        repair_action="Repair the candidate after autosync.",
+    )
+    work_actions._record_retry_build_receipt(
+        run=run,
+        state_path=harness.registry._state_path,
+    )
+
+    monkeypatch.setattr(manager, "_EXECUTOR_AUTH_CACHE", {})
+    manager._EXECUTOR_AUTH_CACHE["codex"] = runtime_preflight.ProviderFreshness(
+        provider_id="codex",
+        status="ok",
+        observed_at=time.time(),
+        ttl_seconds=900.0,
+        source="snapshot",
+    )
+    monkeypatch.setattr(
+        manager,
+        "_validated_brainstorm_planning_authority",
+        lambda bound_run, **_kwargs: (
+            bound_run.planning_authority,
+            bound_run.planning_source_revision,
+        ),
+    )
+    workspace_creator = _CandidateCheckingBuildWorkspaceCreator(
+        harness.repo, tmp_path / "repair-workspaces"
+    )
+    dispatcher = SimpleNamespace(
+        _registry=harness.registry,
+        _git_runner=None,
+        _worktree_creator=workspace_creator,
+        poll_headless_done=lambda job_id: harness.registry.get_job(job_id),
+    )
+    launcher = _VerificationLauncher("codex", "gpt-repair")
+    tick = manager.resume_workflow_run(
+        dispatcher,
+        run_id=run.run_id,
+        identities=IdentityRegistry.from_rows(
+            [
+                {
+                    "executor": "codex",
+                    "model_id": "gpt-repair",
+                    "independence_domain": "openai",
+                    "capabilities": ["build"],
+                }
+            ]
+        ),
+        launcher_factory=lambda _identity: launcher,
+        coordinator_root=harness.state_root,
+    )
+
+    assert tick["reason"] in {"in-flight", "card-terminal-malformed-retry"}
+    repair_job = harness.registry.get_job(str(tick["job_id"]))
+    assert repair_job["workflow_phase"] == "build"
+    assert repair_job["branch"] == "feature/14-work"
+    assert workspace_creator.calls == [
+        ("feature/14-work", candidate, candidate)
+    ]
 
 
 def test_autosync_real_git_merge_uses_source_identity_when_ship_clone_has_none(
