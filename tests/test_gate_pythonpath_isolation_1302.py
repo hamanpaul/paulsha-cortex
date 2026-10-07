@@ -16,7 +16,7 @@ PYTHON_PATH_ENVIRONMENT = (
 )
 
 
-def test_gate_imports_worktree_fixture_instead_of_daemon_pin(
+def test_gate_cannot_import_fixture_available_only_from_daemon_pin(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -25,9 +25,6 @@ def test_gate_imports_worktree_fixture_instead_of_daemon_pin(
     pin.mkdir()
     worktree.mkdir()
     (pin / "pythonpath_fixture.py").write_text("VALUE = 'pin'\n", encoding="utf-8")
-    (worktree / "pythonpath_fixture.py").write_text(
-        "VALUE = 'worktree'\n", encoding="utf-8"
-    )
     monkeypatch.setenv("PYTHONPATH", str(pin))
 
     rows = gate_ledger.run_gates(
@@ -44,7 +41,10 @@ def test_gate_imports_worktree_fixture_instead_of_daemon_pin(
         worktree=worktree,
     )
 
-    assert rows[0]["status"] == "passed"
+    assert rows[0]["status"] == "failed"
+    assert rows[0]["exit_code"] == 1
+    assert "ModuleNotFoundError" in rows[0]["detail"]
+    assert "pythonpath_fixture" in rows[0]["detail"]
 
 
 def test_gate_subprocess_drops_python_startup_and_path_environment(
