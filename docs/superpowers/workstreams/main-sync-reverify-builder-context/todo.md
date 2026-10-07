@@ -14,7 +14,7 @@ work_item: main-sync-reverify-builder-context
 
 ## Tasks
 
-- [ ] **T1 RED**：端到端測試 clean-behind → 自動同步 merge 成功 → 下一輪 tick 派 verification 卡，現行實作會丟出 `workflow reviewer builder job unavailable`。
-- [ ] **T2 來源 job**：`_workflow_stage_execution_builder_context` 把 `main-sync-autosync` 的 manager job 視為 candidate 的來源，與 `openspec-archive` 同等對待；`_dispatch_workflow_card` 後續推導 branch、base 的地方一併檢查。
-- [ ] **T3 gate ledger**：明確定義自動同步後 verification 要使用哪份 gate ledger（沿用原 build 卡的 ledger，或重跑 gate），並寫測試固定行為。
-- [ ] **T4 文件**：新增 changelog fragment，並同步 `CHANGELOG.md [Unreleased]`。
+- [x] **T1 RED**：端到端測試 clean-behind → 自動同步 merge 成功 → 下一輪 tick 派 verification 卡，現行實作會丟出 `workflow reviewer builder job unavailable`。
+- [x] **T2 來源 job**：`_workflow_stage_execution_builder_context` 把 `main-sync-autosync` 的 manager job 視為 candidate 的來源，與 `openspec-archive` 同等對待；`_dispatch_workflow_card` 後續推導 branch、base 的地方一併檢查。
+- [x] **T3 gate ledger**：明確定義自動同步後 verification 要使用哪份 gate ledger（沿用原 build 卡的 ledger，或重跑 gate），並寫測試固定行為。
+- [x] **T4 文件**：新增 changelog fragment，並同步 `CHANGELOG.md [Unreleased]`。
