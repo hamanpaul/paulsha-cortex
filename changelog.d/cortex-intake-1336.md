@@ -1,0 +1,1 @@
+- 進件：`main-sync-reverify-builder-context`（#1336），clean-behind 自動同步後 verification 卡要能找到 candidate 的來源 job。
