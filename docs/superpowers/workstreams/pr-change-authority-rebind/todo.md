@@ -14,8 +14,8 @@ work_item: pr-change-authority-rebind
 
 ## Tasks
 
-- [ ] **T1 RED**：run 已有 PR，PR 新增一則 review 留言後，`resume` 回 mismatch（現行行為）。
-- [ ] **T2 重新綁定**：PR 本身的變動（review、留言、CI 狀態，以及 Manager 自己 push 的 head）不讓 claim 失效。在 resume／review-disposition 時，以 Manager 自產的交付事實（PR head 等於 candidate 或其 autosync 後代）重新綁定 `active`，並留下 receipt。
-- [ ] **T3 仍要 fail closed**：PR 改綁、todo 改寫、issue 關閉時拒絕，並給出明確的 reason。
-- [ ] **T4 恢復路徑**：`regenerate-gates`→`resume` 在 PR 已存在時能採信已通過的 build。
-- [ ] **T5 文件**：新增 changelog fragment，並同步 `CHANGELOG.md [Unreleased]`。
+- [x] **T1 RED**：run 已有 PR，PR 新增一則 review 留言後，`resume` 回 mismatch（現行行為）。
+- [x] **T2 重新綁定**：PR 本身的變動（review、留言、CI 狀態，以及 Manager 自己 push 的 head）不讓 claim 失效。在 resume／review-disposition 時，以 Manager 自產的交付事實（PR head 等於 candidate 或其 autosync 後代）重新綁定 `active`，並留下 receipt。
+- [x] **T3 仍要 fail closed**：PR 改綁、todo 改寫、issue 關閉時拒絕，並給出明確的 reason。
+- [x] **T4 恢復路徑**：`regenerate-gates`→`resume` 在 PR 已存在時能採信已通過的 build。
+- [x] **T5 文件**：新增 changelog fragment，並同步 `CHANGELOG.md [Unreleased]`。

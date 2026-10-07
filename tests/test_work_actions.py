@@ -2880,6 +2880,329 @@ def test_resume_does_not_reset_gates_when_manager_pr_becomes_authority_source(
     assert len(registry.list_jobs()) == initial_job_count
 
 
+def _seed_manager_pr_rebind_delivery(
+    *, snapshot: Path, state: Path, registry: JobRegistry, run_id: str
+):
+    from paulsha_cortex.coordinator.claim import work_authority_digest
+
+    authority = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=snapshot
+    )
+    run = registry.get_workflow_run(run_id)
+    row = work_actions._delivery_journal_row(run, authority)
+    row["delivery_binding"] = {
+        "pr_number": 8,
+        "change": "demo",
+        "todo_paths": ["docs/todo.md"],
+    }
+    row["pushes"] = {
+        HEAD: {
+            "branch": "feature/demo",
+            "ref": "refs/heads/feature/demo",
+            "head": HEAD,
+        }
+    }
+    journal = work_actions._load_runs(state)
+    journal["runs"][run_id] = row
+    work_actions._save_runs(state, journal)
+    assert row["authority_digest"] == work_authority_digest(authority)
+    return authority
+
+
+def _manager_pr_rebind_initial_snapshot(snapshot: Path) -> Path:
+    return _snapshot(
+        snapshot,
+        prs=(8,),
+        source_revisions=(
+            "issue:12@open",
+            "openspec:demo@1",
+            "todo:docs/todo.md@1",
+            "github_pr:acme/demo#8@identity:acme/demo#8;state:open;reviews:0;checks:pending",
+        ),
+        provider_revision="gh-1",
+    )
+
+
+def _manager_pr_rebind_snapshot(snapshot: Path, *, change: str = "pr-updated") -> None:
+    if change == "pr-updated":
+        source_revisions = (
+            "issue:12@open",
+            "openspec:demo@1",
+            "todo:docs/todo.md@1",
+            "github_pr:acme/demo#8@identity:acme/demo#8;state:open;reviews:1;checks:passed",
+        )
+        prs = (8,)
+        todo_paths = ("docs/todo.md",)
+    elif change == "pr-remapped":
+        source_revisions = (
+            "issue:12@open",
+            "openspec:demo@1",
+            "todo:docs/todo.md@1",
+            "github_pr:acme/demo#9@identity:acme/demo#9;state:open;reviews:1;checks:passed",
+        )
+        prs = (9,)
+        todo_paths = ("docs/todo.md",)
+    elif change == "todo-remapped":
+        source_revisions = (
+            "issue:12@open",
+            "openspec:demo@1",
+            "todo:docs/other.md@1",
+            "github_pr:acme/demo#8@identity:acme/demo#8;state:open;reviews:1;checks:passed",
+        )
+        prs = (8,)
+        todo_paths = ("docs/other.md",)
+    elif change == "todo-rewritten":
+        source_revisions = (
+            "issue:12@open",
+            "openspec:demo@1",
+            "todo:docs/todo.md@2",
+            "github_pr:acme/demo#8@identity:acme/demo#8;state:open;reviews:1;checks:passed",
+        )
+        prs = (8,)
+        todo_paths = ("docs/todo.md",)
+    elif change == "issue-closed":
+        source_revisions = (
+            "issue:12@closed",
+            "openspec:demo@1",
+            "todo:docs/todo.md@1",
+            "github_pr:acme/demo#8@identity:acme/demo#8;state:open;reviews:1;checks:passed",
+        )
+        prs = (8,)
+        todo_paths = ("docs/todo.md",)
+    else:  # pragma: no cover - test fixture guard
+        raise AssertionError(change)
+    _snapshot(
+        snapshot,
+        prs=prs,
+        source_revisions=source_revisions,
+        provider_revision="gh-2",
+        todo_paths=todo_paths,
+    )
+
+
+def _install_exact_manager_pr_facts(monkeypatch: pytest.MonkeyPatch) -> None:
+    class GitHub:
+        def __init__(self, *, runner):
+            pass
+
+        def fetch_pr_lifecycle_status(self, *, repo, pr_number):
+            return SimpleNamespace(number=pr_number, state="open", terminal=False)
+
+        def fetch_merge_status(self, *, repo, pr_number):
+            return SimpleNamespace(pr_head=HEAD)
+
+    monkeypatch.setattr(work_actions, "GitHubDeliveryClient", GitHub)
+
+
+def test_resume_rebinds_manager_pr_authority_without_resetting_passed_build(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    snapshot = _manager_pr_rebind_initial_snapshot(tmp_path / "snapshot.json")
+    state = tmp_path / "delivery-journal.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    before = _seed_verified_run_with_gate(
+        registry, run_id, phase="review", pr_refs=("acme/demo#8",)
+    )
+    passed_steps = tuple(
+        replace(step, gate_result="passed") if step.phase == "build" else step
+        for step in before.steps
+    )
+    before = registry._manager_update_workflow_run(run_id, steps=passed_steps)
+    old_authority = _seed_manager_pr_rebind_delivery(
+        snapshot=snapshot, state=state, registry=registry, run_id=run_id
+    )
+    _manager_pr_rebind_snapshot(snapshot)
+    _install_exact_manager_pr_facts(monkeypatch)
+
+    result = work_actions.execute_work_action(
+        args={"action": "resume", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 210,
+        workflow_registry=registry,
+    )
+
+    current_authority = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=snapshot
+    )
+    after = registry.get_workflow_run(run_id)
+    row = work_actions._load_runs(state)["runs"][run_id]
+    receipt = row.get("authority_rebind_receipt")
+    assert result["result"]["action"] == "resume"
+    assert after == before
+    assert row["claim_key"] == before.claim_key
+    assert row["source_revisions"] == list(current_authority.source_revisions)
+    assert row["authority_digest"] == work_actions.work_authority_digest(
+        current_authority
+    )
+    assert row["mapped_prs"] == [8]
+    assert isinstance(receipt, dict)
+    assert receipt["sha256"]
+    assert Path(receipt["ref"]).is_file()
+    assert old_authority.mapped_prs == (8,)
+
+
+@pytest.mark.parametrize(
+    ("change", "expected_reason"),
+    [
+        ("pr-remapped", "pr-target-changed"),
+        ("todo-remapped", "todo-mapping-changed"),
+        ("todo-rewritten", "todo-source-changed"),
+        ("issue-closed", "issue-status-changed"),
+    ],
+)
+def test_resume_fails_closed_when_pr_rebind_changes_delivery_target(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    change: str,
+    expected_reason: str,
+) -> None:
+    snapshot = _manager_pr_rebind_initial_snapshot(tmp_path / "snapshot.json")
+    state = tmp_path / "delivery-journal.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    _seed_verified_run_with_gate(
+        registry, run_id, phase="review", pr_refs=("acme/demo#8",)
+    )
+    _seed_manager_pr_rebind_delivery(
+        snapshot=snapshot, state=state, registry=registry, run_id=run_id
+    )
+    _manager_pr_rebind_snapshot(snapshot, change=change)
+    _install_exact_manager_pr_facts(monkeypatch)
+
+    result = work_actions.execute_work_action(
+        args={"action": "resume", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 210,
+        workflow_registry=registry,
+    )
+
+    assert result["result"]["action"] == "blocked"
+    assert result["result"]["reason"] == expected_reason
+    assert not work_actions._load_runs(state)["runs"][run_id].get(
+        "authority_rebind_receipt"
+    )
+
+
+def test_review_disposition_rebinds_manager_pr_authority_before_recording(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    snapshot = _manager_pr_rebind_initial_snapshot(tmp_path / "snapshot.json")
+    state = tmp_path / "delivery-journal.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    before = _seed_verified_run_with_gate(
+        registry, run_id, phase="review", pr_refs=("acme/demo#8",)
+    )
+    before = registry._manager_update_workflow_run(
+        run_id,
+        steps=_review_steps_passed(before.steps),
+    )
+    _seed_manager_pr_rebind_delivery(
+        snapshot=snapshot, state=state, registry=registry, run_id=run_id
+    )
+    journal = work_actions._load_runs(state)
+    journal_row = journal["runs"][run_id]
+    journal_row["ship"] = {
+        "phase": "needs-fix",
+        "head": HEAD,
+        "pr_number": 8,
+        "change": "demo",
+        "todo_paths": ["docs/todo.md"],
+        "review_id": 9,
+        "finding_count": 1,
+        "findings": [{"path": "src/demo.py", "line": 7, "body": "finding"}],
+        "fix_rounds": 0,
+    }
+    work_actions._save_runs(state, journal)
+    _manager_pr_rebind_snapshot(snapshot)
+
+    class GitHub:
+        def __init__(self, *, runner):
+            pass
+
+        def fetch_pr_lifecycle_status(self, *, repo, pr_number):
+            return SimpleNamespace(number=pr_number, state="open", terminal=False)
+
+        def fetch_merge_status(self, *, repo, pr_number):
+            return SimpleNamespace(pr_head=HEAD)
+
+        def fetch_delivery_facts(self, *, repo, pr_number, change):
+            return DeliveryFacts(
+                head=HEAD,
+                mergeable=True,
+                mergeable_state="clean",
+                checks=(),
+                copilot_reviews=(
+                    CopilotReview(
+                        review_id=9,
+                        commit_id=HEAD,
+                        state="COMMENTED",
+                        body="finding",
+                        author=COPILOT_REVIEWER_LOGIN,
+                        submitted_at_epoch=205,
+                    ),
+                ),
+                review_threads=(
+                    ReviewThread("thread-1", True, False, "src/demo.py", 7, "finding"),
+                ),
+                closing_issues=(12,),
+                active_openspec_absent=True,
+                archive_present=True,
+            )
+
+    monkeypatch.setattr(work_actions, "GitHubDeliveryClient", GitHub)
+    result = work_actions.execute_work_action(
+        args={
+            "action": "review-disposition",
+            "repo": "acme/demo",
+            "work_id": "demo",
+            "actor": "maintainer",
+            "reason": "討論已完成，此 finding 不阻擋合併。",
+        },
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 212,
+        workflow_registry=registry,
+    )
+
+    row = work_actions._load_runs(state)["runs"][run_id]
+    assert result["result"]["action"] == "review-disposition-recorded"
+    assert row["mapped_prs"] == [8]
+    assert row["authority_rebind_receipt"]["sha256"]
+    assert row["review_dispositions"]
+    assert registry.get_workflow_run(run_id).claim_key == before.claim_key
+
+
 def test_resume_restarts_exactly_once_for_a_real_authority_change(
     tmp_path: Path,
 ) -> None:

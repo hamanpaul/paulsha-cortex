@@ -9,6 +9,7 @@
 
 ### Fixed
 
+- **#1339 PR authority 更新不再讓已驗證的 build resume 失效**：resume 與 review-disposition 僅在 PR 仍綁定同一 issue／Todo／OpenSpec、issue 仍開啟，且 Manager 交付 journal 與 GitHub readback 證明 PR HEAD 為 Candidate 或其 Manager autosync 後代時，重新綁定變動過的 PR authority 並保存 receipt；PR 改綁、Todo source 改寫或 issue 關閉時 fail closed。（見 `changelog.d/pr-change-authority-rebind.md`）
 - **cortex 進件：#1345 自動同步後 review 收割與 repair build 不認 autosync job**：登記 work item `autosync-source-job-unify` 與 accepted todo（見 `changelog.d/cortex-intake-1345.md`）。
 - **cortex 進件：#1339、#1340、#1342**：PR 變動後 resume 失效、依賴牆鐘的測試、Copilot 修正輪數把同步 main 算進去；登記三個 work item 與 accepted todo（見 `changelog.d/cortex-intake-batch-20261007.md`）。
 - **#1336 clean-behind 自動同步後派出 verification**：成功的 `main-sync-autosync` Manager job 可作為 exact Candidate 的 reviewer 來源，verify tick 會沿用其 branch 並把新 Candidate 當作後續 build base；同步前 build ledger 綁定舊 Candidate，不會傳給 verifier，verification 對合併後 Candidate 自行執行檢查（見 `changelog.d/main-sync-reverify-builder-context.md`）。

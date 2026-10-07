@@ -2360,6 +2360,8 @@ def _rebase_delivery_journal_authority(
             "snapshot_hash": authority.snapshot_hash,
             "provider_revision": authority.github_provider_revision,
             "authority_digest": work_authority_digest(authority),
+            "confirmed_todo": authority.confirmed_todo,
+            "provider_id": authority.github_provider_id,
             # #765：claim_key 必須跟著 run 的現值走——journal 停在建列時代的 claim
             # 會讓 delivery/resume 的 canonical 視圖與 run row 分屬兩個 era，
             # 下游 job 選擇撿到舊 era terminal、binding 每 tick 必炸。

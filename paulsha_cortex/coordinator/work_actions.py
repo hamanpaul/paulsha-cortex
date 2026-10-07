@@ -36,6 +36,7 @@ from .claim import (
     AuthorityValidationError,
     ClaimCandidate,
     REASON_PROVIDER_RATE_LIMITED_CANONICAL,
+    WorkAuthority,
     authority_matches_claim_era,
     build_claim_key,
     build_label_argv,
@@ -1239,7 +1240,11 @@ def _merged_delivery_authority_compatible(
 
 
 def _canonical_workflow_run(
-    *, workflow_registry, authority, merged_delivery_journal: Path | None = None
+    *,
+    workflow_registry,
+    authority,
+    merged_delivery_journal: Path | None = None,
+    allow_pr_authority_rebind: bool = False,
 ):
     matches = [
         run
@@ -1271,6 +1276,22 @@ def _canonical_workflow_run(
     # as soon as a retry/reclaim has occurred.  Multiple live runs remain a
     # hard failure rather than an arbitrary choice.
     active = [run for run in matches if run.status == "ongoing"]
+    if not active and allow_pr_authority_rebind:
+        # A stale PR projection can make the full WorkAuthority digest differ
+        # before the delivery journal is available for validation. Select only
+        # the unique run with the same issue and OpenSpec identity; the caller
+        # must still prove the exact Manager PR push before rebinding any state.
+        rebind_candidates = [
+            run
+            for run in workflow_registry.list_workflow_runs()
+            if run.repo == authority.repo
+            and run.work_id == authority.work_id
+            and run.status == "ongoing"
+            and run.issue_refs
+            == tuple(f"{authority.repo}#{number}" for number in authority.mapped_issues)
+            and _openspec_refs_compatible(run, authority)
+        ]
+        active = rebind_candidates
     if len(active) != 1:
         raise RuntimeError(
             "delivery WorkflowRun does not match current WorkAuthority"
@@ -1292,6 +1313,8 @@ def _delivery_journal_row(run, authority) -> dict[str, Any]:
         "mapped_prs": list(authority.mapped_prs),
         "mapped_openspec": list(authority.mapped_openspec),
         "mapped_todo_paths": list(authority.mapped_todo_paths),
+        "confirmed_todo": authority.confirmed_todo,
+        "provider_id": authority.github_provider_id,
         "workflow_step_ids": [
             f"{run.run_id}:{step.phase}:{step.card}" for step in run.steps
         ],
@@ -1304,12 +1327,15 @@ def _load_work_run(
     workflow_registry,
     authority,
     allow_merged_delivery: bool = False,
+    allow_pr_authority_rebind: bool = False,
+    preserve_authority_provenance: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any], object]:
     run = _canonical_workflow_run(
         workflow_registry=workflow_registry,
         authority=authority,
         # #1141：只有 ship lane 需要在 merge 後續跑 closure；其他動作維持原判準。
         merged_delivery_journal=state_path if allow_merged_delivery else None,
+        allow_pr_authority_rebind=allow_pr_authority_rebind,
     )
     state = _load_runs(state_path)
     active = state["runs"].get(run.run_id)
@@ -1317,7 +1343,7 @@ def _load_work_run(
         active = _delivery_journal_row(run, authority)
         state["runs"][run.run_id] = active
         _save_runs(state_path, state)
-    else:
+    elif not preserve_authority_provenance:
         provenance = {
             "source_revisions": list(authority.source_revisions),
             "snapshot_hash": authority.snapshot_hash,
@@ -1512,12 +1538,373 @@ def _resume_existing_candidate_after_authority_change(
     return {"action": "resume", "reason": "active-workflow", "run": active}
 
 
+def _pr_revision_rows(authority, *, repo: str, number: int) -> tuple[list[str], list[str]]:
+    """Split stable non-PR authority from the one open PR source being rebound."""
+
+    prefix = f"github_pr:{repo}#{number}@"
+    source_id = prefix[:-1]
+    pull_requests: list[str] = []
+    stable: list[str] = []
+    for revision in authority.source_revisions:
+        if revision.startswith("github_pr:"):
+            source, separator, semantic = revision.rpartition("@")
+            if not separator or source != source_id:
+                raise ValueError("pr-target-changed")
+            if "state:closed" in semantic or "state:merged" in semantic:
+                raise ValueError("pr-status-changed")
+            if re.search(r"(?:^|;)state:open(?:;|$)", semantic) is None:
+                raise ValueError("pr-status-unconfirmed")
+            pull_requests.append(revision)
+        else:
+            stable.append(revision)
+    if not pull_requests:
+        raise ValueError("pr-source-missing")
+    if len(pull_requests) != 1:
+        raise ValueError("pr-source-ambiguous")
+    return stable, pull_requests
+
+
+def _manager_autosync_pr_head(run, *, state_root: Path, candidate: str, head: str) -> bool:
+    """Accept only a Manager autosync chain connecting Candidate to the PR head."""
+
+    foreign_reviews = [
+        ref for ref in run.gate_refs
+        if ref.kind == "foreign-review" and isinstance(ref.sha256, str)
+    ]
+    if not foreign_reviews:
+        return False
+    from . import work_bridge
+
+    try:
+        events = work_bridge._read_main_sync_autosync_events(
+            state_root=state_root,
+            run_id=run.run_id,
+            evidence_refs=run.evidence_refs,
+        )
+        for review_ref in foreign_reviews:
+            chain = work_bridge._main_sync_autosync_chain(
+                events=events,
+                candidate=head,
+                review_ref=review_ref.ref,
+                review_hash=review_ref.sha256,
+                source_repo=run.workspace_root,
+            )
+            if chain and any(
+                str(event.get("candidate_before", "")).lower() == candidate.lower()
+                for event in chain
+            ):
+                return True
+    except (OSError, RuntimeError, ValueError, TypeError):
+        return False
+    return False
+
+
+def _pr_authority_rebind_block_reason(active: dict[str, Any], authority, run) -> str | None:
+    """Return the first changed delivery target that must keep the old claim bound."""
+
+    if len(authority.mapped_prs) != 1:
+        return "pr-target-changed"
+    number = authority.mapped_prs[0]
+    expected_pr = f"{authority.repo}#{number}"
+    if run.pr_refs != (expected_pr,) or active.get("mapped_prs") not in ([], [number]):
+        return "pr-target-changed"
+    if active.get("mapped_issues") != list(authority.mapped_issues) or run.issue_refs != tuple(
+        f"{authority.repo}#{value}" for value in authority.mapped_issues
+    ):
+        return "issue-target-changed"
+    if any(
+        revision.endswith("@closed") or "state:closed" in revision
+        for revision in authority.source_revisions
+        if revision.startswith(("issue:", f"github_issue:{authority.repo}#"))
+    ):
+        return "issue-status-changed"
+    if active.get("mapped_todo_paths") != list(authority.mapped_todo_paths):
+        return "todo-mapping-changed"
+    if active.get("mapped_openspec") != list(authority.mapped_openspec):
+        return "openspec-mapping-changed"
+    prior_revisions = active.get("source_revisions")
+    if not isinstance(prior_revisions, list) or any(
+        not isinstance(value, str) for value in prior_revisions
+    ):
+        return "delivery-authority-malformed"
+    try:
+        prior_mapped_issues = active.get("mapped_issues")
+        prior_mapped_prs = active.get("mapped_prs")
+        prior_mapped_openspec = active.get("mapped_openspec")
+        prior_todo_paths = active.get("mapped_todo_paths")
+        if any(
+            not isinstance(value, list)
+            for value in (
+                prior_mapped_issues,
+                prior_mapped_prs,
+                prior_mapped_openspec,
+                prior_todo_paths,
+            )
+        ):
+            return "delivery-authority-malformed"
+        prior_authority = WorkAuthority._verified(
+            repo=authority.repo,
+            work_id=authority.work_id,
+            mapped_issues=tuple(prior_mapped_issues),
+            mapped_prs=tuple(prior_mapped_prs),
+            mapped_openspec=tuple(prior_mapped_openspec),
+            mapped_todo_paths=tuple(prior_todo_paths),
+            confirmed_todo=active.get(
+                "confirmed_todo", bool(prior_todo_paths)
+            ),
+            auto_label=authority.auto_label,
+            source_revisions=tuple(prior_revisions),
+            provider_revision=str(active.get("provider_revision", authority.github_provider_revision)),
+            provider_id=str(active.get("provider_id", authority.github_provider_id)),
+            last_success_epoch=authority.github_last_success_epoch,
+            snapshot_hash=str(active.get("snapshot_hash", authority.snapshot_hash)),
+            requires_github_authority=authority.requires_github_authority,
+        )
+        if work_authority_digest(prior_authority) != active.get("authority_digest"):
+            return "delivery-authority-malformed"
+    except (TypeError, ValueError):
+        return "delivery-authority-malformed"
+    try:
+        current_stable, current_pr = _pr_revision_rows(
+            authority, repo=authority.repo, number=number
+        )
+    except ValueError as exc:
+        return str(exc)
+    prior_stable = [value for value in prior_revisions if not value.startswith("github_pr:")]
+    prior_pr = [value for value in prior_revisions if value.startswith("github_pr:")]
+    if current_stable != prior_stable:
+        if any(
+            revision.endswith("@closed") or "state:closed" in revision
+            for revision in authority.source_revisions
+            if revision.startswith(("issue:", f"github_issue:{authority.repo}#"))
+        ):
+            return "issue-status-changed"
+        if any(value.startswith("todo:") for value in current_stable + prior_stable):
+            return "todo-source-changed"
+        return "non-pr-authority-changed"
+    if prior_pr:
+        if len(prior_pr) != 1:
+            return "pr-source-ambiguous"
+        if any("state:closed" in value or "state:merged" in value for value in prior_pr):
+            return "pr-status-changed"
+        if any(
+            not value.startswith(f"github_pr:{authority.repo}#{number}@")
+            or re.search(r"(?:^|;)state:open(?:;|$)", value.rpartition("@")[2]) is None
+            for value in prior_pr
+        ):
+            return "pr-target-changed"
+    if active.get("confirmed_todo", bool(active.get("mapped_todo_paths"))) != authority.confirmed_todo:
+        return "todo-source-changed"
+    return None
+
+
+def _rebind_manager_pr_authority(
+    *,
+    active: dict[str, Any],
+    authority,
+    run,
+    state: dict[str, Any],
+    state_path: Path,
+    runner: Runner,
+) -> dict[str, Any]:
+    """Rebind journal authority only after an exact Manager-owned PR head readback."""
+
+    if active.get("delivery_binding") is None:
+        return {"status": "not-applicable"}
+    reason = _pr_authority_rebind_block_reason(active, authority, run)
+    if reason is not None:
+        return {"status": "rejected", "reason": reason}
+    number = authority.mapped_prs[0]
+    change = authority.mapped_openspec[0] if len(authority.mapped_openspec) == 1 else None
+    expected_binding = {
+        "pr_number": number,
+        "change": change,
+        "todo_paths": list(authority.mapped_todo_paths),
+    }
+    if active.get("delivery_binding") != expected_binding:
+        return {"status": "rejected", "reason": "delivery-binding-changed"}
+    if (
+        active.get("run_id") != run.run_id
+        or active.get("repo") != authority.repo
+        or active.get("work_id") != authority.work_id
+        or active.get("claim_key") != run.claim_key
+    ):
+        return {"status": "rejected", "reason": "delivery-run-identity-mismatch"}
+    pushes = active.get("pushes")
+    if not isinstance(pushes, dict) or not pushes:
+        return {"status": "rejected", "reason": "manager-pr-push-evidence-missing"}
+    branches: set[str] = set()
+    for pushed_head, push in pushes.items():
+        branch = push.get("branch") if isinstance(push, dict) else None
+        if (
+            not isinstance(push, dict)
+            or set(push) != {"branch", "ref", "head"}
+            or not isinstance(pushed_head, str)
+            or verification.SAFE_SHA_RE.fullmatch(pushed_head) is None
+            or push.get("head") != pushed_head
+            or not isinstance(branch, str)
+            or re.fullmatch(r"feature/[a-z0-9][a-z0-9._/-]*", branch) is None
+            or push.get("ref") != f"refs/heads/{branch}"
+        ):
+            return {"status": "rejected", "reason": "manager-pr-push-evidence-invalid"}
+        branches.add(branch)
+    if len(branches) != 1:
+        return {"status": "rejected", "reason": "manager-pr-push-evidence-ambiguous"}
+    try:
+        lifecycle, pr_head = _existing_candidate_pr_facts(
+            runner=runner, repo=authority.repo, pr_number=number
+        )
+    except (RuntimeError, ValueError, OSError):
+        return {"status": "rejected", "reason": "manager-pr-readback-failed"}
+    if lifecycle != "open" or not isinstance(pr_head, str):
+        return {"status": "rejected", "reason": "pr-status-changed"}
+    candidate = getattr(run, "candidate_head", None)
+    if not isinstance(candidate, str) or verification.SAFE_SHA_RE.fullmatch(candidate) is None:
+        return {"status": "rejected", "reason": "manager-candidate-missing"}
+    if pr_head.lower() not in {value.lower() for value in pushes}:
+        return {"status": "rejected", "reason": "manager-pr-head-not-pushed"}
+    if pr_head.lower() != candidate.lower() and not _manager_autosync_pr_head(
+        run, state_root=state_path.parent, candidate=candidate, head=pr_head
+    ):
+        return {"status": "rejected", "reason": "manager-pr-head-not-candidate-descendant"}
+
+    expected = {
+        "claim_key": run.claim_key,
+        "source_revisions": list(authority.source_revisions),
+        "authority_digest": work_authority_digest(authority),
+        "mapped_issues": list(authority.mapped_issues),
+        "mapped_prs": list(authority.mapped_prs),
+        "mapped_openspec": list(authority.mapped_openspec),
+        "mapped_todo_paths": list(authority.mapped_todo_paths),
+    }
+    fields_match = all(active.get(field) == value for field, value in expected.items())
+    prior_receipt = _read_pr_authority_rebind_receipt(active, run, state_path=state_path)
+    claim_compatible = authority_matches_claim_era(authority, run)
+    if fields_match:
+        if prior_receipt is not None and (
+            prior_receipt.get("pr_head") == pr_head.lower()
+            and prior_receipt.get("candidate") == candidate.lower()
+        ):
+            return {"status": "current"}
+        if claim_compatible and prior_receipt is None:
+            return {"status": "current"}
+        if not claim_compatible and prior_receipt is None:
+            return {"status": "rejected", "reason": "authority-rebind-receipt-missing"}
+    elif not fields_match and active.get("authority_digest") != run.source_revision and prior_receipt is None:
+        return {"status": "rejected", "reason": "claim-era-rebind-unproven"}
+    evidence_root = state_path.parent / "evidence"
+    evidence_directory = evidence_root / "pr-authority-rebind"
+    if evidence_root.is_symlink() or evidence_directory.is_symlink():
+        return {"status": "rejected", "reason": "authority-rebind-evidence-path-invalid"}
+    receipt_payload = {
+        "schema": _PR_AUTHORITY_REBIND_SCHEMA,
+        "run_id": run.run_id,
+        "claim_key": run.claim_key,
+        "previous_authority_digest": active.get("authority_digest"),
+        "authority_digest": expected["authority_digest"],
+        "source_revisions": expected["source_revisions"],
+        "mapped_issues": expected["mapped_issues"],
+        "mapped_prs": expected["mapped_prs"],
+        "mapped_openspec": expected["mapped_openspec"],
+        "mapped_todo_paths": expected["mapped_todo_paths"],
+        "pr_number": number,
+        "candidate": candidate.lower(),
+        "pr_head": pr_head.lower(),
+    }
+    from . import work_bridge
+
+    evidence = work_bridge._write_json_evidence(
+        state_path.parent, "pr-authority-rebind", receipt_payload
+    )
+    active.update(
+        {
+            **expected,
+            "snapshot_hash": authority.snapshot_hash,
+            "provider_revision": authority.github_provider_revision,
+            "confirmed_todo": authority.confirmed_todo,
+            "provider_id": authority.github_provider_id,
+            "authority_rebind_receipt": {
+                "ref": evidence["ref"],
+                "sha256": evidence["hash"],
+            },
+        }
+    )
+    _save_runs(state_path, state)
+    confirmed = _load_runs(state_path)["runs"].get(run.run_id)
+    if (
+        not isinstance(confirmed, dict)
+        or any(confirmed.get(field) != value for field, value in expected.items())
+        or confirmed.get("authority_rebind_receipt")
+        != active.get("authority_rebind_receipt")
+    ):
+        return {"status": "rejected", "reason": "authority-rebind-readback-conflict"}
+    return {
+        "status": "rebound",
+        "receipt": dict(active["authority_rebind_receipt"]),
+    }
+
+
+def _read_pr_authority_rebind_receipt(
+    active: dict[str, Any], run, *, state_path: Path
+) -> dict[str, Any] | None:
+    receipt = active.get("authority_rebind_receipt")
+    if not isinstance(receipt, dict) or set(receipt) != {"ref", "sha256"}:
+        return None
+    reference = receipt.get("ref")
+    digest = receipt.get("sha256")
+    evidence_root = state_path.parent / "evidence"
+    directory = state_path.parent.resolve() / "evidence" / "pr-authority-rebind"
+    if (
+        evidence_root.is_symlink()
+        or (evidence_root / "pr-authority-rebind").is_symlink()
+        or not isinstance(reference, str)
+        or not isinstance(digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+    ):
+        return None
+    path = Path(reference)
+    if (
+        path.parent != directory
+        or path.name != f"{digest}.json"
+        or path.is_symlink()
+        or not path.is_file()
+        or path.stat().st_mode & 0o222
+    ):
+        return None
+    try:
+        envelope = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    payload = envelope.get("payload") if isinstance(envelope, dict) else None
+    valid = (
+        isinstance(envelope, dict)
+        and set(envelope) == {"payload", "hash"}
+        and isinstance(payload, dict)
+        and envelope.get("hash") == digest
+        and verification.canonical_json_hash(payload) == digest
+        and payload.get("schema") == _PR_AUTHORITY_REBIND_SCHEMA
+        and payload.get("run_id") == run.run_id
+        and payload.get("claim_key") == run.claim_key
+        and payload.get("authority_digest") == active.get("authority_digest")
+        and payload.get("source_revisions") == active.get("source_revisions")
+        and payload.get("mapped_prs") == active.get("mapped_prs")
+        and payload.get("mapped_issues") == active.get("mapped_issues")
+        and payload.get("mapped_openspec") == active.get("mapped_openspec")
+        and payload.get("mapped_todo_paths") == active.get("mapped_todo_paths")
+    )
+    return payload if valid else None
+
+
 def _validate_current_run_authority(
     active: dict[str, Any],
     authority,
     canonical_run,
     *,
     merged_delivery_journal: Path | None = None,
+    allow_manager_pr_rebind: bool = False,
+    state: dict[str, Any] | None = None,
+    state_path: Path | None = None,
+    runner: Runner = subprocess.run,
 ) -> None:
     expected = {
         "claim_key": canonical_run.claim_key,
@@ -1528,17 +1915,48 @@ def _validate_current_run_authority(
         "mapped_openspec": list(authority.mapped_openspec),
         "mapped_todo_paths": list(authority.mapped_todo_paths),
     }
+    claim_compatible = authority_matches_claim_era(authority, canonical_run)
+    merged_compatible = _merged_delivery_authority_compatible(
+        authority,
+        canonical_run,
+        merged_delivery_journal=merged_delivery_journal,
+    )
+    issue_closed = any(
+        (revision.endswith("@closed") or "state:closed" in revision)
+        for revision in authority.source_revisions
+        if revision.startswith(("issue:", f"github_issue:{authority.repo}#"))
+    )
+    fields_match = all(active.get(field) == value for field, value in expected.items())
+    rebind_accepted = False
     if (
-        not (
-            authority_matches_claim_era(authority, canonical_run)
-            or _merged_delivery_authority_compatible(
-                authority,
-                canonical_run,
-                merged_delivery_journal=merged_delivery_journal,
-            )
-        )
-        or any(active.get(field) != value for field, value in expected.items())
+        (not fields_match or not claim_compatible)
+        and not merged_compatible
+        and not issue_closed
+        and allow_manager_pr_rebind
+        and state_path is not None
     ):
+        delivery_state = state if state is not None else _load_runs(state_path)
+        row = delivery_state.get("runs", {}).get(canonical_run.run_id)
+        if isinstance(row, dict):
+            rebound = _rebind_manager_pr_authority(
+                active=row,
+                authority=authority,
+                run=canonical_run,
+                state=delivery_state,
+                state_path=state_path,
+                runner=runner,
+            )
+            if rebound.get("status") in {"rebound", "current"}:
+                active.update(row)
+                fields_match = all(active.get(field) == value for field, value in expected.items())
+                rebind_accepted = fields_match and rebound.get("status") in {"rebound", "current"}
+            elif rebound.get("status") == "rejected":
+                raise RuntimeError(
+                    f"PR authority rebind refused: {rebound.get('reason', 'unknown')}"
+                )
+    if not (claim_compatible or merged_compatible or rebind_accepted) or not fields_match:
+        if allow_manager_pr_rebind and issue_closed and not merged_compatible:
+            raise RuntimeError("delivery WorkflowRun does not match current WorkAuthority")
         raise RuntimeError("persisted workflow does not match current WorkAuthority")
     step_ids = active.get("workflow_step_ids")
     if (
@@ -1578,6 +1996,7 @@ def _ship_binding(args: dict[str, Any], authority) -> dict[str, Any]:
 
 _COPILOT_REARM_PERMIT_SCHEMA = "cortex-copilot-review-rearm-permit/v1"
 _DELIVERY_REVIEW_EPOCH_SCHEMA = "cortex-delivery-review-epoch/v1"
+_PR_AUTHORITY_REBIND_SCHEMA = "cortex-pr-change-authority-rebind/v1"
 
 
 def _exact_verified_candidate_head(run) -> str | None:
@@ -3182,8 +3601,18 @@ def _review_disposition_action(
         state_path=state_path,
         workflow_registry=workflow_registry,
         authority=authority,
+        allow_pr_authority_rebind=True,
+        preserve_authority_provenance=True,
     )
-    _validate_current_run_authority(active, authority, run)
+    _validate_current_run_authority(
+        active,
+        authority,
+        run,
+        allow_manager_pr_rebind=True,
+        state=state,
+        state_path=state_path,
+        runner=runner,
+    )
     # 只有 Cortex 自己的 review gate 全部通過、剩下 ship 段 Copilot finding 時，operator 才能裁決續行；
     # review gate 未過一律走 retry-review／retry-build，不得以 disposition 繞過。
     if any(
@@ -3224,7 +3653,24 @@ def _review_disposition_action(
         change=binding["change"],
     )
     if remote.head != candidate:
-        raise RuntimeError("review-disposition PR HEAD mismatch")
+        pushes = active.get("pushes")
+        pushed_head = remote.head.lower() if isinstance(remote.head, str) else ""
+        push = pushes.get(pushed_head) if isinstance(pushes, dict) else None
+        if (
+            not isinstance(push, dict)
+            or set(push) != {"branch", "ref", "head"}
+            or push.get("head") != pushed_head
+            or not isinstance(push.get("branch"), str)
+            or re.fullmatch(r"feature/[a-z0-9][a-z0-9._/-]*", push["branch"]) is None
+            or push.get("ref") != f"refs/heads/{push['branch']}"
+            or not _manager_autosync_pr_head(
+                run,
+                state_root=state_path.parent,
+                candidate=candidate,
+                head=pushed_head,
+            )
+        ):
+            raise RuntimeError("review-disposition PR HEAD mismatch")
     latest = _review_disposition_latest_copilot_review(remote, head=candidate)
     if (
         latest is None
@@ -4075,6 +4521,32 @@ def _claim_action(
         # 沒有 in-flight job 時才符合精準 invalidation 的前置條件；不符合時
         # （build/claim/define/plan phase、或有 active job）維持既有『原樣
         # resume』行為，不強行 invalidate。
+        if args.get("action") == "resume":
+            delivery_state = _load_runs(Path(state_path))
+            delivery_row = delivery_state["runs"].get(canonical_run.run_id)
+            if isinstance(delivery_row, dict) and delivery_row.get("delivery_binding") is not None:
+                rebound = _rebind_manager_pr_authority(
+                    active=delivery_row,
+                    authority=authority,
+                    run=canonical_run,
+                    state=delivery_state,
+                    state_path=Path(state_path),
+                    runner=runner,
+                )
+                if rebound.get("status") in {"rebound", "current"}:
+                    return {
+                        "action": "resume",
+                        "reason": "manager-pr-authority-rebound",
+                        "run": canonical_run.to_dict(),
+                        "authority_rebind_receipt": rebound.get("receipt"),
+                    }
+                if rebound.get("status") == "rejected":
+                    if rebound["reason"] != "non-pr-authority-changed":
+                        return {
+                            "action": "blocked",
+                            "reason": rebound["reason"],
+                            "run": canonical_run.to_dict(),
+                        }
         if self_only_authority_drift_matches(authority, canonical_run):
             return {
                 "action": "resume",
@@ -9643,9 +10115,18 @@ def _ship_action(
         workflow_registry=workflow_registry,
         authority=authority,
         allow_merged_delivery=True,
+        allow_pr_authority_rebind=True,
+        preserve_authority_provenance=True,
     )
     _validate_current_run_authority(
-        active, authority, canonical_run, merged_delivery_journal=state_path
+        active,
+        authority,
+        canonical_run,
+        merged_delivery_journal=state_path,
+        allow_manager_pr_rebind=True,
+        state=state,
+        state_path=state_path,
+        runner=runner,
     )
     # #218 AC1：work-item repair budget 依 sizing band 參數化；band 尚未掛
     # （None，#222 既有 work item）時 repair_budget_for_band fail-soft 回退到
