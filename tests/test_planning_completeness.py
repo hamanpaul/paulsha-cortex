@@ -555,6 +555,11 @@ def test_brainstorm_is_heterogeneous_persists_immutable_peer_evidence_and_keeps_
         "docs/plan.md",
     }
     assert all(len(row["sha256"]) == 64 for row in persisted["artifacts"])
+    assert {row["ref"]: row["content"] for row in persisted["frozen_artifacts"]} == {
+        "docs/spec.md": ACCEPTED_SPEC,
+        "docs/design.md": ACCEPTED_DESIGN,
+        "docs/plan.md": ACCEPTED_PLAN,
+    }
 
     repeated = run_heterogeneous_brainstorm(
         report=report,

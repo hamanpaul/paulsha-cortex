@@ -1808,6 +1808,7 @@ def _post_integration_artifact_evidence(
                 "kind": artifact.kind,
                 "ref": artifact.ref,
                 "sha256": hashlib.sha256(content).hexdigest(),
+                "content": text,
             }
         )
     completeness = assess_planning_completeness(final_artifacts)
@@ -2172,7 +2173,17 @@ def run_heterogeneous_brainstorm(
         "secondary_evidence": secondary_payload,
         "secondary_evidence_hash": evidence_hash,
         "primary_integration": integration,
-        "artifacts": list(artifact_evidence),
+        "artifacts": [
+            {key: row[key] for key in ("kind", "ref", "sha256")}
+            for row in artifact_evidence
+        ],
+        # Freeze the complete manifest, including pre-existing planning artifacts
+        # that the primary integration did not need to rewrite.  Revalidation can
+        # then avoid reading the operator workspace after define has completed.
+        "frozen_artifacts": [
+            {key: row[key] for key in ("kind", "ref", "content")}
+            for row in artifact_evidence
+        ],
     }
     evidence_path = Path(evidence_dir) / brainstorm_evidence_filename(
         scope=scope, question_pack_id=pack.pack_id, run_id=run_id

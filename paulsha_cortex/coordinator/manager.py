@@ -4505,11 +4505,10 @@ def _frozen_brainstorm_artifacts(
 ) -> dict[str, bytes]:
     """Read planning bytes from the immutable, hash-pinned brainstorm evidence.
 
-    New brainstorm evidence contains the primary integration's exact artifact
-    text as well as its path/hash manifest.  The live workspace can change
-    after define, so consumers use those captured bytes whenever available.
-    Older evidence did not embed artifact text; returning an empty mapping
-    preserves its existing workspace-backed compatibility path.
+    New brainstorm evidence freezes every path/hash manifest row, including
+    pre-existing artifacts omitted from the primary integration's write list.
+    Older evidence without ``frozen_artifacts`` keeps its workspace-backed
+    compatibility path.
     """
 
     refs = (
@@ -4539,12 +4538,22 @@ def _frozen_brainstorm_artifacts(
         payload = json.loads(encoded.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("workflow brainstorm evidence invalid") from exc
-    if not isinstance(payload, dict) or "primary_integration" not in payload:
+    if not isinstance(payload, dict):
+        return {}
+    has_frozen_artifacts = "frozen_artifacts" in payload
+    if "primary_integration" not in payload and not has_frozen_artifacts:
         return {}
     integration = payload.get("primary_integration")
     rows = payload.get("artifacts")
-    content_rows = integration.get("artifacts") if isinstance(integration, dict) else None
-    if not isinstance(rows, list) or not isinstance(content_rows, list):
+    if not isinstance(rows, list):
+        raise ValueError("workflow brainstorm frozen artifacts invalid")
+    if integration is None and has_frozen_artifacts:
+        content_rows = []
+    elif isinstance(integration, dict):
+        content_rows = integration.get("artifacts")
+    else:
+        content_rows = None
+    if not isinstance(content_rows, list):
         raise ValueError("workflow brainstorm frozen artifacts invalid")
     expected: dict[str, tuple[str, str]] = {}
     for row in rows:
@@ -4555,6 +4564,8 @@ def _frozen_brainstorm_artifacts(
             or not isinstance(row.get("kind"), str)
             or not isinstance(row.get("sha256"), str)
         ):
+            raise ValueError("workflow brainstorm frozen artifact manifest invalid")
+        if row["ref"] in expected:
             raise ValueError("workflow brainstorm frozen artifact manifest invalid")
         expected[row["ref"]] = (row["kind"], row["sha256"])
     frozen: dict[str, bytes] = {}
@@ -4578,9 +4589,35 @@ def _frozen_brainstorm_artifacts(
         ):
             raise ValueError("workflow brainstorm frozen artifact binding invalid")
         frozen[ref] = content
-    # Existing artifacts can be attested in the evidence manifest without being
-    # repeated in the integration's ``artifacts`` list.  Freeze the embedded
-    # subset and leave legacy workspace fallback for those older inputs.
+    if has_frozen_artifacts:
+        frozen_rows = payload.get("frozen_artifacts")
+        if not isinstance(frozen_rows, list):
+            raise ValueError("workflow brainstorm frozen artifact content invalid")
+        seen_frozen_rows: set[str] = set()
+        for row in frozen_rows:
+            if (
+                not isinstance(row, dict)
+                or set(row) != {"kind", "ref", "content"}
+                or not isinstance(row.get("kind"), str)
+                or not isinstance(row.get("ref"), str)
+                or not isinstance(row.get("content"), str)
+            ):
+                raise ValueError("workflow brainstorm frozen artifact content invalid")
+            ref = row["ref"]
+            content = row["content"].encode("utf-8")
+            binding = expected.get(ref)
+            if (
+                ref in seen_frozen_rows
+                or binding is None
+                or binding[0] != row["kind"]
+                or hashlib.sha256(content).hexdigest() != binding[1]
+                or ref in frozen and frozen[ref] != content
+            ):
+                raise ValueError("workflow brainstorm frozen artifact binding invalid")
+            seen_frozen_rows.add(ref)
+            frozen[ref] = content
+        if set(frozen) != set(expected):
+            raise ValueError("workflow brainstorm frozen artifact content incomplete")
     return frozen
 
 

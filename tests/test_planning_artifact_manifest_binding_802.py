@@ -253,6 +253,77 @@ def test_fix_standard_authority_accepts_published_canonical_planning_triplet(
     }
 
 
+def test_new_brainstorm_manifest_revalidation_uses_frozen_only_listed_artifact(
+    tmp_path: Path,
+) -> None:
+    """New evidence must freeze manifest-only artifacts, never reread operator workspace."""
+
+    workspace = tmp_path / "workspace"
+    coordinator_root = tmp_path / "coordinator"
+    row = _planning_rows()[0]
+    target = workspace / row["path"]
+    target.parent.mkdir(parents=True)
+    target.write_text(row["content"], encoding="utf-8")
+    digest = manager._sha256_path(target)
+
+    evidence_path = coordinator_root / "evidence" / "planning" / "brainstorm.json"
+    evidence_path.parent.mkdir(parents=True)
+    evidence_payload = {
+        "schema_version": 1,
+        "kind": "brainstorm-peer",
+        "scope": {
+            "repo": "acme/demo",
+            "work_id": CHANGE,
+            "source_revision": "a" * 64,
+        },
+        "primary_integration": {"artifacts": []},
+        "artifacts": [{"kind": row["kind"], "ref": row["path"], "sha256": digest}],
+        "frozen_artifacts": [
+            {"kind": row["kind"], "ref": row["path"], "content": row["content"]}
+        ],
+    }
+    evidence_path.write_text(
+        json.dumps(evidence_payload, ensure_ascii=False, sort_keys=True), encoding="utf-8"
+    )
+    cards = load_cards(DEFAULT_CARDS_PATH)
+    combo = load_combo(DEFAULT_COMBOS_DIR / "fix-standard.yaml", cards)
+    manifest = compile_combo(
+        combo,
+        cards,
+        TASK_SLUG,
+        change=CHANGE,
+        allow_external=True,
+        repo_root=REPO_ROOT,
+    ).workflow_manifest
+    assert manifest is not None
+    run = SimpleNamespace(
+        repo="acme/demo",
+        work_id=CHANGE,
+        workspace_root=str(workspace),
+        steps=manifest.steps,
+        openspec_refs=(CHANGE,),
+        planning_source_revision="a" * 64,
+        planning_authority=(),
+        gate_refs=(
+            manager.GateEvidenceRef(
+                "brainstorm", str(evidence_path), manager._sha256_path(evidence_path)
+            ),
+        ),
+    )
+
+    target.write_text("operator workspace changed after define\n", encoding="utf-8")
+
+    authority, source_revision = manager._validated_brainstorm_planning_authority(
+        run,
+        coordinator_root=coordinator_root,
+    )
+
+    assert source_revision == "a" * 64
+    assert len(authority) == 1
+    assert authority[0].ref == row["path"]
+    assert authority[0].baseline_sha256 == digest
+
+
 @pytest.mark.parametrize(
     "combo_name", ("fix-standard", "small-fix", "feature-oneshot")
 )
