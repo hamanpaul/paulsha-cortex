@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,6 +36,19 @@ class _ShipWorkspaceCreator:
         workspace = make_job_clone(self.repo, target, branch=branch)
         self.created.append(workspace)
         assert _git(workspace, "rev-parse", "HEAD") == base_sha
+        return workspace
+
+
+class _IdentitylessShipWorkspaceCreator(_ShipWorkspaceCreator):
+    def create(self, branch: str, *, job_id: str, base_sha: str) -> Path:
+        workspace = super().create(branch, job_id=job_id, base_sha=base_sha)
+        for key in ("user.name", "user.email"):
+            subprocess.run(
+                ["git", "-C", str(workspace), "config", "--local", "--unset-all", key],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
         return workspace
 
 
@@ -128,6 +142,131 @@ def test_clean_behind_main_is_merged_by_manager_and_only_verify_is_reopened(
     assert not any(call and call[0] == "preflight" for call in harness.runner.calls)
     assert not harness.runner.saw_push()
     assert not harness.runner.saw_gh()
+
+
+def test_autosync_real_git_merge_uses_source_identity_when_ship_clone_has_none(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _ship_harness(
+        tmp_path,
+        monkeypatch,
+        active_change=False,
+        archived_change=True,
+        probe_runner=subprocess.run,
+    )
+    origin = _wire_local_origin(harness, tmp_path / "origin")
+    main_head = _advance_origin_main(origin, tmp_path / "main-advance")
+
+    global_config = tmp_path / "global.gitconfig"
+    global_config.write_text(
+        "[user]\n"
+        "\tname = Source Global Identity\n"
+        "\temail = source-global@example.invalid\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    for key in ("user.name", "user.email"):
+        subprocess.run(
+            ["git", "-C", str(harness.repo), "config", "--local", "--unset-all", key],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    creator = _IdentitylessShipWorkspaceCreator(harness.repo, tmp_path / "ship-workspaces")
+    validator = _production_validator(harness, tmp_path, creator=creator)
+
+    result = _advance_to_ship(harness, validator)
+
+    assert result["main_sync_autosync"]["outcome"] == "merged"
+    assert result["main_sync_autosync"]["main_head"] == main_head
+    workspace = creator.created[0]
+    commit_identity = _git(
+        workspace,
+        "show",
+        "-s",
+        "--format=%an%n%ae%n%cn%n%ce",
+        result["candidate_head"],
+    ).splitlines()
+    assert commit_identity == [
+        "Source Global Identity",
+        "source-global@example.invalid",
+        "Source Global Identity",
+        "source-global@example.invalid",
+    ]
+    for key in ("user.name", "user.email"):
+        probe = subprocess.run(
+            ["git", "-C", str(workspace), "config", "--local", "--get", key],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert probe.returncode == 1
+
+
+def test_autosync_fails_closed_when_no_effective_identity_is_available(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _ship_harness(
+        tmp_path,
+        monkeypatch,
+        active_change=False,
+        archived_change=True,
+        probe_runner=subprocess.run,
+    )
+    origin = _wire_local_origin(harness, tmp_path / "origin")
+    _advance_origin_main(origin, tmp_path / "main-advance")
+
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.delenv("PSC_MAIN_SYNC_GIT_IDENTITY", raising=False)
+    for key in ("user.name", "user.email"):
+        subprocess.run(
+            ["git", "-C", str(harness.repo), "config", "--local", "--unset-all", key],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    creator = _IdentitylessShipWorkspaceCreator(harness.repo, tmp_path / "ship-workspaces")
+    validator = _production_validator(harness, tmp_path, creator=creator)
+
+    result = _advance_to_ship(harness, validator)
+
+    assert result["main_sync_autosync"]["outcome"] == "merge-failed"
+    assert result["reason"] == "main-sync-identity-missing"
+    assert harness.run.candidate_head == harness.candidate
+    assert "needs_human" in harness.run.facets
+
+
+def test_configured_autosync_identity_takes_precedence_and_must_be_well_formed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "PSC_MAIN_SYNC_GIT_IDENTITY",
+        "Configured Identity <configured@example.invalid>",
+    )
+    assert work_bridge._main_sync_autosync_git_identity(tmp_path) == (
+        "Configured Identity",
+        "configured@example.invalid",
+    )
+
+    monkeypatch.setenv("PSC_MAIN_SYNC_GIT_IDENTITY", "malformed identity")
+    assert work_bridge._main_sync_autosync_git_identity(tmp_path) is None
+
+
+def test_autosync_limit_counts_successful_syncs_but_not_failed_merges() -> None:
+    events = [
+        {"outcome": "merge-failed"},
+        {"outcome": "merged"},
+        {"outcome": "harvest-failed"},
+    ]
+
+    assert work_bridge._main_sync_autosync_completed_count(events) == 1
 
 
 def test_main_sync_autosync_limit_stops_with_a_retryable_reason_and_showable_evidence(
