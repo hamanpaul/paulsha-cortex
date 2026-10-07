@@ -1793,3 +1793,11 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/workstreams/copilot-fix-round-accounting/todo.md'
     excludes: []
+  autosync-source-job-unify:
+    title: 'autosync-source-job-unify'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1345'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/autosync-source-job-unify/todo.md'
+    excludes: []
