@@ -210,11 +210,15 @@ def resolve_model_chain(
         run, SimpleNamespace(persona="reviewer"), identities
     )
 
+    overridden_personas = set(model_chain_override or {})
     return {
         persona: {
             "executor": identity.executor,
             "model": identity.model_id,
             "model_id": identity.model_id,
+            "source": (
+                "run-override" if persona in overridden_personas else "shared-default"
+            ),
         }
         for persona, identity in selected.items()
     }

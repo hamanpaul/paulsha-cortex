@@ -117,6 +117,9 @@ def test_resolve_model_chain_with_no_override() -> None:
     # unavailable; use the shared resolver's codex selection.
     assert resolved["builder"]["executor"] == "codex"
     assert resolved["reviewer"]["executor"] == "claude"
+    assert resolved["planner"]["source"] == "shared-default"
+    assert resolved["builder"]["source"] == "shared-default"
+    assert resolved["reviewer"]["source"] == "shared-default"
 
 
 def test_resolve_model_chain_with_builder_override() -> None:
@@ -128,8 +131,11 @@ def test_resolve_model_chain_with_builder_override() -> None:
 
     assert resolved["builder"]["executor"] == "copilot"
     assert resolved["builder"]["model"] == "builder-two"
+    assert resolved["builder"]["source"] == "run-override"
     assert resolved["planner"]["executor"] == "claude"
+    assert resolved["planner"]["source"] == "shared-default"
     assert resolved["reviewer"]["executor"] == "claude"
+    assert resolved["reviewer"]["source"] == "shared-default"
 
 
 def test_intake_preview_and_dispatch_share_primary_planner_and_domain(

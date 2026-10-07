@@ -462,16 +462,19 @@ class WorkActionFlagTests(unittest.TestCase):
                 "executor": "claude",
                 "model": "planner-one",
                 "model_id": "planner-one",
+                "source": "shared-default",
             },
             "builder": {
                 "executor": "codex",
                 "model": "gpt-6-luna",
                 "model_id": "gpt-6-luna",
+                "source": "run-override",
             },
             "reviewer": {
                 "executor": "claude",
                 "model": "reviewer-anthropic",
                 "model_id": "reviewer-anthropic",
+                "source": "shared-default",
             },
         }
         identity_registry = IdentityRegistry.from_rows(

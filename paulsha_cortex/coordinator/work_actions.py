@@ -653,10 +653,11 @@ def _intake_action(
     if result.get("action") in {"claim", "resume"} and isinstance(run, dict):
         # T4: expose a read-only preview for the operator. Keep this separate
         # from WorkflowRun.resolved_model_chain, which records identities only
-        # after their real workflow cards are dispatched.
-        result["resolved_model_chain"] = resolve_model_chain(
-            run.get("model_chain_override")
-        )
+        # after their real workflow cards are dispatched. The preview marks
+        # shared defaults explicitly so a partial run override cannot look like
+        # an unresolved or incomplete model chain in the intake response.
+        resolved_chain = resolve_model_chain(run.get("model_chain_override"))
+        result["resolved_model_chain"] = resolved_chain
     return result
 
 
