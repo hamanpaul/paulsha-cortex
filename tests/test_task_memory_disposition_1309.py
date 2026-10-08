@@ -863,9 +863,13 @@ def test_verify_terminal_invalid_finding_ref_is_rejected_without_receipt(
     assert FINDING_KEY not in "".join(r.getMessage() for r in caplog.records)
 
 
-def test_build_terminal_finding_ref_is_rejected_by_phase_restriction(
-    tmp_path, monkeypatch, caplog
-):
+def test_build_terminal_finding_ref_is_rejected(tmp_path, monkeypatch, caplog):
+    """build 卡送 finding ref 走完整 harvest 會被拒。
+
+    這條端到端路徑先擋在「build payload 查不到 finding」；phase 限制本身由
+    ``test_receipt_phase_gate_rejects_build_finding_ref`` 與
+    ``test_harvest_phase_gate_skips_build_finding_ref`` 分別隔離驗證。
+    """
     registry, run, job, root, _wt = _build_fixture(
         tmp_path / "case",
         monkeypatch,
@@ -904,19 +908,39 @@ def test_record_receipt_requires_verified_finding_and_review_phase(tmp_path, mon
         manager.record_task_memory_receipt(
             registry, receipt, coordinator_root=root, verified_finding=False
         )
-    # build 卡（phase 不在 verify／review）即使 verified_finding=True 也被擋
-    build_registry, build_run, build_job, build_root, _wt = _build_fixture(
-        tmp_path / "build", monkeypatch, memory="delivered"
+
+
+def test_receipt_phase_gate_rejects_build_finding_ref(tmp_path, monkeypatch):
+    """receipt 端 phase 關卡：build job 即使 verified_finding=True 也不能以 finding ref 入帳。"""
+    registry, run, job, root, _wt = _build_fixture(tmp_path, monkeypatch, memory="delivered")
+    restored = manager._restore_task_memory_terminal_attempt(
+        registry, job_id=job["job_id"], coordinator_root=root
     )
-    build_event = {
-        **receipt,
-        "workflow_run_id": build_run.run_id,
-        "job_id": build_job["job_id"],
-        "attempt_id": build_job["job_id"],
-        "card": build_job["workflow_card"],
-        "task_kind": "build",
-    }
-    with pytest.raises(ValueError):
+    prepared = restored[3]
+    event = task_memory.TaskMemoryAdapter(provider=None).record_applied(
+        prepared, "note-1", evidence_ref=FINDING_REF, evidence_sha256=FINDING_CANONICAL_SHA
+    )
+    with pytest.raises(ValueError, match="not verified against terminal diagnostics"):
         manager.record_task_memory_receipt(
-            build_registry, build_event, coordinator_root=build_root, verified_finding=True
+            registry, event, coordinator_root=root, verified_finding=True
         )
+
+
+def test_harvest_phase_gate_skips_build_finding_ref(tmp_path, monkeypatch):
+    """harvest 端 phase 關卡：build job 的 terminal 即使帶有該 finding，也不呼叫 receipt 入帳。"""
+    registry, run, job, root, _wt = _build_fixture(tmp_path, monkeypatch, memory="delivered")
+    calls: list[Any] = []
+    real = manager.record_task_memory_receipt
+    monkeypatch.setattr(
+        manager,
+        "record_task_memory_receipt",
+        lambda *a, **k: calls.append(k.get("verified_finding")) or real(*a, **k),
+    )
+    manager._harvest_task_memory_applied(
+        registry,
+        job_id=job["job_id"],
+        value=_finding_applied(),
+        coordinator_root=root,
+        terminal_payload={"diagnostics": {"findings": [FINDING]}},
+    )
+    assert calls == []
