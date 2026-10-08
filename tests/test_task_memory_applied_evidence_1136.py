@@ -433,7 +433,10 @@ def test_rejected_applied_entries_leave_card_result_unchanged(
         )
 
     assert _applied(root, run) == []
-    assert _receipts(root, run) == before
+    after = _receipts(root, run)
+    assert [row for row in after if row["event"] not in {"disposition-reported", "unreported"}] == before
+    expected_unreported = 1 if spec.get("memory", "delivered") == "delivered" else 0
+    assert len([row for row in after if row["event"] == "unreported"]) == expected_unreported
     assert _evidence_bytes(bound, root) == baseline_evidence
     assert registry.get_job(job["job_id"])["workflow_evidence"] == bound["workflow_evidence"]
     messages = _warnings(caplog)
@@ -510,7 +513,9 @@ def test_empty_list_is_an_explicit_no_op(tmp_path, monkeypatch, caplog, baseline
             registry, job_id=job["job_id"], coordinator_root=root
         )
 
-    assert _receipts(root, run) == before
+    after = _receipts(root, run)
+    assert [row for row in after if row["event"] not in {"disposition-reported", "unreported"}] == before
+    assert len([row for row in after if row["event"] == "unreported"]) == 1
     assert _warnings(caplog) == []
     assert _evidence_bytes(bound, root) == baseline_evidence
 
@@ -529,7 +534,9 @@ def test_terminal_without_field_is_unchanged(tmp_path, monkeypatch, caplog, base
             registry, job_id=job["job_id"], coordinator_root=root
         )
 
-    assert _receipts(root, run) == before
+    after = _receipts(root, run)
+    assert [row for row in after if row["event"] not in {"disposition-reported", "unreported"}] == before
+    assert len([row for row in after if row["event"] == "unreported"]) == 1
     assert _warnings(caplog) == []
     assert _evidence_bytes(bound, root) == baseline_evidence
 
@@ -814,7 +821,7 @@ def test_task_memory_prompt_block_explains_applied_reporting(tmp_path, monkeypat
     assert "Omit the field" in prompt
 
 
-def test_task_memory_prompt_block_is_unchanged_without_offer_or_for_plan_cards(
+def test_task_memory_prompt_block_is_unchanged_without_offer_and_requires_disposition_for_plan_cards(
     tmp_path, monkeypatch
 ):
     registry, run, job, root, _wt = _build_fixture(tmp_path, monkeypatch, memory="none")
@@ -839,6 +846,7 @@ def test_task_memory_prompt_block_is_unchanged_without_offer_or_for_plan_cards(
     )
     plan_prompt = manager._append_task_memory_inline("PROMPT", plan_prepared)
     assert "[note-1]" in plan_prompt
+    assert "task_memory_disposition" in plan_prompt
     assert "task_memory_applied" not in plan_prompt
 
 

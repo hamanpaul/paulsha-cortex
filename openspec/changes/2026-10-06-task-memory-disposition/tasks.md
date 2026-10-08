@@ -3,26 +3,7 @@ status: accepted
 work_item: task-memory-disposition
 ---
 
-# task-memory：每則送出的 note 必填處置與原因（task_memory_disposition）
-
-## Boundary
-
-- Issue：`hamanpaul/paulsha-cortex#1309`。owner 2026-10-06 同意，需求來自 Hippo 端（Hippo×JEV 是否進 Q2，
-  要靠這份資料判斷）。
-- 現況（#1136）：terminal 有選填欄位 `task_memory_applied`，只回報正面結果。applied 必須附 Candidate 中
-  已 commit 檔案的路徑與 sha256。相關程式：
-  - `paulsha_cortex/coordinator/task_memory.py`：`TASK_MEMORY_APPLIED_TERMINAL_FIELD`、
-    `task_memory_applied_json_schema`、`parse_task_memory_applied`。
-  - `paulsha_cortex/coordinator/launcher.py`：terminal schema 注入。
-  - `paulsha_cortex/coordinator/manager.py`：`_extract_terminal_payload` 拆出選填欄位、
-    `_harvest_task_memory_applied` 寫入 receipt、給 model 的 terminal 說明文字。
-  - 測試：`tests/test_task_memory_applied_evidence_1136.py`。
-- 不變的原則（沿用 #1136）：此欄位的任何問題（缺漏、格式錯、集合不符）都**不得**讓卡片失敗，也**不得**改變
-  卡片判定；只記錄在 task-memory 的 receipt 與指標上。
-- 只有當次 attempt 實際送了 task-memory note 時才要求此欄位；沒送記憶的 attempt 行為完全不變。
-- 既有的 `task_memory_applied` 照舊可解析；新舊欄位並存時的優先順序要寫明並測試。
-
-## Tasks
+# Tasks
 
 - [x] **T1 RED**：新增測試，固定以下行為（現行應失敗）：
       - 有送記憶的 attempt，terminal schema 要求 `task_memory_disposition`。
