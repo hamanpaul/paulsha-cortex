@@ -84,6 +84,18 @@ def doctor_summary(
     return run_doctor(probe_live=probe_live, repo=repo, instance=effective_instance).to_dict()
 
 
+def _entry_label(entry: dict[str, Any], *, fallback_keys: Sequence[str]) -> str:
+    work_id = entry.get("work_id")
+    if work_id:
+        run_id = entry.get("run_id")
+        return f"{work_id} ({run_id})" if run_id else str(work_id)
+    for key in fallback_keys:
+        value = entry.get(key)
+        if value:
+            return str(value)
+    return "-"
+
+
 def _print_status(status: dict[str, Any]) -> None:
     sys.stdout.write(f"updated_at: {status.get('updated_at')}\n")
     sys.stdout.write(f"degraded: {status.get('degraded')}\n")
@@ -127,8 +139,9 @@ def _print_status(status: dict[str, Any]) -> None:
         outcome = entry.get("provider_outcome")
         if not isinstance(outcome, dict) or not outcome.get("outcome"):
             continue
+        subject = _entry_label(entry, fallback_keys=("slice_id",))
         sys.stdout.write(
-            f"  provider_failure[{entry.get('slice_id', '-')}]: {outcome.get('outcome')} "
+            f"  provider_failure[{subject}]: {outcome.get('outcome')} "
             f"(authority={outcome.get('authority')}, retryable={outcome.get('retryable')})\n"
         )
     # 診斷 invariant（#527／#514／#515／#511／#482）：把 run 轉入 needs_human 的
@@ -141,7 +154,7 @@ def _print_status(status: dict[str, Any]) -> None:
         blocking = entry.get("blocking_reason")
         if not isinstance(blocking, dict) or not blocking.get("reason"):
             continue
-        subject = entry.get("run_id") or entry.get("slice_id") or "-"
+        subject = _entry_label(entry, fallback_keys=("run_id", "slice_id"))
         sys.stdout.write(
             f"  needs_human[{subject}]: {blocking.get('reason')}: {blocking.get('detail')} "
             f"(source={blocking.get('source')})\n"
@@ -157,7 +170,7 @@ def _print_status(status: dict[str, Any]) -> None:
         quota_decision = entry.get("quota_decision")
         if not isinstance(quota_decision, dict):
             continue
-        subject = entry.get("run_id") or entry.get("slice_id") or "-"
+        subject = _entry_label(entry, fallback_keys=("run_id", "slice_id"))
         wait = quota_decision.get("wait")
         if isinstance(wait, dict) and wait.get("reason"):
             sys.stdout.write(
