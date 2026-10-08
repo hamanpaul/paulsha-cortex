@@ -290,6 +290,7 @@ class FakeCandidateCli:
         # One entry per `self.calls` entry, in the same order: the `env`
         # mapping `_candidate`/`_service_status` actually passed to `_run`.
         self.envs: list[dict[str, str]] = []
+        self.run_kwargs: list[dict[str, object]] = []
         self.fail: dict[str, str] = {}
         self.interrupt_after: str | None = None
         # A verify that runs and FAILs: exit 1 with its JSON result on stdout.
@@ -312,6 +313,7 @@ class FakeCandidateCli:
     def __call__(self, argv, *, check=False, env=None, uid=None, gid=None, **_kwargs):
         argv = tuple(argv)
         self.envs.append(dict(env or {}))
+        self.run_kwargs.append(dict(_kwargs))
         if argv[1:4] == ("service", "status", "--system"):
             receipt = self._value(argv, "--install-receipt")
             self.calls.append(("status", receipt))

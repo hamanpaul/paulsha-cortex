@@ -133,6 +133,20 @@ def test_candidate_cli_calls_get_a_root_path_with_sbin_and_no_usr_local(harness)
     assert "/usr/local" not in path
 
 
+def test_candidate_cli_calls_run_with_an_explicit_public_umask(harness) -> None:
+    code, _report = _run_transaction(harness)
+    assert code == 0
+
+    candidate_kwargs = [
+        kwargs
+        for call, kwargs in zip(harness.cli.calls, harness.cli.run_kwargs, strict=True)
+        if call[0] != "status"
+    ]
+
+    assert candidate_kwargs
+    assert all(kwargs.get("umask") == 0o022 for kwargs in candidate_kwargs)
+
+
 def test_a_tool_that_only_lives_in_sbin_resolves_under_the_candidate_path_shape(
     tmp_path: Path,
 ) -> None:
