@@ -3475,12 +3475,14 @@ def _refresh_ship_authority_after_preflight(
             gate_status="running",
             needs_human_reason=diagnostic_reason(
                 reason,
-                "preflight 完成後無法重新取得 confirmed WorkAuthority；交付已 fail-closed。",
+                (
+                    "preflight 完成後無法重新取得 confirmed WorkAuthority；"
+                    f"交付已 fail-closed。{safe_exception_summary(exc)}"
+                ),
                 source="work_actions._ship_action:authority-refresh",
                 run_id=canonical_run.run_id,
                 work_id=canonical_run.work_id,
                 head=str(getattr(preflight, "head", "")),
-                detail=safe_exception_summary(exc),
             ),
         )
         return {"action": "needs_human", "reason": reason}

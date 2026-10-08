@@ -4861,6 +4861,67 @@ def test_ship_fails_closed_when_authority_identity_changes_during_preflight(
     assert calls.get("merge", 0) == 0
 
 
+def test_ship_requires_human_when_authority_refresh_fails_after_preflight(
+    monkeypatch, tmp_path: Path
+) -> None:
+    snapshot, state, base, _foreign_payload = _ship_authority_refresh_case(tmp_path)
+    current = {"now": 200.0, "review": False, "corrupt_snapshot": False}
+    merged = {"value": False}
+    calls: dict[str, int] = {}
+    _install_ship_authority_refresh_runtime(
+        monkeypatch,
+        snapshot=snapshot,
+        current=current,
+        merged=merged,
+        calls=calls,
+    )
+
+    def run_preflight(**kwargs):
+        calls["preflight"] = calls.get("preflight", 0) + 1
+        if current["corrupt_snapshot"]:
+            snapshot.write_text("{", encoding="utf-8")
+        return PreflightResult(
+            True,
+            None,
+            CommandResult(("policy",), 0, "", ""),
+            CommandResult(("preflight", "--pr", "8"), 0, "", ""),
+            HEAD,
+            TREE,
+        )
+
+    monkeypatch.setattr(work_actions, "run_preflight", run_preflight)
+    first = work_actions.execute_work_action(
+        args=base,
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: current["now"],
+    )
+    assert first["result"]["action"] == "awaiting-copilot"
+
+    current.update(review=True, corrupt_snapshot=True)
+    result = work_actions.execute_work_action(
+        args=base,
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: current["now"],
+    )
+
+    assert result["result"] == {
+        "action": "needs_human",
+        "reason": "work-authority-refresh-failed",
+    }
+    row = _only_journal_row(state)
+    assert row["ship"]["phase"] == "needs_human"
+    assert row["ship"]["reason"] == "work-authority-refresh-failed"
+    run = JobRegistry(state_path=state.parent / "jobs.json").list_workflow_runs()[0]
+    assert "needs_human" in run.facets
+    assert run.needs_human_reason["reason"] == "work-authority-refresh-failed"
+    assert calls["preflight"] == 2
+    assert not merged["value"]
+
+
 def test_ship_runs_official_archive_before_preflight(tmp_path: Path) -> None:
     snapshot = _snapshot(tmp_path / "snapshot.json")
     state = tmp_path / "runs.json"
