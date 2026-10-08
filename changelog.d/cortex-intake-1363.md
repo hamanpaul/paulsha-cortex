@@ -1,0 +1,1 @@
+- 進件：`builder-admission-after-autosync`（#1363），PR 已存在且經過 autosync 的 run 能 retry-build。

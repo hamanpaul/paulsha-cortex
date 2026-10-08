@@ -9,6 +9,7 @@
 
 ### Fixed
 
+- **cortex 進件：#1363 PR 已存在的 run 的 Builder admission**：登記 work item `builder-admission-after-autosync` 與 accepted todo（見 `changelog.d/cortex-intake-1363.md`）。
 - **#1360 authority-restart 後恢復既有 PR run**：claim era 經 WorkAuthority 驗證後，resume 同步 delivery journal active row 的 `claim_key`；retry-review 後的 explicit resume 也會派出替代 review job，交付目標變更仍 fail closed（見 `changelog.d/pr-authority-rebind-v2.md`）。
 - **cortex 進件：#1360 PR 已存在的 run 的 resume（#1339 重做）**：登記 work item `pr-authority-rebind-v2` 與 accepted todo（見 `changelog.d/cortex-intake-1360.md`）。
 - **#1356 autosync 後以新 Candidate 重跑 review**：自動同步會同時重開 verify 與 code-review、清除舊 foreign-review，再以新 Candidate 進入 ship probe；Candidate 來源分類改用 #1345 共用 helper，保留 exact-run／Candidate／成功狀態與 evidence 驗證（見 `changelog.d/autosync-carry-forward-review.md`）。

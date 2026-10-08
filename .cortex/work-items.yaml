@@ -1817,3 +1817,11 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/workstreams/pr-authority-rebind-v2/todo.md'
     excludes: []
+  builder-admission-after-autosync:
+    title: 'builder-admission-after-autosync'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1363'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/builder-admission-after-autosync/todo.md'
+    excludes: []
