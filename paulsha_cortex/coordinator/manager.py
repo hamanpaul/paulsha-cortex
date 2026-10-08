@@ -5114,9 +5114,10 @@ def _workflow_build_handoff_base(run, *, builder_jobs, card: str) -> str:
     整個 run 已採信的成果 reset 掉）。
     """
 
+    source_job = _workflow_latest_candidate_source_job(builder_jobs)
     for value in (
         getattr(run, "candidate_head", None),
-        builder_jobs[-1].get("subject_head") if builder_jobs else None,
+        source_job.get("subject_head") if source_job is not None else None,
     ):
         if isinstance(value, str) and verification.SAFE_SHA_RE.fullmatch(value) is not None:
             return value.lower()
@@ -5734,6 +5735,36 @@ def _reclaim_trusted_build_workspace(
     return result
 
 
+_WORKFLOW_MANAGER_CANDIDATE_SOURCE_CARDS = frozenset(
+    {"openspec-archive", "main-sync-autosync"}
+)
+
+
+def _workflow_manager_candidate_source_job(job: Mapping[str, object]) -> bool:
+    """Manager-owned ship jobs that can author an exact workflow Candidate."""
+
+    return (
+        job.get("persona") == "manager"
+        and job.get("workflow_phase") == "ship"
+        and job.get("workflow_card") in _WORKFLOW_MANAGER_CANDIDATE_SOURCE_CARDS
+    )
+
+
+def _workflow_candidate_source_job(job: Mapping[str, object]) -> bool:
+    """Whether a successful run job may supply a workflow Candidate handoff."""
+
+    return job.get("persona") == "builder" or _workflow_manager_candidate_source_job(job)
+
+
+def _workflow_latest_candidate_source_job(
+    jobs: Sequence[Mapping[str, object]],
+) -> Mapping[str, object] | None:
+    return next(
+        (job for job in reversed(jobs) if _workflow_candidate_source_job(job)),
+        None,
+    )
+
+
 def _review_builder_job_binding(
     registry,
     *,
@@ -5744,11 +5775,7 @@ def _review_builder_job_binding(
     if not isinstance(builder_job_id, str) or not builder_job_id:
         raise ValueError("review evaluation builder job missing")
     builder = registry.get_job(builder_job_id)
-    archive_author = (
-        builder.get("workflow_phase") == "ship"
-        and builder.get("workflow_card") == "openspec-archive"
-        and builder.get("persona") == "manager"
-    )
+    manager_author = _workflow_manager_candidate_source_job(builder)
     expected = {
         "workflow_run_id": run.run_id,
         "workflow_repo": run.repo,
@@ -5758,8 +5785,8 @@ def _review_builder_job_binding(
     }
     expected.update(
         {
-            "workflow_phase": "ship" if archive_author else "build",
-            "persona": "manager" if archive_author else "builder",
+            "workflow_phase": "ship" if manager_author else "build",
+            "persona": "manager" if manager_author else "builder",
         }
     )
     for field, value in expected.items():
@@ -5775,31 +5802,27 @@ def _review_builder_job_binding(
     # harvest 的 fast-forward 與 gate ledger 錨定）。era 等值檢查在此只會讓每一次
     # authority 前進（PR 建立、openspec link）把已採信的 build 產物變成孤兒。
 
-    # ``fix-standard`` deliberately omits the Manager-only ship cards from
-    # ``run.steps``.  The archive job is still the authoritative builder for a
-    # post-archive review, and its canonical ship evidence is what proves that
-    # Manager completed that card.  Requiring a matching step here therefore
-    # rejects valid archive -> review handoffs (for example after an OpenSpec
-    # archive advances the candidate).  Keep the normal build-card check
-    # unchanged; only the typed, successful archive job gets this exception.
-    if archive_author:
+    # Manager-only candidate-source ship cards are deliberately absent from
+    # ``run.steps``. Their canonical ship evidence proves the Manager completed
+    # the card, so requiring a matching step rejects valid source -> review handoffs.
+    if manager_author:
         evidence = builder.get("workflow_evidence")
         if not isinstance(evidence, dict) or evidence.get("kind") != "ship":
-            raise ValueError("review evaluation archive evidence is not passed")
-        return builder, archive_author
+            raise ValueError("review evaluation manager source evidence is not passed")
+        return builder, manager_author
 
     card = builder.get("workflow_card")
     if not isinstance(card, str) or not any(
         step.card == card
         and step.gate_result == "passed"
         and (
-            (step.phase == "build" and not archive_author)
-            or (step.phase == "ship" and archive_author)
+            (step.phase == "build" and not manager_author)
+            or (step.phase == "ship" and manager_author)
         )
         for step in run.steps
     ):
         raise ValueError("review evaluation builder card is not passed")
-    return builder, archive_author
+    return builder, manager_author
 
 
 def _review_builder_job(
@@ -5810,7 +5833,7 @@ def _review_builder_job(
     candidate: str,
     identities: IdentityRegistry,
 ) -> tuple[dict[str, object], object]:
-    builder, archive_author = _review_builder_job_binding(
+    builder, manager_author = _review_builder_job_binding(
         registry,
         run=run,
         builder_job_id=builder_job_id,
@@ -5826,7 +5849,7 @@ def _review_builder_job(
             model_id=model,
             independence_domain=str(builder.get("independence_domain")),
         )
-        if archive_author
+        if manager_author
         else identities.require(executor, model)
     )
     if builder.get("independence_domain") != identity.independence_domain:
@@ -9494,7 +9517,7 @@ def terminalize_workflow_job(
         if not isinstance(run_id, str):
             raise ValueError("workflow review run binding missing")
         run = registry.get_workflow_run(run_id)
-        builder_job, _archive_author = _review_builder_job_binding(
+        builder_job, _manager_author = _review_builder_job_binding(
             registry,
             run=run,
             builder_job_id=builder_job_id,
@@ -15923,25 +15946,21 @@ def _workflow_stage_execution_builder_context(
     同步，等於重現本票要修的那個 bug。
 
     回傳 ``(builder_jobs, builder_job_id, manager_gate_ledger)``：
-    ``builder_jobs`` 是本 run 目前綁定 candidate 的完整 builder job 列表
+    ``builder_jobs`` 是本 run 目前綁定 candidate 的成功來源 job 列表：builder
+    jobs，以及 `openspec-archive`／`main-sync-autosync` Manager jobs
     （`_dispatch_workflow_card` 後續還要拿它推 branch／base 等，不是只有
     這裡用），``builder_job_id`` 是其中最新一筆的 job_id（沒有則 None），
-    ``manager_gate_ledger`` 只在 ``step.phase == "verify"`` 且找得到對應
-    build 卡的 gate ledger 時才非 None。
+    ``manager_gate_ledger`` 只在 ``step.phase == "verify"`` 且找得到 exact
+    Candidate 對應 build 卡的 gate ledger 時才非 None。自動同步會產生新的
+    Candidate；舊 build ledger 不再提供給 verifier，verification 卡須自行對新
+    Candidate 執行檢查。
     """
 
     builder_jobs = [
         job
         for job in registry.list_jobs()
         if job.get("workflow_run_id") == run.run_id
-        and (
-            job.get("persona") == "builder"
-            or (
-                job.get("persona") == "manager"
-                and job.get("workflow_phase") == "ship"
-                and job.get("workflow_card") == "openspec-archive"
-            )
-        )
+        and _workflow_candidate_source_job(job)
         and job.get("status") == "exited"
         and job.get("exit_code") == 0
         and (
@@ -17010,6 +17029,7 @@ def _dispatch_workflow_card(
         builder_jobs, builder_job_id, verification_gate_ledger = (
             _workflow_stage_execution_builder_context(run, step, registry)
         )
+        candidate_source_job = _workflow_latest_candidate_source_job(builder_jobs)
         if step.persona == "reviewer" and builder_job_id is None:
             raise ValueError("workflow reviewer builder job unavailable")
         # #752／#814／#844：run 級 operator 裁決紀錄。下面 `_workflow_job_prompt`
@@ -17107,8 +17127,9 @@ def _dispatch_workflow_card(
             # 路徑（`226/NAMESPACE`）；改 per-job 之後那個一對多消失，不變式成立。
             # 這裡刻意與 slice lane（`autonomy._launcher_worktree`）用**同一個推導點**。
             build_branch = (
-                str(builder_jobs[-1]["branch"])
-                if builder_jobs and isinstance(builder_jobs[-1].get("branch"), str)
+                str(candidate_source_job["branch"])
+                if candidate_source_job is not None
+                and isinstance(candidate_source_job.get("branch"), str)
                 else builder_branch
             )
             accepted_candidate = (
@@ -17181,11 +17202,13 @@ def _dispatch_workflow_card(
             # authority map／input snapshot／output baseline／sandbox clone 源／tree
             # snapshot 五個用途全部拿到同一棵樹，順序問題因此不是被「解決」而是**不存在**。
             #
-            # branch 與底下 job 記錄用的那一個是同一條推導（前一張 build 卡的 branch；
-            # post-archive 時是 `_record_manager_ship_job()` 記在 archive 卡上的那一條）。
+            # branch 與底下 job 記錄用的那一個是同一條推導：exact Candidate 的
+            # source job 可是前一張 build 卡，也可是 archive／main-sync autosync
+            # 的 Manager ship job。
             reviewer_branch = (
-                str(builder_jobs[-1]["branch"])
-                if builder_jobs and isinstance(builder_jobs[-1].get("branch"), str)
+                str(candidate_source_job["branch"])
+                if candidate_source_job is not None
+                and isinstance(candidate_source_job.get("branch"), str)
                 else f"feature/{run.work_id}"
             )
             reviewer_candidate = run.candidate_head
@@ -17203,8 +17226,8 @@ def _dispatch_workflow_card(
                     candidate=reviewer_candidate.lower(),
                 )
             )
-        elif builder_jobs:
-            worktree = str(builder_jobs[-1]["worktree"])
+        elif candidate_source_job is not None:
+            worktree = str(candidate_source_job["worktree"])
         else:
             worktree = run.workspace_root
         effective_repo_root = Path(worktree).resolve()
@@ -17300,8 +17323,9 @@ def _dispatch_workflow_card(
             build_branch
             if step.phase == "build"
             else (
-                str(builder_jobs[-1]["branch"])
-                if builder_jobs and isinstance(builder_jobs[-1].get("branch"), str)
+                str(candidate_source_job["branch"])
+                if candidate_source_job is not None
+                and isinstance(candidate_source_job.get("branch"), str)
                 else f"feature/{run.work_id}"
             )
         )
@@ -18279,7 +18303,11 @@ def resume_workflow_run(
                 "retry_after_epoch": active.deadline_epoch,
             }
     pre_resume_gate_status = run.gate_status
-    retry_failed = False
+    retry_failed = bool(
+        operator_resume
+        and run.current_phase == "review"
+        and run.retry_classification == "review_handoff_failure"
+    )
     recovery_job_id: str | None = None
     quota_auto_retry = bool(
         "needs_human" in run.facets
@@ -19749,6 +19777,7 @@ def apply_workflow_action(
         main_sync = trusted.get("main_sync")
         evidence_ref = trusted.get("ref")
         evidence_hash = trusted.get("hash")
+        autosync = trusted.get("main_sync_autosync")
         context: dict[str, object] = {}
         evidence_refs: tuple[str, ...] = ()
         updated_evidence_refs = current.evidence_refs
@@ -19780,6 +19809,26 @@ def apply_workflow_action(
                 context["main_sync_evidence_hash"] = evidence_hash
                 result["evidence_hash"] = evidence_hash
             result["main_sync"] = dict(main_sync)
+        if isinstance(autosync, dict):
+            autosync_refs = tuple(
+                value
+                for value in (
+                    autosync.get("probe_evidence_ref"),
+                    autosync.get("evidence_ref"),
+                )
+                if isinstance(value, str) and value
+            )
+            evidence_refs = tuple(dict.fromkeys((*evidence_refs, *autosync_refs)))
+            updated_evidence_refs = tuple(
+                dict.fromkeys((*updated_evidence_refs, *autosync_refs))
+            )
+            context["main_sync_autosync"] = json.dumps(
+                autosync,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            result["main_sync_autosync"] = dict(autosync)
         diagnostic_code = (
             delivery_reason
             if delivery_reason in {"review-disposition-required", "review-threads-unresolved"}
@@ -19803,6 +19852,65 @@ def apply_workflow_action(
             ),
             result,
         )
+
+    def try_main_sync_autosync(
+        *,
+        current,
+        run_view,
+        candidate: str | None,
+        trusted: dict[str, object],
+        steps,
+        gate_refs,
+    ) -> dict[str, object] | None:
+        main_sync = trusted.get("main_sync")
+        if (
+            trusted.get("reason") != "candidate-behind-main"
+            or not isinstance(main_sync, dict)
+            or main_sync.get("outcome") != "clean-behind"
+            or not isinstance(candidate, str)
+        ):
+            return None
+        callback = getattr(ship_validator, "main_sync_autosync", None)
+        if not callable(callback):
+            return None
+        autosync = callback(run=run_view, candidate=candidate, stop=trusted)
+        if not isinstance(autosync, dict):
+            return None
+        trusted["main_sync_autosync"] = autosync
+        trusted["reason"] = autosync.get("reason") or "candidate-behind-main"
+        if autosync.get("outcome") != "merged":
+            return None
+        new_candidate = autosync.get("candidate_after")
+        evidence_refs = tuple(
+            value
+            for value in (
+                autosync.get("probe_evidence_ref"),
+                autosync.get("evidence_ref"),
+            )
+            if isinstance(value, str) and value
+        )
+        if (
+            not isinstance(new_candidate, str)
+            or not evidence_refs
+            or not isinstance(autosync.get("evidence_ref"), str)
+        ):
+            raise ValueError("main-sync autosync returned incomplete Candidate evidence")
+        updated = registry._manager_reset_workflow_for_main_sync(
+            current.run_id,
+            expected_candidate=candidate,
+            expected_updated_at=current.updated_at,
+            candidate_head=new_candidate,
+            steps=tuple(steps),
+            gate_refs=tuple(gate_refs),
+            evidence_refs=evidence_refs,
+        )
+        return {
+            "run_id": updated.run_id,
+            "current_phase": updated.current_phase,
+            "reason": "main-sync-autosync-reverify",
+            "candidate_head": updated.candidate_head,
+            "main_sync_autosync": autosync,
+        }
 
     if action == "refresh-completion":
         if not trusted_terminal:
@@ -19926,6 +20034,16 @@ def apply_workflow_action(
                         "reason": "delivery-in-progress",
                     }
                 if status == "needs_human":
+                    autosync_result = try_main_sync_autosync(
+                        current=current,
+                        run_view=current,
+                        candidate=current.candidate_head,
+                        trusted=trusted,
+                        steps=current.steps,
+                        gate_refs=current.gate_refs,
+                    )
+                    if autosync_result is not None:
+                        return autosync_result
                     (
                         delivery_reason,
                         evidence_refs,
@@ -20235,6 +20353,17 @@ def apply_workflow_action(
                             "reason": trusted.get("reason")
                             or ("delivery-in-progress" if status == "pending" else "delivery-needs-human"),
                         }
+                if status == "needs_human":
+                    autosync_result = try_main_sync_autosync(
+                        current=current,
+                        run_view=validation_run,
+                        candidate=candidate,
+                        trusted=trusted,
+                        steps=updated_steps,
+                        gate_refs=validation_run.gate_refs,
+                    )
+                    if autosync_result is not None:
+                        return autosync_result
                 if status == "passed":
                     review_kind = trusted["review_kind"]
                     by_kind.pop("maintainer-review" if review_kind == "copilot" else "copilot", None)
