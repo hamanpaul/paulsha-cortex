@@ -20,14 +20,14 @@ work_item: upgrade-venv-umask
 
 ## Tasks
 
-- [ ] **T1 RED**：以 umask 0077 建立 venv slot，斷言服務帳號無法執行 `bin/cortex`；以權限錯誤的既有同 sha
+- [x] **T1 RED**：以 umask 0077 建立 venv slot，斷言服務帳號無法執行 `bin/cortex`；以權限錯誤的既有同 sha
       slot 執行重用路徑，斷言現行不會修正。
-- [ ] **T2 venv 權限明確化**：installer 建立或重用 venv slot 時，明確設定 root 擁有、目錄與執行檔 0755、
+- [x] **T2 venv 權限明確化**：installer 建立或重用 venv slot 時，明確設定 root 擁有、目錄與執行檔 0755、
       其他檔案 0644（或與既有 slot 相同的規則），不依賴呼叫端 umask。重用既有 slot 時驗證並修正，修正動作
       要能被 rollback 正確處理。
-- [ ] **T3 orchestrator umask 規範**：`cortex upgrade` 對 candidate 子程序的 umask 有明確規定；機敏檔案由寫入端
+- [x] **T3 orchestrator umask 規範**：`cortex upgrade` 對 candidate 子程序的 umask 有明確規定；機敏檔案由寫入端
       自己設 0600，不靠全域 umask 讓 installer 產物不可讀。
-- [ ] **T4 verify 診斷**：服務停在 `activating` 或 203/EXEC 時，verify 的失敗訊息帶出 journal 的原因。
-- [ ] **T5 RC**：升級演練涵蓋「新 wheel sha、新建 venv」，並在呼叫端 umask 0077 下執行，驗證服務帳號能執行
+- [x] **T4 verify 診斷**：服務停在 `activating` 或 203/EXEC 時，verify 的失敗訊息帶出 journal 的原因。
+- [x] **T5 RC**：升級演練涵蓋「新 wheel sha、新建 venv」，並在呼叫端 umask 0077 下執行，驗證服務帳號能執行
       新 venv、verify 通過。
-- [ ] **T6 文件**：runbook 補上說明。新增 changelog fragment，並同步 `CHANGELOG.md [Unreleased]`。
+- [x] **T6 文件**：runbook 補上說明。新增 changelog fragment，並同步 `CHANGELOG.md [Unreleased]`。

@@ -42,6 +42,14 @@ uid／gid、權限 0600。executor 會自己改寫登入檔（例如 codex 刷�
 receipt 一致。生效中的 receipt 由 receipt chain 判定，不看檔名或時間。結果寫在
 `/var/lib/cortex-installer/<版本>/upgrade-report.json`，終端機印出摘要（`--json` 改印完整報告）。
 
+- deployment venv slot（`/opt/cortex/venvs/<wheel sha>/`）建立或重用時，installer 會主動把
+  root 持有的目錄與 executable 修成 `0755`、其他一般檔修成 `0644`，不依賴 operator shell 的
+  `umask`。就算前一次失敗留下同 sha、權限過窄的 slot，下一次升級在 cutover 前也會先修正它；receipt、
+  evidence 與 credential 檔仍各自由 writer 明確寫成 `0600`。
+- verify 若因 service 卡在 `activating`、或 systemd 報 `203/EXEC`/`Permission denied` 之類的啟動
+  問題而 FAIL，失敗 JSON 與 `upgrade-report.json` 的 error 會帶出該 service 最新的 journal reason；
+  先看這個原因，再決定是否 retry 或走 `--recover`。
+
 - 只升不降：目標版本必須高於生效中的 receipt；降版改用 installer `rollback` 或下列手動流程。
 - 下載只跟隨 GitHub 允許清單內的 HTTPS redirect（目前 asset 由 `github.com` 302 到
   `release-assets.githubusercontent.com`）。若 GitHub 改變 release asset 的下載 host，ingress 會

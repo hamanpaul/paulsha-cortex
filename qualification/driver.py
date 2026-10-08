@@ -360,6 +360,7 @@ def _installed_checks(
     require_system_status: bool = True,
     receipt_path: Path | None = None,
     profile: str = "release",
+    prior_receipt_id: str | None = None,
 ) -> list[dict[str, str]]:
     install = _load_json(install_evidence, "install verification evidence")
     if (
@@ -398,15 +399,15 @@ def _installed_checks(
     if profile == "release":
         _installed_owner_bound_reclaim(receipt, evidence_dir)
         owner_reclaim_check.append({"name": "owner-bound-reclaim", "status": "passed"})
-    _write_json(
-        evidence_dir / "install-semantic-checks.json",
-        {
-            "schema_version": 1,
-            "selfcheck": selfcheck_payload,
-            "registry_equation": equation_payload,
-            "receipt_id": receipt.get("receipt_id"),
-        },
-    )
+    semantic_checks: dict[str, object] = {
+        "schema_version": 1,
+        "selfcheck": selfcheck_payload,
+        "registry_equation": equation_payload,
+        "receipt_id": receipt.get("receipt_id"),
+    }
+    if prior_receipt_id is not None:
+        semantic_checks["prior_receipt_id"] = prior_receipt_id
+    _write_json(evidence_dir / "install-semantic-checks.json", semantic_checks)
     if require_system_status:
         # 服務在 activate 時才啟動，loaded receipt 可能晚幾秒才寫入：輪詢到三項
         # 全部 match 或逾時，逾時時列出各項狀態（只輸出列舉 token）。
@@ -7200,10 +7201,12 @@ def main() -> int:
     try:
         receipt = _load_json(args.receipt, "install receipt")
         args.evidence_dir.mkdir(parents=True, exist_ok=False)
+        prior_receipt: Mapping[str, Any] | None = None
         if args.upgrade_report is not None:
             assert args.prior_receipt is not None and args.upgrade_drill_report is not None
+            prior_receipt = _load_json(args.prior_receipt, "prior install receipt")
             _capture_one_command_upgrade(
-                prior_receipt=_load_json(args.prior_receipt, "prior install receipt"),
+                prior_receipt=prior_receipt,
                 upgrade_receipt=receipt,
                 receipt_path=args.receipt,
                 drill_report=_load_json(args.upgrade_drill_report, "upgrade drill report"),
@@ -7217,6 +7220,11 @@ def main() -> int:
             require_system_status=not legacy_profile,
             receipt_path=args.receipt,
             profile=args.profile,
+            prior_receipt_id=(
+                prior_receipt.get("receipt_id")
+                if prior_receipt is not None
+                else None
+            ),
         )
         providers: list[dict[str, object]] = []
         if legacy_profile:
