@@ -17937,7 +17937,11 @@ def resume_workflow_run(
                 "retry_after_epoch": active.deadline_epoch,
             }
     pre_resume_gate_status = run.gate_status
-    retry_failed = False
+    retry_failed = bool(
+        operator_resume
+        and run.current_phase == "review"
+        and run.retry_classification == "review_handoff_failure"
+    )
     recovery_job_id: str | None = None
     quota_auto_retry = bool(
         "needs_human" in run.facets

@@ -1,0 +1,1 @@
+- 進件：`pr-authority-rebind-v2`（#1360，#1339 重做），PR 已存在的 run 在正式生命週期下能 resume；先找出 WorkAuthority mismatch 的真正原因再修。
