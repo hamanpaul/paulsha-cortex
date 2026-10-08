@@ -180,7 +180,7 @@ store 路徑一起輸出。要確認兩個 instance 是否真的共用同一個 
   `~/.agents/coordinator`，任何一個 instance 自設 `PSC_COORDINATOR_ROOT` 就
   有自己的 authority。
 - 同帳號多 instance 要共用 authority，只能讓它們解析到**同一個 coordinator
-  root**——這會一併共用 `jobs.json` registry 與全部 coordinator 狀態，不只
+  root**——這會一併共用 `jobs.json` registry 與全部 coordinator 狀態，不只 <!-- doc-drift-ignore -->
   額度；而且 #836 ledger（`quota-observations/`）與 #839 decision receipt
   （`quota-admission-decisions/`）也掛在同一個 root 下，capacity 來自各自
   ledger 的投影，只共用 reservation 而不共用 ledger 會讓各 instance 以不同
@@ -297,9 +297,9 @@ retry／resume 的新 attempt 邊界重選候選，不搬動仍執行的 job。
 
 quota admission 的啟用前提、fresh observation、wait 恢復、rollback 與 evidence 查核步驟，見[Quota admission enforce 操作手冊](docs/superpowers/runbooks/quota-admission-enforce.md)。
 
-### Production 接線：`manager_daemon.py` 與 quota-pools 設定檔
+### Production 接線：`paulsha_cortex/coordinator/manager_daemon.py` 與 quota-pools 設定檔
 
-`manager_daemon.py` 在 workflow start、operator resume（`workflow-action`／
+`paulsha_cortex/coordinator/manager_daemon.py` 在 workflow start、operator resume（`workflow-action`／
 `work-action` 兩條 resume／retry 路徑）與 periodic resume 全部五個
 dispatch／resume 呼叫點，都會以下述設定檔建構同一份 `DispatchContext` 並
 傳入；periodic tick 另外呼叫 `manager.reconcile_quota_admission_reservations()`
@@ -335,8 +335,8 @@ job metric 的 `usage_unit_refs`，否則 tick summary 的
 `usage-unit-mapping-missing`，ledger 不變。
 
 Manager 讀取 `paulsha_cortex.config.paths.quota_pools_config_path()`
-（預設 `~/.config/paulshaclaw/quota-pools.json`，可用 `PSC_QUOTA_POOLS_CONFIG`
-覆寫整個檔案路徑；比照既有 `paulshaclaw.yaml`，這是 operator-owned app 設定，
+（預設 `~/.config/paulshaclaw/quota-pools.json`，可用 `PSC_QUOTA_POOLS_CONFIG` <!-- doc-drift-ignore -->
+覆寫整個檔案路徑；比照既有 `paulshaclaw.yaml`，這是 operator-owned app 設定， <!-- doc-drift-ignore -->
 不是 Trust Root 治理的 durable-state 資產），schema 為 `cortex/quota-pools/v1`：
 
 ```json
@@ -400,7 +400,7 @@ provider 讀取與長期運作）仍是獨立的部署 gate，本節只交付到
 
 - `policy_config_revision`：這筆決策當時使用的 operator quota-pools 設定檔
   `config_revision`（來自 `DispatchContext.config_revision`，由
-  `manager_daemon.py` 從設定檔載入結果帶入）。admit 與 `quota-admission-insufficient`
+  `paulsha_cortex/coordinator/manager_daemon.py` 從設定檔載入結果帶入）。admit 與 `quota-admission-insufficient`
   wait receipt 都會記；`quota-config-invalid` 沒有可信 revision，維持 `null`。
 - `selected_observation_state`／`selected_feasible`：選中候選當時的額度
   observation 狀態（`unmanaged`／`known`／`unknown`）與是否所有綁定 pool
@@ -562,7 +562,7 @@ cortex --help
 cortex --version   # 應印出 0.1.9
 ```
 
-也可改用 GitHub Release 附帶的 wheel（`release.yml` 會把 exact RC-qualified wheel 附在該 tag 的 Release）：
+也可改用 GitHub Release 附帶的 wheel（`.github/workflows/release.yml` 會把 exact RC-qualified wheel 附在該 tag 的 Release）：
 
 ```bash
 pipx install ./paulsha_cortex-0.1.9-py3-none-any.whl
@@ -605,14 +605,14 @@ mkdir -p "$HOME/.agents/skills"
 ln -s "$repo_root/skills/driving-cortex" "$HOME/.agents/skills/driving-cortex"
 ```
 
-之後更新此 checkout 時，symlink 會讀到最新的 `SKILL.md`；若 repo 搬移，需重新建立入口。
+之後更新此 checkout 時，symlink 會讀到最新的 `skills/driving-cortex/SKILL.md`；若 repo 搬移，需重新建立入口。
 
 ## Usage
 
 ### 需求交付總帳（#845）
 
 refine R01–R14 的版本化需求、acceptance criteria、evidence policy 與 owner 對照在
-[`refine-requirements-v1.json`](docs/superpowers/specs/refine-requirements-v1.json)；
+[`docs/superpowers/specs/refine-requirements-v1.json`](docs/superpowers/specs/refine-requirements-v1.json)；
 驗證來源、CompletionRecord、remote closure、#841 loaded-runtime receipt、live receipt
 及 crash/CAS 索引語意見[需求交付總帳契約](docs/superpowers/specs/requirement-delivery-accounting.md)。
 
@@ -632,7 +632,7 @@ cortex delivery gaps --manifest docs/superpowers/specs/refine-requirements-v1.js
 `recorded_at` 判定期限（過期為 stale）；test 證據只採信 verification contract
 `tests[*].acceptance_ids` 綁定該 criterion 且通過的測試；production 不接受任何 waiver。live 證據已固定接上
 `paulsha_cortex/coordinator/live_receipt_validators.py` 的封閉登記表 validator，只認得
-deployment-canary `qualification.json`（沿用 `qualification/validate.py`）與 #857
+deployment-canary `qualification.json`（沿用 `qualification/validate.py`）與 #857 <!-- doc-drift-ignore -->
 `cortex/task-memory-live-canary/v1` 兩種 receipt kind，兩者都綁定該需求 claim 的
 artifact/target；receipt 缺失、kind 不在登記表內或內容不符綁定規則時保留具體 gap，
 規則詳見[需求交付總帳契約](docs/superpowers/specs/requirement-delivery-accounting.md)。
@@ -661,7 +661,7 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
 
    若既有 `$HOME/.agents/config/paulsha/project-cortex.yaml` 已包含其他 workspace，
    installer 只會在末端追加目前目標，並在替換前建立 `project-cortex.yaml.bak-*`；既有
-   `project-cortex.yaml` 或 `model-identities.yaml` 無法載入時會拒絕覆寫。若舊 env
+   `project-cortex.yaml` 或 `model-identities.yaml` 無法載入時會拒絕覆寫。若舊 env <!-- doc-drift-ignore -->
    記錄的是另一個 HOME 下的 default agents root，請以 `--agents-root PATH` 明確指定後再安裝。
    回寫會以 `yaml.safe_dump` 重排格式並移除註解，原始位元組保留於同目錄的 `.bak-*`。
    每次 append 遷移會在 config root 留下
@@ -670,7 +670,7 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    用於序列化併發安裝，屬常駐鎖檔，不需清除。沒有任何程式會 glob config root，殘留檔
    不影響 monitor/doctor 讀取；若 rollback restore 失敗，錯誤會逐一列出各檔案自己的
    backup、遷移前不存在而 rollback 僅需移除，或沒有 backup 且原始內容只留在記憶體
-   中的 `previous`，並逐檔記錄 restore 結果。既有 `project-cortex.yaml` 若是 symlink，
+   中的 `previous`，並逐檔記錄 restore 結果。既有 `project-cortex.yaml` 若是 symlink， <!-- doc-drift-ignore -->
    只有在此次 install 需要 append/replace、確實會改寫 project config 時才會
    fail-closed，明確指出該路徑並保留 symlink 與其 target 不變；若目標 workspace 已存在、
    install 不需改寫 project config，則保留 symlink 正常完成。本段 append-only 說明只涵蓋
@@ -865,7 +865,7 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
 
    自動化呼叫可用 `cortex service ensure-running`：若 `manager.lock` 已由 live manager 持有，就不重啟並回報 `mode=already-running`；systemd user units 齊備且可用時會啟動 manager service/timer 與 monitor service，並等待 manager lock 最多 10 秒；否則以目前執行中的 Cortex Python 啟動本地 manager 與 monitor。此命令固定輸出一行 `cortex-porcelain/service/v1` JSON，fallback log 寫入 `manager.log`，不會安裝或修改 units。
 
-   `cortex service status` 會先讀 systemd units 與 bootstrap env，若尚未安裝但偵測到前景 `service-manager.sh` lock，則回報 fallback mode 與 log path；`cortex service logs` 會優先走 `journalctl --user`，否則回退讀 `$HOME/.agents/log/manager.log`。只有 systemd mode 支援 `--follow` 即時串流；fallback mode 會顯性拒絕並要求直接 tail log 檔。
+   `cortex service status` 會先讀 systemd units 與 bootstrap env，若尚未安裝但偵測到前景 `paulsha_cortex/scripts/service-manager.sh` lock，則回報 fallback mode 與 log path；`cortex service logs` 會優先走 `journalctl --user`，否則回退讀 `$HOME/.agents/log/manager.log`。只有 systemd mode 支援 `--follow` 即時串流；fallback mode 會顯性拒絕並要求直接 tail log 檔。
    `cortex service status --json` 另含 `loaded_runtime`：分開列出執行 status 命令的 `operator_cli`、磁碟上的 `service_declaration`，以及 Manager／Monitor 啟動時實際載入的 artifact/config receipt。只有 process PID、artifact 與可比對配置都能核對時才回報 match；磁碟更新會顯示 drift，缺 receipt、source override 或無法證實的欄位維持 unknown。`cortex doctor --json` 使用同一份安全投影。欄位與 live 驗收界線見[已載入 runtime 身分證據](docs/loaded-runtime-attestation.md)。
    `cortex service install` 寫入 unit 後，若 `daemon-reload` 或 `enable` 任一階段非零，會直接回報 `mode=systemd`、非零 exit code，訊息僅包含 systemd stderr、unit 落檔位置、重試 command（`systemctl --user ...`），並明確指出「unit 已寫入但僅 reload/enable 尚未完成」，不會輸出 traceback 或 stdout 內容，並不再繼續後續步驟。
 
@@ -884,9 +884,9 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    ```
 
    `--executor`／`--model` 省略時由 daemon 採用部署設定；帶 `--wait [--timeout N]` 時成功為 exit 0、terminal failure 為 exit 1、逾時仍為 exit 3。所有 queue mutation 都可加 `--json` 取得 `cortex-porcelain/run/v1` 輸出。
-   若 spec frontmatter 成對宣告 optional `executor`／`model_id`，fanout/tick 會逐 slice 覆寫這裡的 builder 預設值；命令列明確指定與 spec frontmatter 宣告的 `(executor, model_id)` 都會先查 `model-identities.yaml`，unknown identity 直接 fail-closed 並列出可用 candidates。
+   若 spec frontmatter 成對宣告 optional `executor`／`model_id`，fanout/tick 會逐 slice 覆寫這裡的 builder 預設值；命令列明確指定與 spec frontmatter 宣告的 `(executor, model_id)` 都會先查 `model-identities.yaml`，unknown identity 直接 fail-closed 並列出可用 candidates。 <!-- doc-drift-ignore -->
    `run fanout`／`run tick` 的 JSON 結果固定帶 `dispatch_skipped_by_backoff`；若 `dispatch` request 或 `slice-action retry-build` 因 durable executor backoff 沒有派出 job，也會回同名欄位而不是造假 `job_id`。元素若是已知 cooldown，形狀正好是 `{"slice_id","executor","model_id","retry_after_epoch"}`；若 store 狀態未知，則改為 `retry_after_epoch: null` 並帶 `reason`（目前為 `executor-backoff-store-unknown`）。**unknown 只代表 durable backoff state 無法可信判定，不代表 quota/額度已可用。**
-   `cortex run work start/resume/...` 額外支援 `--planner-executor`／`--planner-model`／`--builder-executor`／`--builder-model`／`--reviewer-executor`／`--reviewer-model`：run-scoped 覆寫該 work item 這次 claim 的 planner/builder/reviewer 模型鏈，三段各自獨立、未指定的段落回退共享 `model-identities.yaml`。覆寫只影響這個 run，不改共享設定檔、不影響其他 active run 尚未派出的 card；於 claim（或首次 dispatch）時凍結，之後 resume／retry 沿用凍結值。指定的 identity 仍須通過既有 capability 與 builder/reviewer independence domain 檢查，違反時 CLI 直接回報錯誤原因並列出可用 identity，不會靜默退回共享預設。
+   `cortex run work start/resume/...` 額外支援 `--planner-executor`／`--planner-model`／`--builder-executor`／`--builder-model`／`--reviewer-executor`／`--reviewer-model`：run-scoped 覆寫該 work item 這次 claim 的 planner/builder/reviewer 模型鏈，三段各自獨立、未指定的段落回退共享 `model-identities.yaml`。覆寫只影響這個 run，不改共享設定檔、不影響其他 active run 尚未派出的 card；於 claim（或首次 dispatch）時凍結，之後 resume／retry 沿用凍結值。指定的 identity 仍須通過既有 capability 與 builder/reviewer independence domain 檢查，違反時 CLI 直接回報錯誤原因並列出可用 identity，不會靜默退回共享預設。 <!-- doc-drift-ignore -->
    `run work` 的 `--card` 用於 `retry-card` 與 `regenerate-gates`：前者需搭配 exact 活動 WorkflowRun ID 與該 run 的待派 card；後者選擇要重跑 gate 的 build 卡，若 run 有多張符合條件的 build 卡就必須指定，單卡時省略仍相容並取該卡最新 job。retry-card 帶 run-scoped identity override 時，Manager 會在 reset 前依既有 capability／independence 判準驗證；拒絕的 override 不會寫進 run。`retry-verify` 在同一個 work-action request reset 後直接派出新的 verification job；符合 #577 精準復原條件的舊 reviewer job 仍保留 `exited` 狀態。`--payload` 可用來傳遞各 action 原本支援的其他欄位，不是選擇 retry card 的必要輸入；retry-card 仍拒絕既有 allowlist 以外的 caller fields。
    每張卡最多接受三次 `retry-card` 重派；超限會維持 `needs_human` 並在阻塞理由標示卡片，提示 `abandon` 或符合條件時使用 `retry-build`。
 
@@ -1004,7 +1004,7 @@ cortex tick \
   --review-model "<reviewer-model-id>"
 ```
 
-`tick` 會依序處理 ready fanout、既有 Job 輪詢、deterministic verification、必要的 foreign review 與 completion 判斷。`--executor`／`--model` 是整批 builder 預設值；spec frontmatter 若成對宣告 `executor`／`model_id`，會逐 slice 覆寫且沿用同一套 commit-required／approval-safety 語意。命令列明確指定與 per-slice 覆寫的 `(executor, model_id)` 都必須存在於 `model-identities.yaml`，才會真正進 executor argv。不要在一般操作加入 `--allow-unsafe`；它會旁路 executor approval/sandbox，且只允許單一 ready slice canary。AGY 會將此旗標轉成 `--dangerously-skip-permissions`；其權限剖面尚未依 #716 逐 executor 量測，應視為 operator 明確承擔的高風險 opt-in。AGY builder prompt 也要求測試與長命令直接在前景同步執行並等待完成，不得交給背景任務。
+`tick` 會依序處理 ready fanout、既有 Job 輪詢、deterministic verification、必要的 foreign review 與 completion 判斷。`--executor`／`--model` 是整批 builder 預設值；spec frontmatter 若成對宣告 `executor`／`model_id`，會逐 slice 覆寫且沿用同一套 commit-required／approval-safety 語意。命令列明確指定與 per-slice 覆寫的 `(executor, model_id)` 都必須存在於 `model-identities.yaml`，才會真正進 executor argv。不要在一般操作加入 `--allow-unsafe`；它會旁路 executor approval/sandbox，且只允許單一 ready slice canary。AGY 會將此旗標轉成 `--dangerously-skip-permissions`；其權限剖面尚未依 #716 逐 executor 量測，應視為 operator 明確承擔的高風險 opt-in。AGY builder prompt 也要求測試與長命令直接在前景同步執行並等待完成，不得交給背景任務。 <!-- doc-drift-ignore -->
 
 若 fanout 發生 `dispatch` 例外，`tick` 回傳仍包含 `completed` 與 `dispatched`，並在 `errors` 按 slice 回報 `slice_id`、`type`、`message`，讓上層在部分派送成功時仍可見完整狀態。summary 也固定帶 `dispatch_skipped_by_backoff`：已知 cooldown 會給 `retry_after_epoch`，store unknown 只會給 `reason` 與 `retry_after_epoch: null`；unknown 一律視為「暫時不能可信派工」，不是 quota 已恢復的訊號。
 
@@ -1078,7 +1078,7 @@ Job `exited` 只代表 Agent process 以 exit code 0 結束，**不代表任務�
 
 ### 4. 處理 `needs_human`
 
-先從 `cortex status` 的 `attention[].next_actions` 選擇當下允許的動作，不要手動改 `jobs.json`：
+先從 `cortex status` 的 `attention[].next_actions` 選擇當下允許的動作，不要手動改 `jobs.json`： <!-- doc-drift-ignore -->
 `cortex list` 與 `cortex work show` 的 needs_human work item 也會投影同一份目前可受理的 recovery actions，包含符合 owner-bound 前置條件時的 `recover-pre-candidate`。
 
 Verify／review 卡的 stage-evidence reuse（#844）：`cortex work resume` 與 periodic tick 遇到同 run／claim-era／exact candidate 且輸入完全相容的既有成功 job 時不再呼叫模型，改由 Manager 在採信點重驗後直接採信；resume 結果與 `cortex work show` 的 `stage_reuse` 會列出 reused（來源 run／job／evidence hash）、fresh 或 ineligible 與原因。支援 cohort、receipt 欄位、migration 與未支援範圍見 [Stage evidence reuse](docs/stage-evidence-reuse.md)。
@@ -1099,7 +1099,7 @@ cortex slice-action "$SLICE_ID" supersede    --actor operator \
 action audit，將 state 標為 `superseded`，不建立 CompletionRecord，也不釋放 dependency；相同
 actor/reason/CAS 重送會回報已完成且不新增 audit。
 
-`fanout`、`tick`、`complete`、`slice-action` 與 `work` 都會寫入 control request queue，再由 daemon / manager 這個單一 writer 改變狀態；daemon 未啟動時會明確拒絕，不會由 CLI 直接競寫 registry。共享 coordinator root 內的 `jobs.json` 另以 exact durable-byte SHA-256 revision ＋ canonical `jobs.json.transaction.lock` sidecar 做 compare-and-persist：stale request 不會被靜默重播，daemon 會先把 `RegistryRevisionConflict`（含 expected/actual revision 與 canonical path）持久化成 `done` error，再移除 request file。
+`fanout`、`tick`、`complete`、`slice-action` 與 `work` 都會寫入 control request queue，再由 daemon / manager 這個單一 writer 改變狀態；daemon 未啟動時會明確拒絕，不會由 CLI 直接競寫 registry。共享 coordinator root 內的 `jobs.json` 另以 exact durable-byte SHA-256 revision ＋ canonical `jobs.json.transaction.lock` sidecar 做 compare-and-persist：stale request 不會被靜默重播，daemon 會先把 `RegistryRevisionConflict`（含 expected/actual revision 與 canonical path）持久化成 `done` error，再移除 request file。 <!-- doc-drift-ignore -->
 
 Work lifecycle mutation 使用 `cortex work <link|unlink|start|resume|retry-build|abandon|retire-delivered|close-delivered|auto|verify-attest|review-attest|review-disposition|ship> <work-id> --repo <owner/repo>`。`link` / `unlink` 以 `--kind <github_issue|github_pr|openspec|path> --ref <canonical-ref>` 指定來源，`--issue N` 僅保留一個 release 的相容入口，兩者不得混用；一般 link/start/resume 由 installer/Monitor registry 解析 trusted repo root。`retry-build` 的 payload 只接受 `expected_candidate` CAS，CLI 會拒絕 `expected_run_id`；`cortex run work retry-build` 使用 `--expected-candidate`，不接受共用旗標 `--expected-run-id`。`abandon` 必須帶 exact `--expected-run-id`、bounded `--actor` 與單行 `--reason`，只會把無active Job、無PR/ship side effect的pre-delivery run設成`superseded`並留下immutable evidence，不會建立CompletionRecord；終態化後也會逐 run reconcile planning transaction、回收 build worktree，並退役 build branch。有超出 base 的 branch commit 會先保留在 `archive/<work_id>-<shortsha>` tag。`review-attest` 的 review 摘要、空 findings 與選填 `evidence_refs`，以及 `ship` 的 exact evidence refs，都由 `--payload <json>` 傳入；當 work item 沒有 mapped OpenSpec 時，即使尚未建立 PR，只要 verified HEAD 仍等於 candidate 也可先建立 maintainer attestation。CLI 只排隊，confirmed Todo/issue authority、GitHub label、official OpenSpec archive、preflight、current-HEAD review、merge 與 remote closure 都由 Manager 驗證及執行。
 
@@ -1268,7 +1268,7 @@ Manager 選到 operator overlay 中的 Copilot identity 時，會在建立 Corte
 
 ### Foreign reviewer identity（不同 independence domain）
 
-`PSC_PROJECT_CONFIG_ROOT/model-identities.yaml`：
+`PSC_PROJECT_CONFIG_ROOT/model-identities.yaml`： <!-- doc-drift-ignore -->
 
 ```yaml
 schema_version: 4
@@ -1304,8 +1304,8 @@ planner／builder／reviewer 的身分解析依序走三層，**層級是排序�
 
 | 層 | provenance 值 | 來源 | 語意 |
 | --- | --- | --- | --- |
-| 1 | `operator-overlay` | host overlay `model-identities.yaml` | operator 人工指定；**列序即優先序**，壓過 packaged roster 的一切內建順序 |
-| 2 | `evaluated-roster` | host `model-eval-roster.yaml` | 經 patchmud 評估合格**且**人工複核通過的身分 |
+| 1 | `operator-overlay` | host overlay `model-identities.yaml` | operator 人工指定；**列序即優先序**，壓過 packaged roster 的一切內建順序 <!-- doc-drift-ignore --> |
+| 2 | `evaluated-roster` | host `model-eval-roster.yaml` | 經 patchmud 評估合格**且**人工複核通過的身分 <!-- doc-drift-ignore --> |
 | 3 | `packaged-fallback` | packaged roster | 候選池：只供評估管線取材；解析落到這層一律 fail-loud |
 
 同層內維持既有偏好（`primary_domain` 偏好、patchmud 實測封套優先），因此這些偏好
@@ -1390,7 +1390,7 @@ key 不一致或 launch 條件與 resolved profile 不符時拒絕派工。
 
 Adapter descriptor 是資料，不會載入 descriptor 提供的程式碼。adapter 的 protocol／runtime
 version、原生 effort 合法值與預設（含 model 專屬預設）由 packaged
-`data/execution-adapters.yaml` 提供，operator 可在 `$PSC_PROJECT_CONFIG_ROOT/execution-adapters.yaml`
+`paulsha_cortex/coordinator/data/execution-adapters.yaml` 提供，operator 可在 `$PSC_PROJECT_CONFIG_ROOT/execution-adapters.yaml`
 以同 schema 的 overlay 整筆取代同名條目；未知鍵、缺欄位或未知版本一律拒收。新增 model
 或既有協定的 effort 只改 descriptor；新 runtime 則要以程式碼登記受信任的 adapter 實作，
 並沿用現有 launcher 的 argv、terminal、usage、cancel/timeout、工具與 sandbox 邊界。
@@ -1399,7 +1399,7 @@ reviewer independence 與既有 Trust Root（加固 runner 下的 launcher／too
 grant），拒絕時在 spawn 前持久化 needs_human。Sized run 的 #842
 exact-profile qualification gate 預設未啟用，讓尚未部署 qualification receipt
 lifecycle 的環境可繼續派工；這類 dispatch 會在 `resolved_model_chain` 留下
-`qualification: not-enforced`。只有 host overlay `model-identities.yaml` 明確宣告
+`qualification: not-enforced`。只有 host overlay `model-identities.yaml` 明確宣告 <!-- doc-drift-ignore -->
 以下政策時，缺少／撤銷／不匹配的 receipt 才會在 spawn 前轉為 `needs_human`：
 
 ```yaml
@@ -1424,7 +1424,7 @@ consumer，真實 immutable producer fixture／revision 與安裝後 launcher �
 - work delivery CompletionRecord 另綁定 repo/work/run ID、workflow step IDs、Monitor snapshot/provider/source revisions、mapped issues、PR/OpenSpec/Todo refs、merge commit，以及 trusted preflight/current-HEAD delivery review/ForeignReview/merge-authorization refs；cached done 每次仍會重新讀取 fresh authority 與 remote closure。若WorkflowRun已是`done/ship`但CompletionRecord綁定舊authority，operator可執行同一個`cortex work resume`；Manager只會唯一選取該terminal run並重跑ship validator，不重開builder或dispatch任何workflow card，且僅在完整closure再次通過後原子刷新completion binding。
 - merge 前 Manager 會先以 atomic no-clobber+fsync 寫入唯讀 `merge-authorized` evidence file（authority digest、HEAD/tree、實際review kind/ref/hash、ForeignReview/preflight/checks hashes），再把 path/hash 綁回 run state。Crash replay 只接受 exact record；未經 Manager authorization 的 external merge 會進入 `needs_human`，不會直接閉合。
 - crash window（record 已寫、slice 尚未 completed）在 restart 後只會補完符合當前 target ancestry 的紀錄；不符合則維持 blocked。
-- 舊版無 `schema_version` / legacy `done` state 需先 clean-start（archive/remove 舊 `jobs.json`），不做 silent migration。
+- 舊版無 `schema_version` / legacy `done` state 需先 clean-start（archive/remove 舊 `jobs.json`），不做 silent migration。 <!-- doc-drift-ignore -->
 
 ### Operator actions 與 status / attention
 
@@ -1449,9 +1449,9 @@ cortex work review-attest "$WORK_ID" --repo "$REPO" --actor "$ACTOR" \
   --payload review-attest.json
 ```
 
-`verify-attest.json` 接受 `{"full_suite_command":"python -m pytest -q","result_summary":{"passed":5987,"failed":0}}`。這是 operator 提交的測試命令與結果聲明，Manager 不會代跑該命令。Manager 只在 ongoing、停於 verify/needs_human、exact Candidate 相符、build 已通過且沒有 active job 時，寫入綁定 repo/work/run/authority/candidate 的 immutable evidence 並推進 review；review 與後續 ship gate 照常執行，`review-attest` 仍只處理 review。
+`verify-attest.json` 接受 `{"full_suite_command":"python -m pytest -q","result_summary":{"passed":5987,"failed":0}}`。這是 operator 提交的測試命令與結果聲明，Manager 不會代跑該命令。Manager 只在 ongoing、停於 verify/needs_human、exact Candidate 相符、build 已通過且沒有 active job 時，寫入綁定 repo/work/run/authority/candidate 的 immutable evidence 並推進 review；review 與後續 ship gate 照常執行，`review-attest` 仍只處理 review。 <!-- doc-drift-ignore -->
 
-`review-attest.json`接受`{"verdict":"approved","summary":"...","findings":[]}`，並可選填 `evidence_refs`（只接受 `{"kind":"operator-reproduction","ref":"<absolute path>","sha256":"<64 hex>"}` 陣列）。path/hash 仍由 Manager 生成，caller 不得注入。若 work item 尚無 mapped PR，Manager 會在 `verified_head == candidate_head` 時先建立 `pr_number: null` 的 immutable maintainer evidence；後續 ship 建 PR 時再把它綁進 delivery gate。若已有 PR，Manager 仍會重讀 authenticated PR HEAD 並將 evidence 綁定 repo/work/run/authority/PR/candidate/actor。
+`review-attest.json`接受`{"verdict":"approved","summary":"...","findings":[]}`，並可選填 `evidence_refs`（只接受 `{"kind":"operator-reproduction","ref":"<absolute path>","sha256":"<64 hex>"}` 陣列）。path/hash 仍由 Manager 生成，caller 不得注入。若 work item 尚無 mapped PR，Manager 會在 `verified_head == candidate_head` 時先建立 `pr_number: null` 的 immutable maintainer evidence；後續 ship 建 PR 時再把它綁進 delivery gate。若已有 PR，Manager 仍會重讀 authenticated PR HEAD 並將 evidence 綁定 repo/work/run/authority/PR/candidate/actor。 <!-- doc-drift-ignore -->
 
 同 HEAD 的 Copilot finding 已完成討論時，operator 可用 `cortex work review-disposition <work-id> --repo <owner/repo> --actor <operator> --reason <理由>` 提交續行裁決。Manager 只在 run／PR／latest Copilot review 仍綁同一 exact HEAD、fresh GitHub snapshot 的所有 review threads 均 resolved，且 thread snapshot 與裁決時一致時寫入 immutable evidence 並清除 needs-human facet；ship 保留原 finding/disposition 歷史。之後明示 `cortex work resume` 會再次執行既有 delivery gates。HEAD、review 或 thread snapshot 改變、仍有未 resolved thread，或沒有 operator disposition 時都會繼續阻擋；單獨 resolve thread 不授權 merge。
 
@@ -1476,7 +1476,7 @@ cortex work resume "$WORK_ID" --repo "$REPO"
 ## Skill usage ledger 與 park janitor（#204）
 
 append-only skill 執行事件記錄、cold-skill 偵測與 proposal-first park／restore，落於
-`~/.agents/registry/`（`skill_usage.jsonl` / `skill_park.json` / `skill_park_proposals/`，
+`~/.agents/registry/`（`skill_usage.jsonl` / `skill_park.json` / `skill_park_proposals/`， <!-- doc-drift-ignore -->
 `PSC_AGENTS_ROOT` 可整族覆寫）。treated 為 `paulsha_cortex.coordinator.skill_ledger` /
 `skill_janitor` 兩個模組；`manager.run_tick` 提供 `ledger_recorder` / `skill_janitor`
 注入點（與既有 `reaper` 同款「預設不啟用、例外不破壞 tick」模式），production 排程是否
@@ -1504,7 +1504,7 @@ cortex skill park <skill_id> --reason "..." --approved-by "$ACTOR"
 cortex skill restore <skill_id> --approved-by "$ACTOR"
 ```
 
-- `class: core` / `class: emergency`（`deck/schema.py` 的 `Card.card_class`）在
+- `class: core` / `class: emergency`（`paulsha_cortex/deck/schema.py` 的 `Card.card_class`）在
   cold 判定與所有 park 入口（janitor proposal、`approve-proposal`、手動 `park`）
   都強制豁免，不可被 park。
 - cold 判定閾值（最低樣本數 / 觀測窗天數）為初始預設值，未經人類最終核可；
@@ -1516,8 +1516,8 @@ cortex skill restore <skill_id> --approved-by "$ACTOR"
 
 ## Monitor registry merge
 
-- manual config：`~/.agents/config/paulsha/project-cortex.yaml`
-- shared hippo registry：`~/.agents/config/paulsha/project-hippo.yaml`
+- manual config：`~/.agents/config/paulsha/project-cortex.yaml` <!-- doc-drift-ignore -->
+- shared hippo registry：`~/.agents/config/paulsha/project-hippo.yaml` <!-- doc-drift-ignore -->
 - merge 規則：兩份 registry 以 realpath 去重，**manual entry 優先**保留 metadata；兩者皆缺時 `cortex monitor` 會直接報錯。
 
 ## Path 契約
@@ -1539,7 +1539,7 @@ cortex skill restore <skill_id> --approved-by "$ACTOR"
 
 Multi-issue workflow build 階段將以 `issue` 清單中最小號碼作為主 branch，並始終以 run repository 作為 `ScriptWorktreeCreator` 的 git來源，以確保 builder worktree 在對應 repo 池內建立。
 
-同一個 shared `coordinator root` 內，`jobs.json` 的 durable identity 取 **canonical state path**：resolve parent directory（non-strict）後再接回原始檔名，因此 symlink-directory spellings 共用同一把 transaction lock；state file 本身若是 symlink，則保留該檔名自己的 replace / sidecar 語意，不會跟著 target path 重新命名。
+同一個 shared `coordinator root` 內，`jobs.json` 的 durable identity 取 **canonical state path**：resolve parent directory（non-strict）後再接回原始檔名，因此 symlink-directory spellings 共用同一把 transaction lock；state file 本身若是 symlink，則保留該檔名自己的 replace / sidecar 語意，不會跟著 target path 重新命名。 <!-- doc-drift-ignore -->
 
 **repo root 是 fail-closed 的（issue #612）**：`paths.repo_root()` 舊實作在 `PSC_REPO_ROOT` 未宣告時退回 `Path.cwd()`，而 manager daemon 的 `WorkingDirectory` 正是 operator 的真實 checkout——於是任何解析不出目標 repo 的呼叫都不是失敗，而是**靜默落在錯的樹上**（實測形態：相對 spec 路徑使 `complete_tick` 對真實 repo 跑 `git fetch --no-tags origin main`；同一族還有 `worktree_reclaim` 的 `git worktree remove --force`／`prune` 這類寫入動作）。現行契約：
 
@@ -1547,7 +1547,7 @@ Multi-issue workflow build 階段將以 `issue` 清單中最小號碼作為主 b
 - spec 路徑必須是**絕對路徑**才能推導 repo root（`autonomy._infer_repo_root`）；相對路徑與「向上找不到 git repo 根又未宣告 `PSC_REPO_ROOT`」皆 fail-closed 並帶 `DiagnosticReason`（`spec-path-not-absolute`／`repo-root-unresolved`）。`cortex install service` 會把 `PSC_REPO_ROOT` 寫進 unit 的 `EnvironmentFile`，正常部署不受影響。
 - **解析時機是 lazy 的（issue #633）**：`coordinator.seams.ScriptWorktreeCreator` 不在 `__init__` 解析 repo／worktree pool，改由第一次真正要用時解析並 memoize。理由是 `manager_daemon.run_loop → ensure_dispatcher()` 會在**建 dispatcher 當下**實體化它，舊實作因此讓「EnvironmentFile 少一個變數」變成 **Manager 啟動即崩 ＋ `Restart=on-failure` crash-loop**，而不是「派不了工」。**fail-closed 的性質未放寬，只改時機**：第一次 `create()` 仍原樣拋 `RepoRootUnresolvedError`，訊息逐字不變，且拒絕發生在任何磁碟動作之前。副作用是 `systemctl is-active` 全綠**不代表**派得了工——部署驗收要另外確認 `paths.repo_root()` 解析得出目標樹（runbook 第 7b 的 F2b）。
 
-`cortex install service` 會把 `PSC_CONTROL_ROOT` 寫成 `<agents_root>/control/<instance>`（比照 `PSC_RUN_ROOT` 的 `run/<instance>` 模式），讓 `manager.lock` 天生 per-instance；`service-manager.sh` 透過 `cortex control lock-path`（與 daemon 同一套 `config/runtime.py` 解析鏈）取得 lock 路徑，不再自行硬寫預設值（issue #375）。`PSC_PROJECT_CONFIG_ROOT` 與 `PSC_CONTROL_ROOT` 皆屬 installer 的 managed path：每次 `cortex install service` 都會依目前 `PSC_AGENTS_ROOT`／instance 重新推導並覆寫，不會被既有值鎖住（issue #371）；`cortex doctor` 的 `managed-path-drift` probe 可在尚未重跑 install 前就偵測到殘留的舊值。`PSC_MANAGER_SPECS_DIR`／`PSC_COORDINATOR_ROOT`／`PSC_SPECS_ROOT` 目前仍未 instance 化、也不在 installer 的 managed_env 之列（evaluate 後決定留待後續 follow-up；多 instance 共用同一 `PSC_AGENTS_ROOT` 時這三者會共用同一份 specs/coordinator 狀態）。
+`cortex install service` 會把 `PSC_CONTROL_ROOT` 寫成 `<agents_root>/control/<instance>`（比照 `PSC_RUN_ROOT` 的 `run/<instance>` 模式），讓 `manager.lock` 天生 per-instance；`paulsha_cortex/scripts/service-manager.sh` 透過 `cortex control lock-path`（與 daemon 同一套 `paulsha_cortex/config/runtime.py` 解析鏈）取得 lock 路徑，不再自行硬寫預設值（issue #375）。`PSC_PROJECT_CONFIG_ROOT` 與 `PSC_CONTROL_ROOT` 皆屬 installer 的 managed path：每次 `cortex install service` 都會依目前 `PSC_AGENTS_ROOT`／instance 重新推導並覆寫，不會被既有值鎖住（issue #371）；`cortex doctor` 的 `managed-path-drift` probe 可在尚未重跑 install 前就偵測到殘留的舊值。`PSC_MANAGER_SPECS_DIR`／`PSC_COORDINATOR_ROOT`／`PSC_SPECS_ROOT` 目前仍未 instance 化、也不在 installer 的 managed_env 之列（evaluate 後決定留待後續 follow-up；多 instance 共用同一 `PSC_AGENTS_ROOT` 時這三者會共用同一份 specs/coordinator 狀態）。
 
 `PSC_PREFLIGHT_CMD` 必須為 typed argv，不可使用 shell wrapper。delivery preflight 常見設定範例：
 
@@ -1565,17 +1565,17 @@ export PSC_DIGEST_DELIVERY_CMD='/path/to/relay-script --channel ops'
 
 `cortex digest emit` 會把 digest JSON 從 stdin pipe 給該命令；命令需自行解析 stdin 並負責實際投遞（例如轉發到 Slack/Telegram webhook），cortex 本身不內建任何外部通知整合。
 
-共同前綴 `PSC_AGENTS_ROOT` 可一次覆寫 mutable/runtime roots。systemd unit 依宣告順序讀取 `~/.agents/core/runtime/<instance>.env` 與固定 bootstrap `~/.agents/core/runtime/<instance>-manager.env`；installer在後者持久化`PSC_INSTANCE`與`PSC_AGENTS_ROOT`。Interactive CLI以同一`PSC_INSTANCE`選取bootstrap env，不掃描猜測其他instance；symlink、malformed或relative root會fail-closed。installer重跑時，PY／PSC_REPO_ROOT會與env中`PSC_REPO_IDENTITY`身分戳記（由git remote origin正規化而來，SSH/HTTPS視為同一身分；非git/無origin則退回路徑指紋）比對；同身分、或戳記缺席（首次安裝／既有舊env遷移）才會更新並保留既有operator roots，跨身分變更須帶`--rebind`明確放行，否則fail-closed並於錯誤訊息附上env檔實際路徑（`cortex doctor`可在潛伏期內偵測此類漂移）。Monitor socket預設為`$PSC_RUN_ROOT/project-monitor.sock`，也可由`project-cortex.yaml`的`monitor.socket_path`覆寫；production `MonitorSocketClient`與service使用相同config解析。
+共同前綴 `PSC_AGENTS_ROOT` 可一次覆寫 mutable/runtime roots。systemd unit 依宣告順序讀取 `~/.agents/core/runtime/<instance>.env` 與固定 bootstrap `~/.agents/core/runtime/<instance>-manager.env`；installer在後者持久化`PSC_INSTANCE`與`PSC_AGENTS_ROOT`。Interactive CLI以同一`PSC_INSTANCE`選取bootstrap env，不掃描猜測其他instance；symlink、malformed或relative root會fail-closed。installer重跑時，PY／PSC_REPO_ROOT會與env中`PSC_REPO_IDENTITY`身分戳記（由git remote origin正規化而來，SSH/HTTPS視為同一身分；非git/無origin則退回路徑指紋）比對；同身分、或戳記缺席（首次安裝／既有舊env遷移）才會更新並保留既有operator roots，跨身分變更須帶`--rebind`明確放行，否則fail-closed並於錯誤訊息附上env檔實際路徑（`cortex doctor`可在潛伏期內偵測此類漂移）。Monitor socket預設為`$PSC_RUN_ROOT/project-monitor.sock`，也可由`project-cortex.yaml`的`monitor.socket_path`覆寫；production `MonitorSocketClient`與service使用相同config解析。 <!-- doc-drift-ignore -->
 
 ## 誠實狀態表
 
 | 面向 | 現況 |
 | --- | --- |
-| persona enforcement | standalone PR workflow（`persona-scope.yml`）由 `personas.yaml` 的 `enforcement` 驅動，現為 `enforce`（#135；切換前以 `python -m paulsha_cortex.persona.replay` 回放近期已合併 PR 驗證零誤殺，見 `docs/persona-scope-enforcement.md`）；coordinator verification 的 `persona-scope` 為 fail-closed gate |
+| persona enforcement | standalone PR workflow（`.github/workflows/persona-scope.yml`）由 `paulsha_cortex/persona/personas.yaml` 的 `enforcement` 驅動，現為 `enforce`（#135；切換前以 `python -m paulsha_cortex.persona.replay` 回放近期已合併 PR 驗證零誤殺，見 `docs/persona-scope-enforcement.md`）；coordinator verification 的 `persona-scope` 為 fail-closed gate |
 | manager service install | `cortex install service` 會 render / copy / enable，但不會 start；systemd 不可用時只落檔 |
 | coordinator runtime | `jobs` / `stat` / `ready` / `status` 為讀取路徑；`fanout` / `complete` / `tick` / `slice-action` / `work` 走 control queue；舊低階 `dispatch` 已停用 |
 | deck 驗證 | compile 只產生 `dispatch: hold` 骨架；verify 只檢查 `produces` glob 存在性，不驗內容 |
-| monitor registry | `project-cortex.yaml` ⊍ `project-hippo.yaml`，realpath 去重且 manual 優先 |
+| monitor registry | `project-cortex.yaml` ⊍ `project-hippo.yaml`，realpath 去重且 manual 優先 <!-- doc-drift-ignore --> |
 | skill 治理（#204） | ledger／park state／janitor proposal 已落地，`cortex skill` 可操作；`manager.run_tick` 的 `ledger_recorder`／`skill_janitor` 是可注入 hook，預設不啟用（比照既有 `reaper` 慣例）；park 狀態尚未接上任何選牌/router 消費點 |
 | 依賴模型 | 僅 `PyYAML`；runtime 不依賴 `paulsha-hippo` |
 
