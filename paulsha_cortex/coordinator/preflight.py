@@ -410,6 +410,14 @@ def _read_clean_identity(*, root: Path, runner: Runner) -> tuple[str, str]:
     return head, tree_hash
 
 
+def current_clean_identity(
+    *, repo_root: str | Path, runner: Runner = subprocess.run
+) -> tuple[str, str]:
+    """Return the committed clean checkout identity used by preflight."""
+
+    return _read_clean_identity(root=Path(repo_root).resolve(), runner=runner)
+
+
 def run_preflight(
     *,
     repo_root: str | Path,

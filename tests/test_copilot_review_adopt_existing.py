@@ -304,6 +304,7 @@ def _invoke_ship(
         now=lambda: now,
         state_path=state,
         workflow_registry=registry,
+        snapshot_path=tmp_path / "snapshot.json",
     )
 
 
