@@ -19168,7 +19168,7 @@ def resume_workflow_run(
             result["stage_reuse"] = {"card": step.card, **adopted_receipt}
     if "needs_human" in updated.facets:
         return result
-    next_job = dispatch_or_stop(updated)
+    next_job = dispatch_or_stop(updated, retry=retry_failed)
     classified = classify_dispatch_result(
         next_job,
         registry=registry,

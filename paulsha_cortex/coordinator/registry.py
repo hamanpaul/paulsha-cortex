@@ -6590,6 +6590,7 @@ class JobRegistry:
                 ):
                     continue
                 job["status"] = "failed"
+                job["workflow_evidence"] = None
         steps = tuple(
             replace(step, gate_result="pending") if step.phase == "review" else step
             for step in current.steps

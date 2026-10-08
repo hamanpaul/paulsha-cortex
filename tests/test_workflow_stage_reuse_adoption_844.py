@@ -974,6 +974,195 @@ class TestS05RejectedSources:
         assert harness.receipt("code-review")["job_id"] == review_job
         assert harness.jobs("adversarial-review") == []
 
+    def test_retry_review_replaces_stale_evidence_for_every_review_card(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        harness = Harness(
+            tmp_path,
+            monkeypatch,
+            planning_authority=_planning_authority(),
+        )
+        harness.adopt_verification()
+        code_review_job = harness.jobs("code-review")[-1]["job_id"]
+        harness.finish(code_review_job)
+        adversarial_dispatch = harness.resume()
+        adversarial_job = adversarial_dispatch["job_id"]
+        assert harness.registry.get_job(adversarial_job)["workflow_card"] == "adversarial-review"
+        harness.finish(adversarial_job, findings=[BLOCKING_FINDING])
+        blocked = harness.resume()
+        assert blocked["reason"] == "blocking-findings"
+
+        code_evidence = harness.registry.get_job(code_review_job)["workflow_evidence"]
+        adversarial_evidence = harness.registry.get_job(adversarial_job)["workflow_evidence"]
+        assert code_evidence is not None
+        assert adversarial_evidence is not None
+        code_evidence_path = harness.root / code_evidence["path"]
+        code_evidence_bytes = code_evidence_path.read_bytes()
+        adversarial_evidence_path = harness.root / adversarial_evidence["path"]
+        adversarial_evidence_bytes = adversarial_evidence_path.read_bytes()
+
+        snapshot = tmp_path / "retry-review-snapshot.json"
+        snapshot.write_text(
+            json.dumps(
+                {
+                    "schema": "work-items-snapshot/v1",
+                    "providers": {
+                        "github": {
+                            "provider_id": "github",
+                            "revision": "gh-1",
+                            "last_success_epoch": 100,
+                            "degraded": False,
+                        }
+                    },
+                    "work_items": [
+                        {
+                            "repo": base.REPO,
+                            "work_id": WORK_ID,
+                            "mapped_issues": [844],
+                            "mapped_prs": [],
+                            "mapped_openspec": [WORK_ID],
+                            "mapped_todo_paths": [],
+                            "confirmed_todo": True,
+                            "auto_label": True,
+                            "source_revisions": [
+                                "issue:844@open",
+                                f"openspec:{WORK_ID}@1",
+                            ],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        retried = work_actions.execute_work_action(
+            args={
+                "action": "retry-review",
+                "repo": base.REPO,
+                "work_id": WORK_ID,
+                "issue": 844,
+                "actor": "operator",
+                "reason": "Replace every stale review attempt before resume.",
+                "expected_candidate": harness.candidate,
+            },
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=harness.root / "runs.json",
+            workflow_registry=harness.registry,
+        )
+
+        assert retried["result"]["action"] == "retry-review"
+        assert all(
+            step["gate_result"] == "pending"
+            for step in retried["result"]["run"]["steps"]
+            if step["phase"] == "review"
+        )
+        assert harness.registry.get_job(code_review_job)["status"] == "failed"
+        assert harness.registry.get_job(code_review_job)["workflow_evidence"] is None
+        assert harness.registry.get_job(adversarial_job)["status"] == "failed"
+        assert harness.registry.get_job(adversarial_job)["workflow_evidence"] is None
+        assert code_evidence_path.read_bytes() == code_evidence_bytes
+        assert adversarial_evidence_path.read_bytes() == adversarial_evidence_bytes
+        assert manager._workflow_review_evidence_state(
+            harness.registry.get_job(adversarial_job),
+            run=harness.run(),
+            coordinator_root=harness.root,
+        ) is None
+        assert harness.run().retry_classification == "review_handoff_failure"
+
+        resumed_code = harness.resume(operator_resume=True)
+        assert resumed_code["reason"] == "in-flight"
+        replacement_code = harness.registry.get_job(resumed_code["job_id"])
+        assert replacement_code["workflow_card"] == "code-review"
+        assert replacement_code["job_id"] != code_review_job
+        harness.finish(replacement_code["job_id"])
+
+        resumed = harness.resume(operator_resume=True)
+        assert isinstance(resumed.get("job_id"), str), resumed
+        replacement_adversarial = harness.registry.get_job(resumed["job_id"])
+        assert replacement_adversarial["workflow_card"] == "adversarial-review"
+        assert replacement_adversarial["job_id"] != adversarial_job, resumed
+
+        failed_adversarial_job_id = replacement_adversarial["job_id"]
+        harness.registry.update_headless_result(
+            failed_adversarial_job_id, status="failed", exit_code=1
+        )
+        failure = harness.resume()
+        assert failure["reason"] == "job-failed"
+        retry_card = work_actions.execute_work_action(
+            args={
+                "action": "retry-card",
+                "repo": base.REPO,
+                "work_id": WORK_ID,
+                "issue": 844,
+                "actor": "operator",
+                "expected_run_id": harness.run_id,
+                "card": "adversarial-review",
+            },
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=harness.root / "runs.json",
+            workflow_registry=harness.registry,
+        )
+        assert retry_card["result"]["action"] == "retry-card"
+
+        current = harness.run()
+        harness.registry._manager_update_workflow_run(
+            current.run_id,
+            facets=("needs_human",),
+            gate_status="failed",
+            needs_human_reason=fixture_needs_human_reason(),
+        )
+        superseded = work_actions.execute_work_action(
+            args={
+                "action": "supersede-attempt",
+                "repo": base.REPO,
+                "work_id": WORK_ID,
+                "issue": 844,
+                "actor": "operator",
+                "reason": "The failed replacement has no accepted evidence.",
+                "expected_run_id": harness.run_id,
+                "expected_candidate": harness.candidate,
+                "expected_era": harness.run().claim_key,
+                "expected_job_id": failed_adversarial_job_id,
+                "card": "adversarial-review",
+            },
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=harness.root / "runs.json",
+            workflow_registry=harness.registry,
+        )
+        assert superseded["result"]["reason"] == "attempt-superseded"
+
+        replacement_after_actions = harness.resume(operator_resume=True)
+        assert isinstance(replacement_after_actions.get("job_id"), str)
+        replacement_adversarial = harness.registry.get_job(
+            replacement_after_actions["job_id"]
+        )
+        assert replacement_adversarial["workflow_card"] == "adversarial-review"
+        assert replacement_adversarial["job_id"] != failed_adversarial_job_id
+
+        harness.finish(replacement_adversarial["job_id"])
+        current = harness.run()
+        harness.registry._manager_update_workflow_run(
+            current.run_id,
+            steps=tuple(
+                replace(step, gate_result="passed") if step.phase == "ship" else step
+                for step in current.steps
+            ),
+        )
+        completed = harness.resume(
+            operator_resume=True,
+            ship_validator=lambda *, run, candidate: {
+                "trusted": True,
+                "status": "passed",
+                "head": candidate,
+                "commit_id": candidate,
+                "ref": "evidence/test-ship-review.json",
+                "hash": "8" * 64,
+            },
+        )
+        assert harness.run().current_phase == "ship", completed
+
     def test_review_of_previous_candidate_is_not_reused(self, tmp_path, monkeypatch) -> None:
         harness = Harness(tmp_path, monkeypatch)
         harness.adopt_verification()
