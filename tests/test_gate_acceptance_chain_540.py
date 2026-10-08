@@ -24,6 +24,7 @@ terminal 採信卻連續撞上三個獨立缺陷，run 停在 needs_human，正�
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,7 @@ from paulsha_cortex import doctor
 from paulsha_cortex.control import contract as control_contract
 from paulsha_cortex.coordinator import gate_ledger, gate_runner, manager, work_actions
 from paulsha_cortex.coordinator import terminal_contract as tc
+from paulsha_cortex.coordinator.model_identities import IdentityRegistry
 from paulsha_cortex.coordinator.registry import JobRegistry
 from paulsha_cortex.coordinator.workflow import WorkflowStep
 
@@ -318,7 +320,7 @@ def test_red_required_card_prompt_states_the_inverted_semantics(tmp_path: Path) 
 HEAD = "b" * 40
 
 
-def _snapshot(path: Path) -> Path:
+def _snapshot(path: Path, *, pr_numbers: tuple[int, ...] = ()) -> Path:
     path.write_text(
         json.dumps(
             {
@@ -336,7 +338,7 @@ def _snapshot(path: Path) -> Path:
                         "repo": "acme/demo",
                         "work_id": "demo",
                         "mapped_issues": [12],
-                        "mapped_prs": [],
+                        "mapped_prs": list(pr_numbers),
                         "mapped_openspec": ["demo"],
                         "mapped_todo_paths": ["docs/todo.md"],
                         "confirmed_todo": True,
@@ -476,6 +478,152 @@ def test_regenerate_gates_rewrites_ledger_from_current_declaration(
     assert [row["name"] for row in payload["gates"]] == ["pytest"]
     assert payload["gates"][0]["exit_code"] == 1
     assert result["ledger_digest"] == tc.gate_ledger_digest(payload)
+
+
+def test_regenerate_gates_then_resume_accepts_existing_pr_build(
+    tmp_path: Path, monkeypatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    subprocess.run(["git", "init", "-q", str(workspace)], check=True)
+    subprocess.run(
+        ["git", "-C", str(workspace), "config", "user.email", "t@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(workspace), "config", "user.name", "T"], check=True
+    )
+    (workspace / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(workspace), "add", "candidate.txt"], check=True)
+    subprocess.run(["git", "-C", str(workspace), "commit", "-qm", "candidate"], check=True)
+    subprocess.run(["git", "-C", str(workspace), "branch", "feature/demo"], check=True)
+    candidate = subprocess.run(
+        ["git", "-C", str(workspace), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    snapshot = _snapshot(tmp_path / "snapshot.json", pr_numbers=(45,))
+    authority = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=snapshot
+    )
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    run = registry._manager_create_workflow_run(
+        work_id=authority.work_id,
+        repo=authority.repo,
+        claim_key=work_actions._expected_claim_key(authority),
+        source_revision=work_actions.work_authority_digest(authority),
+        workspace_root=str(workspace),
+        combo="feature-oneshot",
+        current_phase="build",
+        steps=(_step("build", "tdd-red", test_policy="focused"),),
+        issue_refs=tuple(f"{authority.repo}#{n}" for n in authority.mapped_issues),
+        pr_refs=tuple(f"{authority.repo}#{n}" for n in authority.mapped_prs),
+        openspec_refs=authority.mapped_openspec,
+        candidate_head=candidate,
+        facets=("needs_human",),
+        gate_status="failed",
+        needs_human_reason=fixture_needs_human_reason(),
+    )
+    log = tmp_path / "logs" / "workflow" / "tdd-red.jsonl"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text(
+        json.dumps(
+            {
+                "schema_version": tc.TERMINAL_SCHEMA_VERSION,
+                "kind": "workflow-card",
+                "status": "passed",
+                "run_id": run.run_id,
+                "card_id": "tdd-red",
+                "candidate": candidate,
+                "outputs": [],
+                "diagnostics": {},
+                "gate_evidence": [{"name": "pytest", "status": "passed"}],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    job = registry.create_job(
+        task="demo-tdd-red",
+        persona="builder",
+        branch="feature/demo",
+        pane="",
+        worktree=str(workspace),
+        executor="codex",
+        model_id="gpt-primary",
+        independence_domain="openai",
+        dispatch_head=candidate,
+        subject_head=candidate,
+        workflow_run_id=run.run_id,
+        workflow_claim_key=run.claim_key,
+        workflow_repo=run.repo,
+        workflow_card="tdd-red",
+        workflow_phase="build",
+        workflow_repo_root=str(workspace),
+        workflow_test_policy="focused",
+        source_revision=run.source_revision,
+    )
+    registry.attach_launch_handle(
+        job["job_id"],
+        executor="codex",
+        model_id="gpt-primary",
+        log_path=str(log),
+    )
+    registry.update_headless_result(job["job_id"], status="exited", exit_code=0)
+    ledger = tc.gate_ledger_path(log)
+    ledger.write_text(
+        json.dumps(
+            {
+                "schema_version": tc.GATE_LEDGER_SCHEMA_VERSION,
+                "kind": tc.GATE_LEDGER_KIND,
+                "slice_id": "",
+                "gates": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PSC_GATE_CMD_PYTEST", "python3 -c pass")
+
+    regenerated = _regenerate(
+        tmp_path, snapshot, registry, expected_run_id=run.run_id
+    )["result"]
+    assert regenerated["reason"] == "gate-ledger-regenerated"
+    assert json.loads(ledger.read_text(encoding="utf-8"))["gates"][0]["status"] == "passed"
+
+    class Dispatcher:
+        _registry = registry
+        _git_runner = None
+
+        def poll_headless_done(self, job_id: str) -> dict:
+            return registry.get_job(job_id)
+
+    identities = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "codex",
+                "model_id": "gpt-primary",
+                "independence_domain": "openai",
+                "capabilities": ["build"],
+            }
+        ]
+    )
+    resumed = manager.resume_workflow_run(
+        Dispatcher(),
+        run_id=run.run_id,
+        identities=identities,
+        launcher_factory=lambda _identity: None,
+        coordinator_root=tmp_path,
+        operator_resume=True,
+    )
+
+    accepted = registry.get_workflow_run(run.run_id)
+    assert accepted.current_phase == "verify"
+    assert accepted.candidate_head == candidate
+    assert accepted.steps[0].gate_result == "passed"
+    assert resumed["current_phase"] == "verify"
+    assert resumed["reason"] is None
 
 
 def test_regenerate_gates_does_not_change_the_verdict(tmp_path: Path, monkeypatch) -> None:

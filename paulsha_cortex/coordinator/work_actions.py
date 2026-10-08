@@ -1323,6 +1323,8 @@ def _load_work_run(
             "snapshot_hash": authority.snapshot_hash,
             "provider_revision": authority.github_provider_revision,
         }
+        if authority_matches_claim_era(authority, run):
+            provenance["claim_key"] = run.claim_key
         if any(active.get(field) != value for field, value in provenance.items()):
             active.update(provenance)
             _save_runs(state_path, state)
