@@ -1882,23 +1882,21 @@ def _builder_binding(
         or not isinstance(builder_job_id, str)
     ):
         raise RuntimeError("delivery foreign-review builder binding malformed")
+    from . import manager
+
     row = registry.get_job(builder_job_id)
-    normal_builder = (
-        row.get("workflow_phase") == "build"
-        and row.get("persona") == "builder"
-    )
-    manager_archive = (
-        row.get("workflow_phase") == "ship"
-        and row.get("workflow_card") == "openspec-archive"
-        and row.get("persona") == "manager"
-        and row.get("executor") == "cortex-manager"
+    candidate_source = manager._workflow_candidate_source_job(row)
+    manager_source = manager._workflow_manager_candidate_source_job(row)
+    manager_source_binding = not manager_source or (
+        row.get("executor") == "cortex-manager"
         and row.get("model_id") == "deterministic"
         and row.get("independence_domain") == "cortex"
         and isinstance(row.get("workflow_evidence"), dict)
     )
     if (
         row.get("workflow_run_id") != run.run_id
-        or not (normal_builder or manager_archive)
+        or not candidate_source
+        or not manager_source_binding
         or row.get("status") != "exited"
         or row.get("exit_code") != 0
         or row.get("subject_head") != review_candidate

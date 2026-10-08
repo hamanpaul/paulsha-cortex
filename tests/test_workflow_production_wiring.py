@@ -6714,13 +6714,16 @@ def test_review_terminal_rejects_non_builder_job_binding_before_publication(
     assert not (tmp_path / report_ref).exists()
 
 
-def test_review_binding_accepts_manager_archive_without_combo_ship_step() -> None:
-    """Post-archive review binds the canonical Manager ship evidence.
+@pytest.mark.parametrize("source_card", ["openspec-archive", "main-sync-autosync"])
+def test_review_binding_accepts_manager_candidate_source_without_combo_ship_step(
+    source_card: str,
+) -> None:
+    """Review binds canonical Manager ship evidence as the Candidate source.
 
     ``fix-standard`` has no ship cards in its workflow step list; the
-    production bridge records ``openspec-archive`` as a Manager-owned job and
-    advances the candidate before the review card is dispatched.  That job's
-    typed ship evidence is the binding authority for the review.
+    production bridge records archive and autosync as Manager-owned jobs and
+    advances the candidate before the review card is dispatched. Their typed
+    ship evidence is the binding authority for the review.
     """
 
     candidate = "a" * 40
@@ -6733,15 +6736,15 @@ def test_review_binding_accepts_manager_archive_without_combo_ship_step() -> Non
             "steps": (),
         },
     )()
-    archive_job = {
-        "job_id": "archive-job",
+    manager_job = {
+        "job_id": f"{source_card}-job",
         "workflow_run_id": run.run_id,
         "workflow_repo": run.repo,
         "subject_head": candidate,
         "status": "exited",
         "exit_code": 0,
         "workflow_phase": "ship",
-        "workflow_card": "openspec-archive",
+        "workflow_card": source_card,
         "persona": "manager",
         "workflow_evidence": {
             "kind": "ship",
@@ -6752,15 +6755,125 @@ def test_review_binding_accepts_manager_archive_without_combo_ship_step() -> Non
 
     class Registry:
         def get_job(self, job_id: str) -> dict:
-            assert job_id == archive_job["job_id"]
-            return dict(archive_job)
+            assert job_id == manager_job["job_id"]
+            return dict(manager_job)
 
-    bound, archive_author = manager._review_builder_job_binding(
-        Registry(), run=run, builder_job_id=archive_job["job_id"], candidate=candidate
+    bound, manager_author = manager._review_builder_job_binding(
+        Registry(), run=run, builder_job_id=manager_job["job_id"], candidate=candidate
     )
 
-    assert bound["job_id"] == archive_job["job_id"]
-    assert archive_author is True
+    assert bound["job_id"] == manager_job["job_id"]
+    assert manager_author is True
+
+
+def test_review_harvest_accepts_main_sync_autosync_candidate_source(tmp_path: Path) -> None:
+    candidate = "a" * 40
+    coordinator = tmp_path / "coordinator"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    registry = JobRegistry(state_path=coordinator / "jobs.json")
+    steps = tuple(
+        WorkflowStep.from_dict({
+            **step.to_dict(),
+            "gate_result": "passed"
+            if step.phase in {"claim", "define", "plan", "build", "verify"}
+            else "pending",
+        })
+        for step in _manifest().steps
+    )
+    run = registry._manager_create_workflow_run(
+        work_id="production-wiring",
+        repo="owner/repo",
+        claim_key="claim:v1:" + "1" * 64,
+        source_revision="2" * 64,
+        workspace_root=str(repo),
+        combo="feature-oneshot",
+        current_phase="review",
+        steps=steps,
+        issue_refs=(),
+        openspec_refs=(),
+        pr_refs=(),
+        attempts={"review": 1},
+        candidate_head=candidate,
+        verified_head=candidate,
+        gate_status="running",
+    )
+    source = registry.create_job(
+        task="autosync",
+        persona="manager",
+        kind="build",
+        branch="feature/production-wiring",
+        pane="",
+        worktree=str(repo),
+        executor="cortex-manager",
+        model_id="deterministic",
+        independence_domain="cortex",
+        subject_head=candidate,
+        workflow_run_id=run.run_id,
+        workflow_claim_key=run.claim_key,
+        workflow_repo=run.repo,
+        workflow_card="main-sync-autosync",
+        workflow_phase="ship",
+        workflow_repo_root=str(repo),
+        source_revision=run.source_revision,
+    )
+    registry.update_headless_result(source["job_id"], status="exited", exit_code=0)
+    registry.bind_workflow_evidence(
+        source["job_id"],
+        locator={"kind": "ship", "path": "evidence/autosync.json", "hash": "b" * 64},
+        subject_head=candidate,
+    )
+
+    report_ref = "reports/review/production-wiring.md"
+    log = tmp_path / "review.jsonl"
+    log.write_text(
+        json.dumps({
+            "schema_version": 1,
+            "kind": "workflow-review-result",
+            "reason": "accepted",
+            "findings": [],
+            "reports": [{"path": report_ref, "body": "# Review\n"}],
+        })
+        + "\n",
+        encoding="utf-8",
+    )
+    review_job = registry.create_job(
+        task="autosync-review",
+        persona="reviewer",
+        kind="review",
+        branch="feature/production-wiring",
+        pane="",
+        worktree=str(repo),
+        executor="claude",
+        model_id="reviewer",
+        independence_domain="anthropic",
+        subject_head=candidate,
+        workflow_run_id=run.run_id,
+        workflow_claim_key=run.claim_key,
+        workflow_repo=run.repo,
+        workflow_card="code-review",
+        workflow_phase="review",
+        workflow_repo_root=str(repo),
+        workflow_outputs=(report_ref,),
+        workflow_output_baseline=(),
+        workflow_builder_job_id=source["job_id"],
+        source_revision=run.source_revision,
+    )
+    registry.attach_launch_handle(
+        review_job["job_id"], executor="claude", model_id="reviewer", log_path=str(log)
+    )
+    _gate_ledger_passed(log)
+    registry.update_headless_result(review_job["job_id"], status="exited", exit_code=0)
+    assert registry.get_job(review_job["job_id"])["executor"] == "claude"
+
+    harvested = manager.terminalize_workflow_job(
+        registry,
+        job_id=review_job["job_id"],
+        coordinator_root=coordinator,
+    )
+
+    assert harvested["workflow_evidence"]["kind"] == "review"
+    assert registry.get_job(review_job["job_id"])["workflow_evidence"]["kind"] == "review"
 
 
 def test_planning_replacement_requires_persisted_authority_not_caller_hash(
