@@ -173,6 +173,8 @@ def _write_snapshot(
     openspec_status: str = "active",
     prs: tuple[int, ...] = (),
     pr_status: str = "open",
+    issue_status: str = "open",
+    todo_path: str = TODO_REF,
     todo_revision: str = "todo-blob:unchecked",
     extra_sources: tuple[dict[str, str], ...] = (),
     provider_revision: str = "github-snapshot:1",
@@ -184,9 +186,11 @@ def _write_snapshot(
             f"{REPO}#{ISSUE}",
             f"github:issue:{ISSUE}",
             f"github:{REPO}",
-            "open",
+            issue_status,
         ),
-        _source(f"todo:{REPO}:{TODO_REF}", "todo", TODO_REF, todo_revision, f"repo:{REPO}"),
+        _source(
+            f"todo:{REPO}:{todo_path}", "todo", todo_path, todo_revision, f"repo:{REPO}"
+        ),
         _source(
             f"openspec:{REPO}:{CHANGE}",
             "openspec",
@@ -278,6 +282,9 @@ class _Fixture:
         run_pr_number: int = PR,
         current_prs: tuple[int, ...] | None = None,
         current_pr_status: str = "open",
+        issue_status: str = "open",
+        current_todo_path: str = TODO_REF,
+        journal_binding: bool = True,
         current_openspec_status: str = "archived",
         extra_sources: tuple[dict[str, str], ...] = (),
         needs_human_reason: str | None = None,
@@ -410,14 +417,17 @@ class _Fixture:
                 "change": CHANGE,
                 "todo_paths": [TODO_REF],
             }
-            row["ship"] = {
-                "phase": "needs-fix",
-                "head": self.candidate,
-                "review_id": 1,
-                "finding_count": 1,
-                "findings": [{"path": "src/feature.py", "line": 1, "body": FINDING}],
-                "fix_rounds": 0,
-            }
+            if not journal_binding:
+                row.pop("delivery_binding")
+            else:
+                row["ship"] = {
+                    "phase": "needs-fix",
+                    "head": self.candidate,
+                    "review_id": 1,
+                    "finding_count": 1,
+                    "findings": [{"path": "src/feature.py", "line": 1, "body": FINDING}],
+                    "fix_rounds": 0,
+                }
             key = self.run.run_id
             if journal_owner == "other":
                 key = "workflow-" + "9" * 20
@@ -432,6 +442,8 @@ class _Fixture:
             openspec_status=current_openspec_status,
             prs=current_prs,
             pr_status=current_pr_status,
+            issue_status=issue_status,
+            todo_path=current_todo_path,
             todo_revision="todo-blob:checked",
             extra_sources=extra_sources,
             provider_revision="github-snapshot:2",
@@ -583,6 +595,100 @@ def test_retry_build_after_archive_and_open_pr_dispatches_builder(
     assert body["pr_refs"] == [f"{REPO}#{PR}"]
 
 
+def test_retry_build_after_autosync_push_without_legacy_binding_dispatches_builder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Production Manager push journal plus run PR ref survives an autosync Candidate."""
+
+    fixture = _Fixture(tmp_path, monkeypatch, journal_binding=False)
+    before_candidate = fixture.candidate
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "--bare", "-q", str(origin)], check=True)
+    _git(fixture.repo_root, "remote", "add", "origin", str(origin))
+    _git(fixture.repo_root, "push", "-q", "origin", BRANCH)
+
+    _git(fixture.repo_root, "branch", "main", fixture.heads["base"])
+    _git(fixture.repo_root, "checkout", "-q", "main")
+    _write(fixture.repo_root, "main.txt", "main update\n")
+    main_head = _commit(fixture.repo_root, "main update")
+    _git(fixture.repo_root, "checkout", "-q", BRANCH)
+    _git(fixture.repo_root, "merge", "--no-ff", "-m", "Manager autosync", "main")
+    autosync_candidate = _git(fixture.repo_root, "rev-parse", "HEAD").lower()
+
+    before_sync = fixture.registry.get_workflow_run(fixture.run.run_id)
+    work_bridge._record_manager_ship_job(
+        registry=fixture.registry,
+        state_root=fixture.coordinator,
+        run=before_sync,
+        worktree=fixture.repo_root,
+        branch=BRANCH,
+        card="main-sync-autosync",
+        old_head=fixture.candidate,
+        new_head=autosync_candidate,
+    )
+    synced = fixture.registry._manager_reset_workflow_for_main_sync(
+        before_sync.run_id,
+        expected_candidate=fixture.candidate,
+        expected_updated_at=before_sync.updated_at,
+        candidate_head=autosync_candidate,
+        steps=before_sync.steps,
+        gate_refs=before_sync.gate_refs,
+        evidence_refs=("evidence/main-sync-autosync/merged.json",),
+    )
+    subprocess.run(
+        ["git", "-C", str(fixture.repo_root), "push", "-q", "origin", f"HEAD:refs/heads/{BRANCH}"],
+        check=True,
+    )
+    state = work_actions._load_runs(fixture.journal)
+    row = state["runs"][synced.run_id]
+    row["pushes"][autosync_candidate] = {
+        "branch": BRANCH,
+        "ref": f"refs/heads/{BRANCH}",
+        "head": autosync_candidate,
+    }
+    work_actions._save_runs(fixture.journal, state)
+    reverified = fixture.registry._manager_update_workflow_run(
+        synced.run_id,
+        current_phase="review",
+        verified_head=autosync_candidate,
+        steps=tuple(
+            replace(step, gate_result="passed")
+            if step.phase in {"verify", "review"}
+            else step
+            for step in synced.steps
+        ),
+        gate_refs=(
+            GateEvidenceRef("foreign-review", "reports/review/accepted.md", "f" * 64),
+        ),
+        facets=("needs_human",),
+        gate_status="running",
+        needs_human_reason=fixture_needs_human_reason(
+            "review-terminal-explicit-stop", candidate=autosync_candidate
+        ),
+    )
+    fixture.candidate = autosync_candidate
+
+    journal_row = work_actions._load_runs(fixture.journal)["runs"][reverified.run_id]
+    assert journal_row.get("delivery_binding") is None
+    assert journal_row["run_id"] == reverified.run_id
+    assert journal_row["claim_key"] == reverified.claim_key
+    assert reverified.pr_refs == (f"{REPO}#{PR}",)
+    assert autosync_candidate in journal_row["pushes"]
+    parents = _git(
+        fixture.repo_root, "rev-list", "--parents", "-n", "1", autosync_candidate
+    ).split()
+    assert parents == [autosync_candidate, before_candidate, main_head]
+    assert _git(origin, "rev-parse", f"refs/heads/{BRANCH}") == autosync_candidate
+
+    result = fixture.executor()(fixture.retry_build_request())
+
+    assert result["result"]["dispatch"]["kind"] == "job"
+    job = fixture.registry.get_job(result["result"]["job_id"])
+    assert job["workflow_run_id"] == reverified.run_id
+    assert job["dispatch_head"] == autosync_candidate
+    assert fixture.launch_calls == ["codex/gpt-primary"]
+
+
 def test_retry_build_after_archive_without_pr_dispatches_builder(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -639,6 +745,8 @@ def test_projection_lists_retry_build_only_when_builder_would_dispatch(
         {"current_prs": (PR, PR + 1)},  # authority 的 PR 不唯一
         {"current_pr_status": "closed"},  # PR 不是 open
         {"run_pr_number": PR + 1},  # run 綁的 PR 與 authority 不同（非 exact）
+        {"issue_status": "closed"},  # 已關閉 issue 不因 Manager 的 push 證據獲准
+        {"current_todo_path": "docs/superpowers/workstreams/other/todo.md"},  # Todo 換綁
         # 外部新增 link
         {
             "extra_sources": (
@@ -675,6 +783,8 @@ def test_projection_lists_retry_build_only_when_builder_would_dispatch(
         "pr-not-unique",
         "pr-not-open",
         "pr-not-exact",
+        "issue-closed",
+        "todo-rebound",
         "external-plan-link",
         "external-openspec-link",
     ],
@@ -682,7 +792,9 @@ def test_projection_lists_retry_build_only_when_builder_would_dispatch(
 def test_retry_build_rejects_unproven_drift_before_reset(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: dict
 ) -> None:
-    fixture = _Fixture(tmp_path, monkeypatch, **case)
+    # Exercise the workflow PR evidence fallback that omits the legacy work-action
+    # delivery_binding field; every changed target must still fail closed.
+    fixture = _Fixture(tmp_path, monkeypatch, journal_binding=False, **case)
 
     _assert_rejected_before_reset(
         fixture,

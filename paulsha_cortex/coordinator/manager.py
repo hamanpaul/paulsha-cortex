@@ -4347,12 +4347,35 @@ def _delivery_journal_pushed_pr_number(
         for field in ("run_id", "repo", "work_id", "claim_key")
     ):
         return None
-    binding = row.get("delivery_binding")
-    if not isinstance(binding, dict) or set(binding) != {"pr_number", "change", "todo_paths"}:
-        return None
-    pr_number = binding.get("pr_number")
-    if not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number <= 0:
-        return None
+    if "delivery_binding" in row:
+        binding = row.get("delivery_binding")
+        if (
+            not isinstance(binding, dict)
+            or set(binding) != {"pr_number", "change", "todo_paths"}
+        ):
+            return None
+        pr_number = binding.get("pr_number")
+        if not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number <= 0:
+            return None
+    else:
+        # Workflow ship pushes are recorded by ``_push_exact_candidate`` and the
+        # Manager binds the created PR to ``run.pr_refs``. That path does not write
+        # the legacy work-action ``delivery_binding`` row. Use the run's single PR
+        # ref only when the journal row itself is exact and has no malformed binding;
+        # caller-side authority matching still requires that same PR to remain open.
+        run_refs = tuple(getattr(run, "pr_refs", ()) or ())
+        if (
+            len(run_refs) != 1
+            or not isinstance(getattr(run, "repo", None), str)
+            or not isinstance(run_refs[0], str)
+        ):
+            return None
+        match = re.fullmatch(
+            rf"{re.escape(run.repo)}#([1-9][0-9]*)", run_refs[0]
+        )
+        if match is None:
+            return None
+        pr_number = int(match.group(1))
     pushes = row.get("pushes")
     if not isinstance(pushes, dict) or not pushes:
         return None
