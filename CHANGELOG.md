@@ -9,6 +9,12 @@
 
 ### Fixed
 
+- **#1360 authority-restart 後恢復既有 PR run**：claim era 經 WorkAuthority 驗證後，resume 同步 delivery journal active row 的 `claim_key`；retry-review 後的 explicit resume 也會派出替代 review job，交付目標變更仍 fail closed（見 `changelog.d/pr-authority-rebind-v2.md`）。
+- **cortex 進件：#1360 PR 已存在的 run 的 resume（#1339 重做）**：登記 work item `pr-authority-rebind-v2` 與 accepted todo（見 `changelog.d/cortex-intake-1360.md`）。
+- **#1356 autosync 後以新 Candidate 重跑 review**：自動同步會同時重開 verify 與 code-review、清除舊 foreign-review，再以新 Candidate 進入 ship probe；Candidate 來源分類改用 #1345 共用 helper，保留 exact-run／Candidate／成功狀態與 evidence 驗證（見 `changelog.d/autosync-carry-forward-review.md`）。
+- **cortex 進件：#1345 自動同步後 review 收割與 repair build 不認 autosync job**：登記 work item `autosync-source-job-unify` 與 accepted todo（見 `changelog.d/cortex-intake-1345.md`）。
+- **#1345 自動同步 candidate source 統一**：成功的 `main-sync-autosync` Manager ship job 與 `openspec-archive` 同為 review binding、verification context 及 retry-build branch/base 的合法來源；保留 exact run/repo/Candidate、成功狀態與 typed ship evidence 檢查（見 `changelog.d/autosync-source-job-unify.md`）。
+- **cortex 進件：#1339、#1340、#1342**：PR 變動後 resume 失效、依賴牆鐘的測試、Copilot 修正輪數把同步 main 算進去；登記三個 work item 與 accepted todo（見 `changelog.d/cortex-intake-batch-20261007.md`）。
 - **#1336 clean-behind 自動同步後派出 verification**：成功的 `main-sync-autosync` Manager job 可作為 exact Candidate 的 reviewer 來源，verify tick 會沿用其 branch 並把新 Candidate 當作後續 build base；同步前 build ledger 綁定舊 Candidate，不會傳給 verifier，verification 對合併後 Candidate 自行執行檢查（見 `changelog.d/main-sync-reverify-builder-context.md`）。
 - **#1334 clean-behind 自動同步的 Git 身分**：merge 以 `-c user.name`／`-c user.email` 明確帶入設定的 `PSC_MAIN_SYNC_GIT_IDENTITY`（`Name <email>`）或來源 checkout 的有效身分；ship clone 複製來源 checkout 實際生效的身分；上限只計成功建立新 Candidate 的同步。
 - **cortex 進件：#1336 自動同步後 verification 找不到來源 job、#1338 被終止的 repair build 無法恢復**：登記 work item `main-sync-reverify-builder-context`、`retry-build-killed-repair` 與 accepted todo，交給 cortex 派工（見 `changelog.d/cortex-intake-1336.md`）。
