@@ -134,6 +134,81 @@ def _authority(tmp_path: Path, *, source_revisions: list[str] | None = None):
     ), snapshot
 
 
+def _canonical_snapshot(
+    path: Path,
+    *,
+    issue_status: str = "open",
+    pr_numbers: tuple[int, ...] = (),
+    changes: tuple[str, ...] = ("demo",),
+    openspec_status: str = "active",
+    provider_revision: str = "gh-1",
+) -> Path:
+    sources = [
+        {
+            "source_id": "github_issue:acme/demo#12",
+            "kind": "github_issue",
+            "ref": "acme/demo#12",
+            "revision": "updated:2026-10-08T00:00:00Z",
+            "status": issue_status,
+            "confidence": "confirmed",
+            "provider": "github:acme/demo",
+        },
+        *(
+            {
+                "source_id": f"github_pr:acme/demo#{number}",
+                "kind": "github_pr",
+                "ref": f"acme/demo#{number}",
+                "revision": "updated:2026-10-08T00:00:00Z",
+                "status": "open",
+                "confidence": "confirmed",
+                "provider": "github:acme/demo",
+            }
+            for number in pr_numbers
+        ),
+        *(
+            {
+                "source_id": f"openspec:acme/demo:{change}",
+                "kind": "openspec",
+                "ref": change,
+                "revision": "sha256:" + "a" * 64,
+                "status": openspec_status,
+                "confidence": "confirmed",
+                "provider": "repo:acme/demo",
+            }
+            for change in changes
+        ),
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema": "work-items-snapshot/v1",
+                "providers": {
+                    "github:acme/demo": {
+                        "provider_id": "github:acme/demo",
+                        "status": "ok",
+                        "last_attempt_at": "2026-10-08T00:00:00Z",
+                        "last_success_at": "2026-10-08T00:00:00Z",
+                        "revision": provider_revision,
+                        "diagnostics": [],
+                        "sources": [],
+                        "observations": {},
+                    }
+                },
+                "work_items": [
+                    {
+                        "repo": "acme/demo",
+                        "work_id": "demo",
+                        "sources": sources,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 def _make_run(
     registry: JobRegistry,
     *,
@@ -817,6 +892,163 @@ def test_repeated_automatic_scan_on_unchanged_authority_does_not_retrigger_resta
         assert "needs_human" in current.facets
         assert current.attempts.get("verify", 0) == attempts_after_tick1
         assert current.claim_key == work_actions._expected_claim_key(new_authority)
+
+
+def test_authority_restart_rebinds_active_delivery_row_before_review_disposition(
+    tmp_path: Path,
+) -> None:
+    old_snapshot = _canonical_snapshot(tmp_path / "snapshot.json")
+    old_authority = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=old_snapshot
+    )
+    assert old_authority.source_revisions == (
+        "github_issue:acme/demo#12@identity:acme/demo#12;state:open",
+        "openspec:acme/demo:demo@identity:demo;state:active",
+    )
+
+    state_path = tmp_path / "delivery-journal.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    run = _make_run(
+        registry,
+        authority=old_authority,
+        claim_key=work_actions._expected_claim_key(old_authority),
+        current_phase="review",
+        steps=_base_steps(verify_result="passed", review_result="passed"),
+        candidate_head=HEAD,
+        verified_head=HEAD,
+    )
+    _state, old_row, _run = work_actions._load_work_run(
+        state_path=state_path,
+        workflow_registry=registry,
+        authority=old_authority,
+    )
+    old_claim_key = old_row["claim_key"]
+
+    new_snapshot = _canonical_snapshot(
+        old_snapshot,
+        openspec_status="archived",
+        provider_revision="gh-2",
+    )
+    new_authority = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=new_snapshot
+    )
+    assert work_actions._expected_claim_key(new_authority) != old_claim_key
+
+    resumed = work_actions._claim_action(
+        args={"action": "resume", "repo": "acme/demo", "work_id": "demo"},
+        authority=new_authority,
+        now_epoch=200,
+        state_path=state_path,
+        workflow_registry=registry,
+    )
+    restarted = registry.get_workflow_run(run.run_id)
+    assert resumed["action"] == "resume"
+    assert resumed["reason"] == "active-workflow"
+    assert restarted.claim_key == work_actions._expected_claim_key(new_authority)
+    assert restarted.current_phase == "verify"
+    restarted_steps = {step.phase: step for step in restarted.steps}
+    assert restarted_steps["build"].gate_result == "passed"
+    assert restarted_steps["verify"].gate_result == "pending"
+    assert restarted_steps["review"].gate_result == "pending"
+    assert restarted.candidate_head == HEAD
+    assert restarted.retry_classification == "authority_restart"
+    assert _only_delivery_row(state_path, run.run_id)["claim_key"] == old_claim_key
+
+    # Reconstruct the field-wise journal state seen in production: the row has
+    # current authority provenance, but its claim_key was left in the old era.
+    journal = work_actions._load_runs(state_path)
+    current_row = work_actions._delivery_journal_row(restarted, new_authority)
+    current_row["claim_key"] = old_claim_key
+    journal["runs"][run.run_id] = current_row
+    work_actions._save_runs(state_path, journal)
+
+    # review-disposition is a real action that validates the active delivery row.
+    # It should pass authority validation, then reject because this run has no
+    # ship finding to adjudicate. Before the claim-key rebind, it fails earlier
+    # with "persisted workflow does not match current WorkAuthority".
+    with pytest.raises(
+        RuntimeError,
+        match="review-disposition only applies to ship Copilot findings",
+    ):
+        work_actions.execute_work_action(
+            args={
+                "action": "review-disposition",
+                "repo": "acme/demo",
+                "work_id": "demo",
+                "actor": "operator",
+                "reason": "verify authority rebinding before disposition",
+            },
+            requested_by="operator",
+            snapshot_path=new_snapshot,
+            state_path=state_path,
+            workflow_registry=registry,
+        )
+
+    row = _only_delivery_row(state_path, run.run_id)
+    assert row["claim_key"] == restarted.claim_key
+    assert row["source_revisions"] == list(new_authority.source_revisions)
+    assert row["authority_digest"] == work_actions.work_authority_digest(new_authority)
+
+
+@pytest.mark.parametrize("changed_authority", ["issue-closed", "pr-rebound", "openspec-remapped"])
+def test_unrestarted_target_change_does_not_rebind_delivery_row(
+    tmp_path: Path, changed_authority: str
+) -> None:
+    old_snapshot = _canonical_snapshot(tmp_path / "snapshot.json", pr_numbers=(8,))
+    old_authority = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=old_snapshot
+    )
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    run = _make_run(
+        registry,
+        authority=old_authority,
+        claim_key=work_actions._expected_claim_key(old_authority),
+        current_phase="review",
+        steps=_base_steps(verify_result="passed", review_result="passed"),
+        candidate_head=HEAD,
+        verified_head=HEAD,
+    )
+    run = registry._manager_update_workflow_run(
+        run.run_id, pr_refs=("acme/demo#8",)
+    )
+    state_path = tmp_path / "delivery-journal.json"
+    _state, _row, _run = work_actions._load_work_run(
+        state_path=state_path,
+        workflow_registry=registry,
+        authority=old_authority,
+    )
+    journal_before = state_path.read_bytes()
+
+    if changed_authority == "issue-closed":
+        new_snapshot = _canonical_snapshot(
+            old_snapshot, issue_status="closed", pr_numbers=(8,)
+        )
+    elif changed_authority == "pr-rebound":
+        new_snapshot = _canonical_snapshot(old_snapshot, pr_numbers=(9,))
+    else:
+        new_snapshot = _canonical_snapshot(old_snapshot, pr_numbers=(8,), changes=("other",))
+    new_authority = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=new_snapshot
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="delivery WorkflowRun does not match current WorkAuthority",
+    ):
+        work_actions._load_work_run(
+            state_path=state_path,
+            workflow_registry=registry,
+            authority=new_authority,
+        )
+
+    assert state_path.read_bytes() == journal_before
+    assert registry.get_workflow_run(run.run_id).claim_key == run.claim_key
+
+
+def _only_delivery_row(path: Path, run_id: str) -> dict:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["schema"] == "cortex-delivery-journal/v1"
+    return payload["runs"][run_id]
 
 
 def test_merged_delivery_authority_advance_does_not_reset_review_run(

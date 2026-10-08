@@ -999,7 +999,7 @@ class TestRetryReviewOverwritesStaleReceipt:
     後續派工的production路徑都會落地的那一步。
     """
 
-    def test_retry_review_reset_then_forced_dispatch_overwrites_receipt(
+    def test_retry_review_then_resume_dispatches_replacement_and_overwrites_receipt(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _seed_auth_cache(monkeypatch)
@@ -1041,6 +1041,7 @@ class TestRetryReviewOverwritesStaleReceipt:
             facets=("needs_human",),
             gate_status="failed",
             needs_human_reason=fixture_needs_human_reason(),
+            pr_refs=(f"{REPO}#845",),
         )
         builder_job = registry.create_job(
             task="wf-subagent-build",
@@ -1095,23 +1096,27 @@ class TestRetryReviewOverwritesStaleReceipt:
         # 產品 `_retry_review_action` 實際呼叫的重置函式（非本票修改）：把
         # review step 打回 pending、舊 exited job 標 failed、清 needs_human。
         reset_run = registry._manager_reset_workflow_for_retry_review(
-            run.run_id, expected_candidate=candidate
+            run.run_id,
+            expected_candidate=candidate,
+            retry_classification="review_handoff_failure",
         )
         assert registry.get_job(review_job["job_id"])["status"] == "failed"
         assert "needs_human" not in reset_run.facets
 
         launch_calls: list[str] = []
-        replacement = manager.dispatch_workflow_card(
+        resumed = manager.resume_workflow_run(
             _Dispatcher(registry),
-            run=registry.get_workflow_run(run.run_id),
+            run_id=run.run_id,
             identities=_identities(),
             launcher_factory=_launcher_factory(launch_calls),
             coordinator_root=tmp_path / "coordinator",
-            force_new_card=True,
+            operator_resume=True,
         )
 
-        assert replacement is not None and "job_id" in replacement
-        assert replacement["job_id"] != review_job["job_id"]
+        assert resumed["current_phase"] == "review"
+        assert resumed["reason"] == "in-flight"
+        replacement_job_id = resumed["job_id"]
+        assert replacement_job_id != review_job["job_id"]
         assert len(launch_calls) == 1
 
         persisted = registry.get_workflow_run(run.run_id)
@@ -1119,7 +1124,8 @@ class TestRetryReviewOverwritesStaleReceipt:
         assert receipt["decision"] == "fresh", (
             "retry-review 的新 attempt 後，receipt 不得停留在前一輪的 'reused'"
         )
-        assert receipt["stage_execution_key"] == replacement["workflow_stage_execution_key"]
+        replacement_job = registry.get_job(replacement_job_id)
+        assert receipt["stage_execution_key"] == replacement_job["workflow_stage_execution_key"]
         assert receipt["stage_execution_key"] != stale_key
 
 
