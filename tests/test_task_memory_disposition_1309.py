@@ -692,3 +692,231 @@ def test_finding_key_lookup_is_scoped_to_accepted_diagnostics():
     assert manager._task_memory_finding_by_key(
         {"outputs": [{"finding_key": "F-1"}]}, "F-1"
     ) is None
+
+
+# ---------------------------------------------------------------------------
+# 9. T4：`finding:<key>` applied 證據的端到端路徑（verify／review 卡）
+# ---------------------------------------------------------------------------
+
+FINDING_KEY = "F-1"
+FINDING = {"finding_key": FINDING_KEY, "severity": "warning", "message": "Missing guard."}
+FINDING_REF = f"finding:{FINDING_KEY}"
+FINDING_REF_SHA = hashlib.sha256(FINDING_REF.encode("utf-8")).hexdigest()
+FINDING_CANONICAL_SHA = hashlib.sha256(
+    json.dumps(FINDING, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+).hexdigest()
+VERIFY_REPORT_REF = "reports/verify/task-memory-disposition.md"
+
+
+def _finding_applied(**overrides: object) -> list[dict[str, object]]:
+    return [{
+        "note_id": "note-1",
+        "evidence_ref": FINDING_REF,
+        "evidence_sha256": FINDING_REF_SHA,
+        **overrides,
+    }]
+
+
+def _finding_disposition() -> list[dict[str, object]]:
+    return [_valid_disposition_entry(
+        verdict="applied", reason="Verification finding F-1 confirms the note was applied."
+    )]
+
+
+def _verify_finding_fixture(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    applied: object,
+    details: dict | None = None,
+    disposition: object = _ABSENT,
+):
+    review_target = tmp_path / "review-target"
+    (review_target / "src").mkdir(parents=True)
+    (review_target / ARTIFACT_REF).write_bytes(ARTIFACT)
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    step = WorkflowStep(
+        phase="verify",
+        persona="reviewer",
+        card="verification",
+        executor="agy",
+        model="gemini-3.1-pro-high",
+        domain="google",
+        inputs=(),
+        outputs=(VERIFY_REPORT_REF,),
+    )
+    run = registry._manager_create_workflow_run(
+        work_id=WORK_ID,
+        repo=REPO,
+        claim_key=CLAIM_KEY,
+        source_revision="6" * 64,
+        workspace_root=str(review_target),
+        combo="feature-oneshot",
+        current_phase="verify",
+        steps=(step,),
+        attempts={},
+        candidate_head="a" * 40,
+        gate_status="running",
+    )
+    job = registry.create_job(
+        task="verification",
+        persona="reviewer",
+        kind="review",
+        branch="feature/task-memory-disposition",
+        pane="",
+        worktree=str(tmp_path / "reviewer-sandbox"),
+        executor="agy",
+        model_id="gemini-3.1-pro-high",
+        independence_domain="google",
+        subject_head="a" * 40,
+        workflow_run_id=run.run_id,
+        workflow_claim_key=run.claim_key,
+        workflow_repo=run.repo,
+        workflow_card=step.card,
+        workflow_phase="verify",
+        workflow_repo_root=str(review_target),
+        workflow_outputs=(VERIFY_REPORT_REF,),
+        source_revision=run.source_revision,
+    )
+    coordinator_root = tmp_path / "coordinator"
+    _prepare_dispatch_memory(monkeypatch, registry, run, job, coordinator_root)
+    terminal: dict[str, object] = {
+        "schema_version": 1,
+        "kind": "workflow-verification-result",
+        "status": "verified",
+        "summary": "verification passed",
+        "details": details if details is not None else {"findings": [FINDING]},
+        "reports": [{"path": VERIFY_REPORT_REF, "body": "# Verification\n\nPassed.\n"}],
+        "task_memory_applied": applied,
+    }
+    if disposition is not _ABSENT:
+        terminal["task_memory_disposition"] = disposition
+    log = tmp_path / "verification.jsonl"
+    log.write_text(json.dumps(terminal) + "\n", encoding="utf-8")
+    registry.attach_launch_handle(
+        job["job_id"], executor="agy", model_id="gemini-3.1-pro-high", log_path=str(log)
+    )
+    registry.update_headless_result(job["job_id"], status="exited", exit_code=0)
+    return registry, run, registry.get_job(job["job_id"]), coordinator_root
+
+
+def _applied_receipts(root: Path, run) -> list[dict]:
+    return [row for row in _receipts(root, run) if row["event"] == "applied-with-evidence"]
+
+
+def test_verify_terminal_finding_ref_records_applied_with_canonical_finding_hash(
+    tmp_path, monkeypatch, caplog
+):
+    registry, run, job, root = _verify_finding_fixture(
+        tmp_path, monkeypatch, applied=_finding_applied(), disposition=_finding_disposition()
+    )
+
+    with caplog.at_level(logging.WARNING, logger=manager.__name__):
+        bound = manager.terminalize_workflow_job(
+            registry, job_id=job["job_id"], coordinator_root=root
+        )
+
+    assert bound["workflow_evidence"] is not None
+    assert not [r for r in caplog.records if "rejected" in r.getMessage()]
+    applied = _applied_receipts(root, run)
+    assert len(applied) == 1
+    assert applied[0]["card"] == "verification" and applied[0]["task_kind"] == "verify"
+    assert applied[0]["evidence"] == {"ref": FINDING_REF, "sha256": FINDING_CANONICAL_SHA}
+    assert applied[0]["evidence"]["sha256"] != FINDING_REF_SHA
+    reported = _disposition_reported(root, run)
+    assert len(reported) == 1 and reported[0]["verdict"] == "applied"
+
+
+@pytest.mark.parametrize(
+    "case_name, applied, details",
+    [
+        ("key-not-in-diagnostics", _finding_applied(
+            evidence_ref="finding:F-404",
+            evidence_sha256=hashlib.sha256(b"finding:F-404").hexdigest(),
+        ), None),
+        ("different-key-in-findings", _finding_applied(), {"findings": [{**FINDING, "finding_key": "F-2"}]}),
+        ("reference-hash-mismatch", _finding_applied(evidence_sha256="0" * 64), None),
+        ("canonical-hash-instead-of-reference-hash", _finding_applied(
+            evidence_sha256=FINDING_CANONICAL_SHA
+        ), None),
+    ],
+)
+def test_verify_terminal_invalid_finding_ref_is_rejected_without_receipt(
+    case_name, applied, details, tmp_path, monkeypatch, caplog
+):
+    registry, run, job, root = _verify_finding_fixture(
+        tmp_path / case_name,
+        monkeypatch,
+        applied=applied,
+        details=details,
+        disposition=_finding_disposition(),
+    )
+
+    with caplog.at_level(logging.WARNING, logger=manager.__name__):
+        bound = manager.terminalize_workflow_job(
+            registry, job_id=job["job_id"], coordinator_root=root
+        )
+
+    assert bound["workflow_evidence"] is not None
+    assert _applied_receipts(root, run) == []
+    assert any("task-memory applied evidence rejected" in r.getMessage() for r in caplog.records)
+    assert FINDING_KEY not in "".join(r.getMessage() for r in caplog.records)
+
+
+def test_build_terminal_finding_ref_is_rejected_by_phase_restriction(
+    tmp_path, monkeypatch, caplog
+):
+    registry, run, job, root, _wt = _build_fixture(
+        tmp_path / "case",
+        monkeypatch,
+        disposition=_finding_disposition(),
+        applied=_finding_applied(),
+        memory="delivered",
+    )
+    log = Path(job["log_path"])
+    terminal = json.loads(log.read_text(encoding="utf-8"))
+    terminal.update({
+        "schema_version": 2,
+        "diagnostics": {"findings": [FINDING]},
+        "gate_evidence": [{"name": "pytest", "status": "passed"}],
+    })
+    log.write_text(json.dumps(terminal) + "\n", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger=manager.__name__):
+        manager.terminalize_workflow_job(registry, job_id=job["job_id"], coordinator_root=root)
+
+    assert _applied_receipts(root, run) == []
+    assert any("task-memory applied evidence rejected" in r.getMessage() for r in caplog.records)
+    # disposition 本身不受影響
+    assert len(_disposition_reported(root, run)) == 1
+
+
+def test_record_receipt_requires_verified_finding_and_review_phase(tmp_path, monkeypatch):
+    registry, run, job, root = _verify_finding_fixture(
+        tmp_path / "ok", monkeypatch, applied=_finding_applied(), disposition=_finding_disposition()
+    )
+    manager.terminalize_workflow_job(registry, job_id=job["job_id"], coordinator_root=root)
+    receipt = _applied_receipts(root, run)[0]
+    assert receipt["evidence"]["ref"] == FINDING_REF
+
+    # 未通過 terminal diagnostics 驗證（預設 verified_finding=False）即使 event 完整也被擋
+    with pytest.raises(ValueError, match="not verified against terminal diagnostics"):
+        manager.record_task_memory_receipt(
+            registry, receipt, coordinator_root=root, verified_finding=False
+        )
+    # build 卡（phase 不在 verify／review）即使 verified_finding=True 也被擋
+    build_registry, build_run, build_job, build_root, _wt = _build_fixture(
+        tmp_path / "build", monkeypatch, memory="delivered"
+    )
+    build_event = {
+        **receipt,
+        "workflow_run_id": build_run.run_id,
+        "job_id": build_job["job_id"],
+        "attempt_id": build_job["job_id"],
+        "card": build_job["workflow_card"],
+        "task_kind": "build",
+    }
+    with pytest.raises(ValueError):
+        manager.record_task_memory_receipt(
+            build_registry, build_event, coordinator_root=build_root, verified_finding=True
+        )

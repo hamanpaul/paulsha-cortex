@@ -47,7 +47,7 @@
 
 ### Added
 
-- **#1309 task-memory 逐則處置收據**：實際送出記憶時，terminal 逐 note 回報 verdict 與原因；Manager 驗證 note 集合並只保存 reason SHA-256，漏報或格式錯誤只記 `unreported`、不改卡片結果。收據加入送出區塊 SHA-256；verify／review 的 applied 證據可引用已採信 finding key；新增填寫率、verdict 與漏報原因查詢文件（見 `changelog.d/task-memory-disposition.md`）。
+- **#1309 task-memory 逐則處置收據**：實際送出記憶時，terminal 逐 note 回報 verdict 與原因；Manager 驗證 note 集合並只保存 reason SHA-256，漏報或格式錯誤只記 `unreported`、不改卡片結果。收據加入送出區塊 SHA-256；verify／review 的 applied 證據可引用已採信 finding key；新增填寫率、verdict 與漏報原因查詢文件；已補上 `finding:<key>` 路徑的整合測試與反例（見 `changelog.d/task-memory-disposition.md`）。
 - **v0.1.13 發版**：`VERSION` 升為 0.1.13，收錄 #1263 一鍵升級 `cortex upgrade` 與 #716 deployment canary 端到端修正（見 `changelog.d/release-0-1-13.md`）。
 - **#1263 一鍵升級 `cortex upgrade <版本>`**：root 一個指令完成 ingress → plan → apply → 憑證繼承 → activate → verify → loaded↔installed 核對，失敗自動回到前一版；新增 `--recover`／`--status`、`credentials inherit`、`effective_receipt` 與 RC 升級演練；`--release-source`／`--allow-same-version`／`--prior-receipt` 僅供 qualification（`PSC_UPGRADE_QUALIFICATION=1`）使用、無 `--repository` 參數（官方來源固定 `hamanpaul/paulsha-cortex`）；maintenance window 內 SIGHUP 與 INT／TERM 一樣觸發 rollback、`--status` 也偵測 stale lease marker（見 `changelog.d/one-command-upgrade.md`）（#1263）。
 - **#716 post-archive reviewer 不再補入過期的 active OpenSpec 檔**：archive 之後 reviewer 的 OpenSpec planning authority 輸入改讀候選自己的 archive 副本（tasks.md 只容忍 checkbox 差異，entry 不唯一／symlink／缺檔 fail-closed），不再從來源樹 seed claim 當下未勾選的 active 檔（#716）。
