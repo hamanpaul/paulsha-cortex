@@ -685,6 +685,7 @@ def produce_plan(
         stdin=subprocess.DEVNULL,
         start_new_session=True,
         cwd=work,
+        umask=_CANDIDATE_UMASK,
     )
     try:
         reported = json.loads(result.stdout)["plan_sha256"]
@@ -723,6 +724,12 @@ _CANDIDATE_ENV = {"HOME": "/root", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PYTH
 # `/usr/local/{s,}bin` is deliberately left out: the sealed candidate must
 # never pick up a host-local override.
 _CANDIDATE_SYSTEM_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
+# `perform_upgrade()` keeps a private root umask for durable reports and
+# snapshots, but installer artifacts must not inherit that and become
+# unreadable/executable to service accounts. Candidate steps therefore run with
+# an explicit public tree umask; sensitive files stay 0600 because their own
+# writers set that mode directly.
+_CANDIDATE_UMASK = 0o022
 _REPORT_NAME = "upgrade-report.json"
 _LAST_REPORT_NAME = "last-upgrade-report.json"
 _HALTED_NEXT_ACTION = (
@@ -914,6 +921,7 @@ def _candidate(sealed: SealedCandidate, *arguments: str) -> CompletedProcess[str
             env={**_CANDIDATE_ENV, "PATH": f"{sealed.venv}/bin:{_CANDIDATE_SYSTEM_PATH}"},
             stdin=subprocess.DEVNULL,
             start_new_session=True,
+            umask=_CANDIDATE_UMASK,
         )
     if held.signal is not None:
         raise UpgradeInterrupted(held.signal, completed=result)
