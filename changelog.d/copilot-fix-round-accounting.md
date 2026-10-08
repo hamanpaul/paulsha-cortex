@@ -1,0 +1,1 @@
+- **#1342 Copilot 修正輪數與裁決出口**：`repair_rounds` 只在 `needs-fix` 後的修正候選改變時計數，並排除有 Manager evidence 的 autosync 與 retry-build 純 main merge；已達上限時仍對新 HEAD 要求 Copilot review，若仍有 findings，保留 exact-HEAD `needs-fix` 狀態並提供 `review-disposition` 作為 operator 出口。
