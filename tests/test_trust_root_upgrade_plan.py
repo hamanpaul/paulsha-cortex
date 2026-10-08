@@ -283,6 +283,7 @@ def test_the_plan_child_gets_no_terminal_stdin_or_root_working_directory(
     assert options[0]["stdin"] == subprocess.DEVNULL
     assert options[0]["start_new_session"] is True
     assert options[0]["cwd"] == sealed.attempt_dir / "plan"
+    assert options[0]["umask"] == upgrade._CANDIDATE_UMASK
 
 
 def test_a_plan_output_swapped_for_a_fifo_is_refused_without_blocking(
