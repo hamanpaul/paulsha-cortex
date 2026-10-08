@@ -1825,3 +1825,11 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/workstreams/builder-admission-after-autosync/todo.md'
     excludes: []
+  retry-review-all-review-cards:
+    title: 'retry-review-all-review-cards'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1365'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/retry-review-all-review-cards/todo.md'
+    excludes: []
