@@ -7,6 +7,14 @@ on:
         description: Exact VERSION value to release (without the v prefix)
         required: true
         type: string
+      profile:
+        description: Release profile
+        required: true
+        type: choice
+        options:
+          - trust-root
+          - user-level
+        default: trust-root
 
 concurrency:
   group: release
@@ -25,6 +33,7 @@ jobs:
     outputs:
       release_sha: ${{ steps.preflight.outputs.release_sha }}
       tag_name: ${{ steps.preflight.outputs.tag_name }}
+      profile: ${{ steps.preflight.outputs.profile }}
       rc_run_id: ${{ steps.preflight.outputs.rc_run_id }}
       legacy_rc_run_id: ${{ steps.preflight.outputs.legacy_rc_run_id }}
     steps:
@@ -39,8 +48,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ inputs.version }}
+          RELEASE_PROFILE: ${{ inputs.profile }}
         run: |
           set -euo pipefail
+          case "$RELEASE_PROFILE" in
+            trust-root|user-level) ;;
+            *) echo "::error::unsupported release profile"; exit 1 ;;
+          esac
           [[ "$RELEASE_VERSION" =~ ^[0-9]+[.][0-9]+[.][0-9]+([+-][0-9A-Za-z][0-9A-Za-z.-]*)?$ ]] || {
             echo "::error::release version is not valid SemVer"
             exit 1
@@ -229,8 +243,10 @@ jobs:
             "tests.yml:pull_request"
             "persona-scope.yml:pull_request"
             "policy-check.yml:pull_request"
-            "rc-qualification.yml:workflow_dispatch"
           )
+          if [[ "$RELEASE_PROFILE" == "trust-root" ]]; then
+            required_pr_workflows+=("rc-qualification.yml:workflow_dispatch")
+          fi
           for required_workflow in "${required_pr_workflows[@]}"; do
             IFS=: read -r workflow event <<<"$required_workflow"
             workflow_runs=$(gh api --method GET \
@@ -255,6 +271,9 @@ jobs:
             }
           done
 
+          rc_run_id=
+          legacy_rc_run_id=
+          if [[ "$RELEASE_PROFILE" == "trust-root" ]]; then
           run_json=$(gh api --method GET \
             "repos/${GITHUB_REPOSITORY}/actions/workflows/rc-qualification.yml/runs" \
             -f event=workflow_dispatch -f per_page=100)
@@ -275,7 +294,6 @@ jobs:
           legacy_requirement=$(python3 qualification/release_gate.py legacy-requirement \
             --head "$release_sha")
           echo "::notice::legacy-adoption requirement: $(jq -r .reason <<<"$legacy_requirement")"
-          legacy_rc_run_id=
           if jq -e '.required == true' <<<"$legacy_requirement" >/dev/null; then
             legacy_paths=$(jq -r '.paths | join(", ")' <<<"$legacy_requirement")
             legacy_run=$(python3 qualification/release_gate.py select-run \
@@ -295,9 +313,11 @@ jobs:
               exit 1
             }
           fi
+          fi
 
           echo "release_sha=$release_sha" >> "$GITHUB_OUTPUT"
           echo "tag_name=$tag_name" >> "$GITHUB_OUTPUT"
+          echo "profile=$RELEASE_PROFILE" >> "$GITHUB_OUTPUT"
           echo "rc_run_id=$rc_run_id" >> "$GITHUB_OUTPUT"
           echo "legacy_rc_run_id=$legacy_rc_run_id" >> "$GITHUB_OUTPUT"
 
@@ -336,14 +356,24 @@ jobs:
           python -m twine check --strict dist/*.whl
 
       - name: Upload reproduced wheel for gate comparison
+        if: inputs.profile == 'trust-root'
         uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1  # v4.6.1
         with:
           name: reproduced-dist
           path: dist/*.whl
 
+      - name: Upload user-level wheel
+        if: inputs.profile == 'user-level'
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1  # v4.6.1
+        with:
+          name: user-level-dist
+          if-no-files-found: error
+          path: dist/*.whl
+
   qualification-gate:
     runs-on: ubuntu-latest
     needs: [release-preflight, build]
+    if: inputs.profile == 'trust-root'
     steps:
       - name: Checkout exact release validator
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
@@ -467,14 +497,29 @@ jobs:
   release:
     runs-on: ubuntu-latest
     needs: [release-preflight, qualification-gate]
+    if: >-
+      always() &&
+      needs['release-preflight'].result == 'success' &&
+      ((inputs.profile == 'trust-root' &&
+        needs['qualification-gate'].result == 'success') ||
+       (inputs.profile == 'user-level' &&
+        needs['qualification-gate'].result == 'skipped'))
     permissions:
       actions: read
       contents: write
     steps:
       - name: Download release-authoritative artifacts
+        if: inputs.profile == 'trust-root'
         uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e  # v4.2.1
         with:
           name: qualified-dist
+          path: dist
+
+      - name: Download user-level wheel
+        if: inputs.profile == 'user-level'
+        uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e  # v4.2.1
+        with:
+          name: user-level-dist
           path: dist
 
       - name: Create verified annotated tag and GitHub Release
@@ -482,6 +527,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_SHA: ${{ needs['release-preflight'].outputs.release_sha }}
           TAG_NAME: ${{ needs['release-preflight'].outputs.tag_name }}
+          RELEASE_PROFILE: ${{ needs['release-preflight'].outputs.profile }}
         run: |
           set -euo pipefail
           release_sha=$RELEASE_SHA
@@ -577,11 +623,24 @@ jobs:
             find dist -maxdepth 1 -type f -name '*-qualification.json' -print
           )
           mapfile -t release_assets < <(find dist -maxdepth 1 -type f -print)
-          ((${#wheels[@]} == 1 && ${#install_inputs[@]} == 1 && \
-             ${#qualification_manifests[@]} == 1 && ${#release_assets[@]} == 3)) || {
-            echo "::error::expected exactly one wheel, install-input archive, and qualification manifest"
+          release_asset_args=("${wheels[0]}")
+          if [[ "$RELEASE_PROFILE" == "trust-root" ]]; then
+            ((${#wheels[@]} == 1 && ${#install_inputs[@]} == 1 && \
+               ${#qualification_manifests[@]} == 1 && ${#release_assets[@]} == 3)) || {
+              echo "::error::expected exactly one wheel, install-input archive, and qualification manifest"
+              exit 1
+            }
+            release_asset_args+=("${install_inputs[0]}" "${qualification_manifests[0]}")
+          elif [[ "$RELEASE_PROFILE" == "user-level" ]]; then
+            ((${#wheels[@]} == 1 && ${#install_inputs[@]} == 0 && \
+               ${#qualification_manifests[@]} == 0 && ${#release_assets[@]} == 1)) || {
+              echo "::error::user-level release must contain exactly one wheel"
+              exit 1
+            }
+          else
+            echo "::error::unsupported release profile"
             exit 1
-          }
+          fi
 
           tag_created=false
           tag_object_sha=
@@ -699,14 +758,18 @@ jobs:
               false
             }
 
-          gh release create "$tag_name" "${wheels[0]}" "${install_inputs[0]}" \
-            "${qualification_manifests[0]}" \
+          user_level_notice='本版為使用者層級發版，不含 Trust Root 安裝輸入，不支援 Trust Root system 部署。'
+          release_notes="<!-- $release_transaction_marker -->"
+          if [[ "$RELEASE_PROFILE" == "user-level" ]]; then
+            release_notes+=$'\n\n'"$user_level_notice"
+          fi
+          gh release create "$tag_name" "${release_asset_args[@]}" \
             --repo "$GITHUB_REPOSITORY" \
             --draft \
             --verify-tag \
             --target "$release_sha" \
             --title "$tag_name" \
-            --notes "<!-- $release_transaction_marker -->" \
+            --notes "$release_notes" \
             --generate-notes
 
           owned_release=$(find_owned_release)
@@ -718,12 +781,13 @@ jobs:
           wheel_name=$(basename "${wheels[0]}")
           wheel_size=$(stat --format=%s "${wheels[0]}")
           wheel_digest="sha256:$(sha256sum "${wheels[0]}" | awk '{print $1}')"
-          install_input_name=$(basename "${install_inputs[0]}")
-          install_input_size=$(stat --format=%s "${install_inputs[0]}")
-          install_input_digest="sha256:$(sha256sum "${install_inputs[0]}" | awk '{print $1}')"
-          qualification_name=$(basename "${qualification_manifests[0]}")
-          qualification_size=$(stat --format=%s "${qualification_manifests[0]}")
-          qualification_digest="sha256:$(sha256sum "${qualification_manifests[0]}" | awk '{print $1}')"
+          if [[ "$RELEASE_PROFILE" == "trust-root" ]]; then
+            install_input_name=$(basename "${install_inputs[0]}")
+            install_input_size=$(stat --format=%s "${install_inputs[0]}")
+            install_input_digest="sha256:$(sha256sum "${install_inputs[0]}" | awk '{print $1}')"
+            qualification_name=$(basename "${qualification_manifests[0]}")
+            qualification_size=$(stat --format=%s "${qualification_manifests[0]}")
+            qualification_digest="sha256:$(sha256sum "${qualification_manifests[0]}" | awk '{print $1}')"
           jq -e \
             --arg tag "$tag_name" \
             --arg marker "$release_transaction_marker" \
@@ -758,6 +822,28 @@ jobs:
             echo "::error::draft release asset or ownership verification failed"
             false
           }
+          else
+            jq -e \
+              --arg tag "$tag_name" \
+              --arg marker "$release_transaction_marker" \
+              --arg wheel "$wheel_name" \
+              --arg wheel_digest "$wheel_digest" \
+              --arg notice "$user_level_notice" \
+              --argjson wheel_size "$wheel_size" '
+              .tag_name == $tag and
+              .draft == true and
+              ((.body // "") | contains($marker)) and
+              ((.body // "") | contains($notice)) and
+              (.assets | length) == 1 and
+              ([.assets[]
+                | select(.name == $wheel and .size == $wheel_size and
+                         .state == "uploaded" and
+                         .digest == $wheel_digest)] | length) == 1
+            ' <<<"$owned_release" >/dev/null || {
+              echo "::error::user-level release asset or ownership verification failed"
+              false
+            }
+          fi
 
           published_release=$(jq -n '{draft: false}' | \
             gh api --method PATCH \
@@ -772,5 +858,13 @@ jobs:
             echo "::error::published release failed transaction verification"
             false
           }
+          if [[ "$RELEASE_PROFILE" == "user-level" ]]; then
+            jq -e --arg notice "$user_level_notice" \
+              '((.body // "") | contains($notice))' \
+              <<<"$published_release" >/dev/null || {
+              echo "::error::published user-level release is missing its support notice"
+              false
+            }
+          fi
           tag_created=false
           trap - EXIT INT TERM

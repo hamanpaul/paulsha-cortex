@@ -125,6 +125,23 @@ def test_resolve_release_refuses_a_missing_asset(tmp_path: Path) -> None:
         resolve_release(DirectoryReleaseFetcher(release.source), fixtures.VERSION)
 
 
+def test_resolve_release_refuses_user_level_wheel_only_release(tmp_path: Path) -> None:
+    release = fixtures.write_release_source(tmp_path)
+    path = fixtures.release_json_path(release.source)
+    document = json.loads(path.read_text())
+    wheel_name, install_input_name, qualification_name = asset_names(fixtures.VERSION)
+    document["assets"] = [
+        row for row in document["assets"] if row["name"] == wheel_name
+    ]
+    path.write_text(json.dumps(document))
+
+    with pytest.raises(IngressError) as error:
+        resolve_release(DirectoryReleaseFetcher(release.source), fixtures.VERSION)
+
+    assert install_input_name in str(error.value)
+    assert qualification_name in str(error.value)
+
+
 def _edit_json(path: Path, mutate) -> None:
     document = json.loads(path.read_text())
     mutate(document)

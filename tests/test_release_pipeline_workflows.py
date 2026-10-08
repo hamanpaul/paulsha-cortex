@@ -159,6 +159,77 @@ def test_release_workflow_is_manual_no_pypi_and_sha_pinned() -> None:
     _assert_all_uses_have_version_comments("release.yml")
 
 
+def test_release_workflow_profile_input_defaults_to_trust_root() -> None:
+    payload = _load_workflow("release.yml")
+    inputs = _workflow_on(payload)["workflow_dispatch"]["inputs"]
+
+    profile = inputs.get("profile")
+    assert isinstance(profile, dict), "release.yml must expose a release profile"
+    assert profile.get("type") == "choice"
+    assert profile.get("default") == "trust-root"
+    assert profile.get("options") == ["trust-root", "user-level"]
+
+
+def test_release_workflow_runs_rc_requirements_only_for_trust_root() -> None:
+    payload = _load_workflow("release.yml")
+    jobs = payload.get("jobs", {})
+    assert isinstance(jobs, dict)
+
+    preflight = jobs.get("release-preflight")
+    assert isinstance(preflight, dict)
+    assert "profile" in preflight.get("outputs", {})
+    preflight_runs = _job_step_runs(preflight)
+    trust_root_start = 'if [[ "$RELEASE_PROFILE" == "trust-root" ]]; then'
+    assert trust_root_start in preflight_runs
+    trust_root_preflight = preflight_runs.rsplit(trust_root_start, 1)[1]
+    assert "select-run" in trust_root_preflight
+    assert "--profile release" in trust_root_preflight
+    assert "legacy-requirement" in trust_root_preflight
+    assert "--profile legacy-adoption" in trust_root_preflight
+    assert 'required_pr_workflows+=("rc-qualification.yml:workflow_dispatch")' in preflight_runs
+
+    gate = jobs.get("qualification-gate")
+    assert isinstance(gate, dict)
+    assert gate.get("if") == "inputs.profile == 'trust-root'"
+
+
+def test_user_level_release_publishes_only_wheel_with_fixed_notice() -> None:
+    payload = _load_workflow("release.yml")
+    jobs = payload.get("jobs", {})
+    assert isinstance(jobs, dict)
+
+    build = jobs.get("build")
+    assert isinstance(build, dict)
+    build_steps = build.get("steps", [])
+    user_upload = next(
+        step
+        for step in build_steps
+        if isinstance(step, dict) and step.get("name") == "Upload user-level wheel"
+    )
+    assert user_upload.get("if") == "inputs.profile == 'user-level'"
+    assert user_upload.get("with", {}).get("name") == "user-level-dist"
+
+    release = jobs.get("release")
+    assert isinstance(release, dict)
+    assert "always()" in release.get("if", "")
+    assert "qualification-gate" in _job_needs(release)
+    release_steps = release.get("steps", [])
+    user_download = next(
+        step
+        for step in release_steps
+        if isinstance(step, dict)
+        and step.get("name") == "Download user-level wheel"
+    )
+    assert user_download.get("if") == "inputs.profile == 'user-level'"
+    assert user_download.get("with", {}).get("name") == "user-level-dist"
+
+    release_runs = _job_step_runs(release)
+    assert 'if [[ "$RELEASE_PROFILE" == "user-level" ]]' in release_runs
+    assert "本版為使用者層級發版，不含 Trust Root 安裝輸入，不支援 Trust Root system 部署。" in release_runs
+    assert 'release_asset_args=("${wheels[0]}")' in release_runs
+    assert 'release_asset_args+=("${install_inputs[0]}" "${qualification_manifests[0]}")' in release_runs
+
+
 def _job_needs(job: dict) -> set[str]:
     needs = job.get("needs", [])
     if isinstance(needs, str):
@@ -753,6 +824,7 @@ else:
         "GITHUB_RUN_ATTEMPT": "1",
         "RELEASE_SHA": release_sha,
         "TAG_NAME": "v1.2.3",
+        "RELEASE_PROFILE": "trust-root",
     }
     if failure_mode == "stale-upload":
         stale_marker = f"cortex-release-transaction:v1:999:1:{release_sha}"

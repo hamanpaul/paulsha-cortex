@@ -10,14 +10,23 @@
 ## 發版操作
 
 1. 合入 release candidate PR，確認 default branch exact SHA 的 `Tests` workflow 全綠。
-2. 在 Actions 手動執行 `RC qualification`，ref 必須選同一個 default branch SHA。
-3. workflow 會產生 `rc-qualification-<sha>`；`qualification.json` 必須為
+2. 若要發 `trust-root` 版，在 Actions 手動執行 `RC qualification`，ref 必須選同一個
+   default branch SHA。
+3. `trust-root` workflow 會產生 `rc-qualification-<sha>`；`qualification.json` 必須為
    `schema_version: 2`、`profile: release`、`providers: []`。
-4. 手動執行 `Release`，輸入與 `VERSION` 完全相同的版本。release workflow 會重新 build wheel、
-   比對 wheel/bundle hashes，並以 `--require-release-profile` 驗證 evidence。
-5. 驗證 annotated tag、non-draft GitHub Release 與恰好三份資產都指向同一 main SHA：唯一
-   wheel、完整 install-input archive、passed release qualification manifest。三份資產的
-   GitHub REST `digest` 都必須等於 publication job 的本機 SHA-256。
+4. 手動執行 `Release`，輸入與 `VERSION` 完全相同的版本，並選擇 `trust-root` 或
+   `user-level` profile。`trust-root` 會重新 build wheel、比對 wheel/bundle hashes，並以
+   `--require-release-profile` 驗證 evidence。
+5. 驗證 annotated tag、non-draft GitHub Release 與資產都指向同一 main SHA。`trust-root` 必須
+   有唯一 wheel、完整 install-input archive、passed release qualification manifest，且三份資產的
+   GitHub REST `digest` 都等於 publication job 的本機 SHA-256。
+
+`user-level` 仍執行來源、版本、default-branch head、Tests、policy 與 PR 審查檢查，但不查找 RC
+qualification、不要求 legacy-adoption qualification，也不執行 `qualification-gate`。它只發布重建的
+wheel，不產生 install-input archive 或 qualification manifest；release notes 會附固定聲明：
+「本版為使用者層級發版，不含 Trust Root 安裝輸入，不支援 Trust Root system 部署。」此 release
+不能用於 Trust Root system deployment；installer ingress 仍要求 wheel、install-input 與 qualification
+manifest 三份資產，缺少任一資產都會拒絕該 release。
 
 Release candidate PR 應帶對應 `release:<version>` label。Policy Check 必須在 PR 建立、commit
 同步、重開、title/body 編輯與 label 增刪時重跑；不能沿用缺少後加 label 的舊 event payload，
