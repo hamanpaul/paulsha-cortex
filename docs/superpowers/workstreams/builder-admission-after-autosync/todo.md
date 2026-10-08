@@ -15,8 +15,8 @@ work_item: builder-admission-after-autosync
 
 ## Tasks
 
-- [ ] **T1 RED**：以正式生命週期重現：claim → build → ship 開 PR → autosync 推到 PR → retry-build，現行實作回 `builder-todo-authority-changed`。在 PR 中寫明實際不相符的欄位。
-- [ ] **T2 最小修正**：只修 T1 查到的原因，讓 Manager 自己的推送（含 autosync）被 admission 認定為自產交付事實。
-- [ ] **T3 fail closed**：PR 改綁、issue 關閉、todo 改寫時仍拒絕，reason 正確。
-- [ ] **T4 恢復**：PR 已存在、經過 autosync 的 run，`retry-build` 能派出 builder；已經卡住的現有 run，升級後 retry-build 也能派出。
-- [ ] **T5 文件**：新增 changelog fragment，並同步 `CHANGELOG.md [Unreleased]`。
+- [x] **T1 RED**：以正式生命週期重現：claim → build → ship 開 PR → autosync 推到 PR → retry-build，現行實作回 `builder-todo-authority-changed`。在 PR 中寫明實際不相符的欄位。
+- [x] **T2 最小修正**：只修 T1 查到的原因，讓 Manager 自己的推送（含 autosync）被 admission 認定為自產交付事實。
+- [x] **T3 fail closed**：PR 改綁、issue 關閉、todo 改寫時仍拒絕，reason 正確。
+- [x] **T4 恢復**：PR 已存在、經過 autosync 的 run，`retry-build` 能派出 builder；已經卡住的現有 run，升級後 retry-build 也能派出。
+- [x] **T5 文件**：新增 changelog fragment，並同步 `CHANGELOG.md [Unreleased]`。
