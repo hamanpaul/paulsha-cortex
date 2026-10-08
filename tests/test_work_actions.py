@@ -4476,6 +4476,452 @@ def test_default_ship_runtime_is_resumable_and_connects_all_delivery_gates(
     assert "remote-closure" in calls
 
 
+def _set_snapshot_provider_state(
+    path: Path,
+    *,
+    last_success_epoch: float,
+    provider_revision: str = "gh-2",
+    source_revisions: tuple[str, ...] | None = None,
+) -> None:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    provider = payload["providers"]["github"]
+    provider["last_success_epoch"] = last_success_epoch
+    provider["revision"] = provider_revision
+    if source_revisions is not None:
+        payload["work_items"][0]["source_revisions"] = list(source_revisions)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _ship_authority_refresh_case(tmp_path: Path):
+    snapshot = _snapshot(tmp_path / "monitor" / "snapshot.json")
+    repo_root = _init_repo(tmp_path / "repo")
+    state = tmp_path / "coordinator" / "runs.json"
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    foreign = evidence / "foreign.json"
+    foreign.write_text("{}", encoding="utf-8")
+    metadata = _pr_metadata(evidence / "pr.json")
+    work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+    )
+    foreign_payload = {"state": "passed", "candidate": HEAD}
+    base = {
+        "action": "ship",
+        "repo": "acme/demo",
+        "work_id": "demo",
+        "repo_root": str(repo_root),
+        "pr_number": 8,
+        "change": "demo",
+        "todo_paths": ["docs/todo.md"],
+        "foreign_review_path": str(foreign),
+        "foreign_review_hash": work_actions.verification.canonical_json_hash(
+            foreign_payload
+        ),
+        "pr_metadata_path": str(metadata),
+    }
+    return snapshot, state, base, foreign_payload
+
+
+def _install_ship_authority_refresh_runtime(
+    monkeypatch,
+    *,
+    snapshot: Path,
+    current: dict,
+    merged: dict,
+    calls: dict,
+) -> None:
+    from paulsha_cortex.coordinator import delivery
+
+    class GitHub:
+        def __init__(self, *, runner):
+            pass
+
+        def ensure_pr_metadata(self, **kwargs):
+            calls["metadata"] = calls.get("metadata", 0) + 1
+
+        def fetch_delivery_facts(self, **kwargs):
+            reviews = ()
+            if current["review"]:
+                reviews = (
+                    CopilotReview(
+                        review_id=9,
+                        commit_id=HEAD,
+                        state="COMMENTED",
+                        body="ok",
+                        author=COPILOT_REVIEWER_LOGIN,
+                        submitted_at_epoch=201,
+                    ),
+                )
+            return DeliveryFacts(
+                head=HEAD,
+                mergeable=True,
+                mergeable_state="clean",
+                checks=(GitHubCheck("pytest", "completed", "success"),),
+                copilot_reviews=reviews,
+                review_threads=(),
+                closing_issues=(12,),
+                active_openspec_absent=True,
+                archive_present=True,
+            )
+
+        def request_copilot(self, **kwargs):
+            calls["request"] = calls.get("request", 0) + 1
+
+        def fetch_merge_status(self, **kwargs):
+            return MergeStatus(
+                merged["value"],
+                HEAD,
+                "c" * 40 if merged["value"] else None,
+            )
+
+    class Orchestrator:
+        def __init__(self, *, github, now):
+            self._now = now
+
+        def merge_if_ready(self, **kwargs):
+            calls["merge"] = calls.get("merge", 0) + 1
+            delivery._validate_work_authority(
+                kwargs["authority"], now_epoch=current["now"]
+            )
+            merged["value"] = True
+            return SimpleNamespace(expected_head=HEAD, expected_tree_hash=TREE)
+
+    monkeypatch.setattr(work_actions, "GitHubDeliveryClient", GitHub)
+    monkeypatch.setattr(work_actions, "ShipOrchestrator", Orchestrator)
+    monkeypatch.setattr(work_actions, "load_preflight_command", lambda: ("preflight",))
+    monkeypatch.setattr(
+        work_actions,
+        "current_clean_identity",
+        lambda **kwargs: (HEAD, TREE),
+    )
+
+    def run_preflight(**kwargs):
+        calls["preflight"] = calls.get("preflight", 0) + 1
+        if current.get("refresh_snapshot"):
+            _set_snapshot_provider_state(
+                snapshot,
+                last_success_epoch=current["refresh_epoch"],
+            )
+        if current.get("after_preflight_now") is not None:
+            current["now"] = current["after_preflight_now"]
+        return PreflightResult(
+            True,
+            None,
+            CommandResult(("policy",), 0, "", ""),
+            CommandResult(("preflight", "--pr", "8"), 0, "", ""),
+            HEAD,
+            TREE,
+        )
+
+    monkeypatch.setattr(work_actions, "run_preflight", run_preflight)
+    monkeypatch.setattr(
+        work_actions,
+        "_validate_foreign_review",
+        lambda *args, **kwargs: {"state": "passed", "candidate": HEAD},
+    )
+
+
+def test_ship_reloads_work_authority_after_long_preflight(monkeypatch, tmp_path: Path) -> None:
+    """A fresh snapshot published during a >900s preflight authorizes the exact merge."""
+
+    snapshot, state, base, _foreign_payload = _ship_authority_refresh_case(tmp_path)
+    current = {"now": 200.0, "review": False, "refresh_snapshot": False}
+    merged = {"value": False}
+    calls: dict[str, int] = {}
+    _install_ship_authority_refresh_runtime(
+        monkeypatch,
+        snapshot=snapshot,
+        current=current,
+        merged=merged,
+        calls=calls,
+    )
+    first = work_actions.execute_work_action(
+        args=base,
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: current["now"],
+    )
+    assert first["result"]["action"] == "awaiting-copilot"
+
+    current.update(
+        now=200.0,
+        review=True,
+        refresh_snapshot=True,
+        refresh_epoch=1100.0,
+        after_preflight_now=1101.0,
+    )
+    result = work_actions.execute_work_action(
+        args=base,
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: current["now"],
+    )
+
+    assert result["result"]["action"] == "merged-awaiting-closure"
+    assert calls["preflight"] == 2
+    assert calls["merge"] == 1
+
+
+def test_ship_retries_stale_merge_with_cached_preflight_and_backoff(
+    monkeypatch, tmp_path: Path
+) -> None:
+    snapshot, state, base, _foreign_payload = _ship_authority_refresh_case(tmp_path)
+    current = {"now": 200.0, "review": False, "refresh_snapshot": False}
+    merged = {"value": False}
+    calls: dict[str, int] = {}
+    _install_ship_authority_refresh_runtime(
+        monkeypatch,
+        snapshot=snapshot,
+        current=current,
+        merged=merged,
+        calls=calls,
+    )
+    first = work_actions.execute_work_action(
+        args=base,
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: current["now"],
+    )
+    assert first["result"]["action"] == "awaiting-copilot"
+
+    current.update(now=1101.0, review=True)
+    stale = work_actions.execute_work_action(
+        args=base,
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: current["now"],
+    )
+    assert stale["result"] == {
+        "action": "provider-stale-retry",
+        "reason": "provider-stale-retry",
+        "retry_after_epoch": 1131.0,
+        "attempt": 1,
+    }
+    authority = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=snapshot
+    )
+    assert work_actions.has_merge_authorized_preflight(
+        state_path=state,
+        run_id=_only_journal_row(state)["run_id"],
+        authority=authority,
+        binding={"pr_number": 8, "change": "demo", "todo_paths": ["docs/todo.md"]},
+        head=HEAD,
+        tree_hash=TREE,
+    )
+    legacy_journal = json.loads(state.read_text(encoding="utf-8"))
+    legacy_row = next(iter(legacy_journal["runs"].values()))
+    legacy_row["ship"].pop("preflight_result")
+    state.write_text(json.dumps(legacy_journal), encoding="utf-8")
+
+    current["now"] = 1110.0
+    waiting = work_actions.execute_work_action(
+        args=base,
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: current["now"],
+    )
+    assert waiting["result"]["reason"] == "provider-stale-retry-wait"
+    assert calls["preflight"] == 2
+    assert calls["merge"] == 1
+
+    _set_snapshot_provider_state(snapshot, last_success_epoch=1130.0)
+    current["now"] = 1131.0
+    recovered = work_actions.execute_work_action(
+        args=base,
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: current["now"],
+    )
+    assert recovered["result"]["action"] == "merged-awaiting-closure"
+    assert calls["preflight"] == 2
+    assert calls["merge"] == 2
+
+
+def test_ship_provider_stale_backoff_exhaustion_requires_human(
+    monkeypatch, tmp_path: Path
+) -> None:
+    snapshot, state, base, _foreign_payload = _ship_authority_refresh_case(tmp_path)
+    current = {"now": 200.0, "review": False, "refresh_snapshot": False}
+    merged = {"value": False}
+    calls: dict[str, int] = {}
+    _install_ship_authority_refresh_runtime(
+        monkeypatch,
+        snapshot=snapshot,
+        current=current,
+        merged=merged,
+        calls=calls,
+    )
+    first = work_actions.execute_work_action(
+        args=base,
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: current["now"],
+    )
+    assert first["result"]["action"] == "awaiting-copilot"
+    current.update(now=1101.0, review=True)
+    retry = work_actions.execute_work_action(
+        args=base,
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: current["now"],
+    )
+    assert retry["result"]["attempt"] == 1
+
+    for due in (1131.0, 1191.0, 1311.0):
+        current["now"] = due
+        retry = work_actions.execute_work_action(
+            args=base,
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=state,
+            now=lambda: current["now"],
+        )
+        assert retry["result"]["action"] == "provider-stale-retry"
+
+    current["now"] = 1551.0
+    exhausted = work_actions.execute_work_action(
+        args=base,
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: current["now"],
+    )
+    assert exhausted["result"] == {
+        "action": "needs_human",
+        "reason": "provider-stale-retry-exhausted",
+    }
+    assert calls["preflight"] == 2
+    assert calls["merge"] == 5
+
+
+def test_ship_fails_closed_when_authority_identity_changes_during_preflight(
+    monkeypatch, tmp_path: Path
+) -> None:
+    snapshot, state, base, _foreign_payload = _ship_authority_refresh_case(tmp_path)
+    current = {"now": 200.0, "review": False, "refresh_snapshot": False}
+    merged = {"value": False}
+    calls: dict[str, int] = {}
+    _install_ship_authority_refresh_runtime(
+        monkeypatch,
+        snapshot=snapshot,
+        current=current,
+        merged=merged,
+        calls=calls,
+    )
+    first = work_actions.execute_work_action(
+        args=base,
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: current["now"],
+    )
+    assert first["result"]["action"] == "awaiting-copilot"
+
+    def changed_preflight(**kwargs):
+        calls["preflight"] = calls.get("preflight", 0) + 1
+        _set_snapshot_provider_state(
+            snapshot,
+            last_success_epoch=1100.0,
+            source_revisions=("issue:12@open", "openspec:demo@2"),
+        )
+        return PreflightResult(
+            True,
+            None,
+            CommandResult(("policy",), 0, "", ""),
+            CommandResult(("preflight", "--pr", "8"), 0, "", ""),
+            HEAD,
+            TREE,
+        )
+
+    monkeypatch.setattr(work_actions, "run_preflight", changed_preflight)
+    current.update(now=1101.0, review=True)
+    result = work_actions.execute_work_action(
+        args=base,
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: current["now"],
+    )
+    assert result["result"] == {
+        "action": "needs_human",
+        "reason": "work-authority-changed-during-preflight",
+    }
+    assert calls.get("merge", 0) == 0
+
+
+def test_ship_requires_human_when_authority_refresh_fails_after_preflight(
+    monkeypatch, tmp_path: Path
+) -> None:
+    snapshot, state, base, _foreign_payload = _ship_authority_refresh_case(tmp_path)
+    current = {"now": 200.0, "review": False, "corrupt_snapshot": False}
+    merged = {"value": False}
+    calls: dict[str, int] = {}
+    _install_ship_authority_refresh_runtime(
+        monkeypatch,
+        snapshot=snapshot,
+        current=current,
+        merged=merged,
+        calls=calls,
+    )
+
+    def run_preflight(**kwargs):
+        calls["preflight"] = calls.get("preflight", 0) + 1
+        if current["corrupt_snapshot"]:
+            snapshot.write_text("{", encoding="utf-8")
+        return PreflightResult(
+            True,
+            None,
+            CommandResult(("policy",), 0, "", ""),
+            CommandResult(("preflight", "--pr", "8"), 0, "", ""),
+            HEAD,
+            TREE,
+        )
+
+    monkeypatch.setattr(work_actions, "run_preflight", run_preflight)
+    first = work_actions.execute_work_action(
+        args=base,
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: current["now"],
+    )
+    assert first["result"]["action"] == "awaiting-copilot"
+
+    current.update(review=True, corrupt_snapshot=True)
+    result = work_actions.execute_work_action(
+        args=base,
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: current["now"],
+    )
+
+    assert result["result"] == {
+        "action": "needs_human",
+        "reason": "work-authority-refresh-failed",
+    }
+    row = _only_journal_row(state)
+    assert row["ship"]["phase"] == "needs_human"
+    assert row["ship"]["reason"] == "work-authority-refresh-failed"
+    run = JobRegistry(state_path=state.parent / "jobs.json").list_workflow_runs()[0]
+    assert "needs_human" in run.facets
+    assert run.needs_human_reason["reason"] == "work-authority-refresh-failed"
+    assert calls["preflight"] == 2
+    assert not merged["value"]
+
+
 def test_ship_runs_official_archive_before_preflight(tmp_path: Path) -> None:
     snapshot = _snapshot(tmp_path / "snapshot.json")
     state = tmp_path / "runs.json"
@@ -4662,7 +5108,8 @@ def test_review_findings_persist_across_heads_and_third_round_needs_human_defaul
     assert final["repair_rounds_used"] == 2
     assert final["repair_rounds_budget"] == 2
     assert final["repair_rounds_remaining"] == 0
-    assert final["legal_next_steps"] == ("maintainer-review",)
+    assert final["legal_next_steps"] == ("review-disposition",)
+    assert final["next_actions"] == list(final["legal_next_steps"])
     # #218 AC3：已重複 stage 與預估 invalidation 範圍（ship 階段 repair 迴圈
     # 不回頭讓 build/verify 失效，範圍即當前 phase）。
     assert final["repeated_stage"]

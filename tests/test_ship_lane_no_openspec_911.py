@@ -195,6 +195,7 @@ def test_ship_without_openspec_binds_none_change_and_reaches_preflight(
         now=lambda: 200,
         state_path=state,
         workflow_registry=registry,
+        snapshot_path=snapshot,
     )
 
     assert result == {"action": "awaiting-copilot", "head": HEAD}
@@ -523,6 +524,7 @@ def test_multi_openspec_stop_tells_operator_to_unlink_before_resume(tmp_path: Pa
         now=lambda: 200,
         state_path=state,
         workflow_registry=registry,
+        snapshot_path=snapshot,
     )
 
     assert result == {

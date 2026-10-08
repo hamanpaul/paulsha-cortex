@@ -84,7 +84,14 @@ from . import not_claimable
 from .planning_runtime import PLANNING_FAILURE_KIND_OPERATOR_WORKTREE_DRIFT
 from . import verification
 from . import worktree_reclaim
-from .preflight import PreflightRequest, load_preflight_command, run_preflight
+from .preflight import (
+    CommandResult,
+    PreflightRequest,
+    PreflightResult,
+    current_clean_identity,
+    load_preflight_command,
+    run_preflight,
+)
 from .work_bridge import (
     current_sizing_snapshot,
     extract_model_chain_override,
@@ -112,6 +119,10 @@ _RETIREMENT_ACTIONS = frozenset({"abandon", "retire-delivered"})
 # #731：`refreeze-base` 同理——它只讀 run 自身狀態與來源樹的 git ref，一個位元組
 # 都不取自 issue 的當下 open/closed。
 _LOCAL_UNBLOCK_ACTIONS = _RETIREMENT_ACTIONS | {"reset-reclaim-budget", "refreeze-base"}
+
+SHIP_PROVIDER_STALE_MAX_ATTEMPTS = 5
+SHIP_PROVIDER_STALE_BACKOFF_BASE_SECONDS = 30
+SHIP_PROVIDER_STALE_BACKOFF_MAX_SECONDS = 300
 
 
 def _positive_int(value: object, *, field: str) -> int:
@@ -2154,6 +2165,55 @@ def _preflight_hash(preflight: object) -> str:
     )
 
 
+def _preflight_cache_record(preflight: object) -> dict[str, Any]:
+    """Keep enough authenticated gate identity to retry an authorized merge."""
+
+    return {
+        "head": getattr(preflight, "head"),
+        "tree_hash": getattr(preflight, "tree_hash"),
+        "policy": _command_result_payload(getattr(preflight, "policy")),
+        "ci_parity": _command_result_payload(getattr(preflight, "ci_parity")),
+    }
+
+
+def _preflight_from_cache_record(value: object) -> PreflightResult | None:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"head", "tree_hash", "policy", "ci_parity"}
+        or not isinstance(value.get("head"), str)
+        or verification.SAFE_SHA_RE.fullmatch(value["head"]) is None
+        or not isinstance(value.get("tree_hash"), str)
+        or verification.SAFE_SHA_RE.fullmatch(value["tree_hash"]) is None
+    ):
+        return None
+
+    def command_result(item: object) -> CommandResult | None:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"argv", "returncode"}
+            or not isinstance(item.get("argv"), list)
+            or not item["argv"]
+            or any(not isinstance(part, str) or not part for part in item["argv"])
+            or item.get("returncode") != 0
+            or isinstance(item.get("returncode"), bool)
+        ):
+            return None
+        return CommandResult(tuple(item["argv"]), 0, "", "")
+
+    policy = command_result(value.get("policy"))
+    ci_parity = command_result(value.get("ci_parity"))
+    if policy is None or ci_parity is None:
+        return None
+    return PreflightResult(
+        passed=True,
+        failed_stage=None,
+        policy=policy,
+        ci_parity=ci_parity,
+        head=value["head"].lower(),
+        tree_hash=value["tree_hash"].lower(),
+    )
+
+
 def _checks_hash(remote: object) -> str:
     return verification.canonical_json_hash(
         [
@@ -2370,9 +2430,92 @@ def _authorization_matches(
         return False
     body = value["payload"]
     return (
-        body.get("preflight_hash") == _preflight_hash(preflight)
+        body.get("preflight_hash")
+        in {
+            _preflight_hash(preflight),
+            getattr(preflight, "authorization_preflight_hash", None),
+        }
         and (remote is None or body.get("checks_hash") == _checks_hash(remote))
     )
+
+
+def _authorized_preflight(
+    ship: object,
+    *,
+    active: dict[str, Any],
+    authority,
+    binding: dict[str, Any],
+    head: str,
+    tree_hash: str,
+) -> PreflightResult | None:
+    if not isinstance(ship, dict) or ship.get("phase") != "merge-authorized":
+        return None
+    cache_record = ship.get("preflight_result")
+    preflight = _preflight_from_cache_record(cache_record)
+    if cache_record is None:
+        authorization = ship.get("merge_authorization")
+        body = authorization.get("payload") if isinstance(authorization, dict) else None
+        if isinstance(body, dict):
+            preflight = SimpleNamespace(
+                passed=True,
+                failed_stage=None,
+                head=head.lower(),
+                tree_hash=tree_hash.lower(),
+                policy=SimpleNamespace(argv=("persisted-preflight",), returncode=0),
+                ci_parity=SimpleNamespace(argv=("persisted-preflight",), returncode=0),
+                authorization_preflight_hash=body.get("preflight_hash"),
+            )
+            if not _authorization_identity_matches(
+                authorization,
+                active=active,
+                authority=authority,
+                binding=binding,
+                head=head,
+                tree_hash=tree_hash,
+            ):
+                preflight = None
+    if (
+        preflight is None
+        or preflight.head.lower() != head.lower()
+        or preflight.tree_hash.lower() != tree_hash.lower()
+        or not _authorization_matches(
+            ship.get("merge_authorization"),
+            active=active,
+            authority=authority,
+            binding=binding,
+            preflight=preflight,
+        )
+    ):
+        return None
+    return preflight
+
+
+def has_merge_authorized_preflight(
+    *,
+    state_path: str | Path,
+    run_id: str,
+    authority,
+    binding: dict[str, Any],
+    head: str,
+    tree_hash: str,
+) -> bool:
+    """Check whether the Manager journal holds a valid exact-head preflight proof."""
+
+    try:
+        state = _load_runs(Path(state_path))
+    except (OSError, ValueError, RuntimeError):
+        return False
+    active = state.get("runs", {}).get(run_id)
+    if not isinstance(active, dict) or active.get("run_id") != run_id:
+        return False
+    return _authorized_preflight(
+        active.get("ship"),
+        active=active,
+        authority=authority,
+        binding=binding,
+        head=head,
+        tree_hash=tree_hash,
+    ) is not None
 
 
 def _authorization_identity_matches(
@@ -3285,6 +3428,393 @@ def _review_disposition_action(
     }
 
 
+def _authority_delivery_identity(authority) -> tuple[object, ...]:
+    return (
+        authority.repo,
+        authority.work_id,
+        authority.mapped_prs,
+        authority.mapped_issues,
+        authority.mapped_openspec,
+        authority.mapped_todo_paths,
+        authority.confirmed_todo,
+        authority.source_revisions,
+        getattr(authority, "requires_github_authority", True),
+    )
+
+
+def _refresh_ship_authority_after_preflight(
+    *,
+    authority,
+    snapshot_path: str | Path | None,
+    active: dict[str, Any],
+    state: dict[str, Any],
+    state_path: Path,
+    canonical_run,
+    workflow_registry,
+    preflight: object,
+) -> object | dict[str, Any]:
+    try:
+        refreshed = load_work_authority(
+            repo=authority.repo,
+            work_id=authority.work_id,
+            snapshot_path=snapshot_path,
+        )
+    except (OSError, ValueError) as exc:
+        reason = "work-authority-refresh-failed"
+        active["ship"] = {
+            **(active.get("ship") or {}),
+            "phase": "needs_human",
+            "reason": reason,
+            "head": getattr(preflight, "head", None),
+            "tree_hash": getattr(preflight, "tree_hash", None),
+        }
+        _save_runs(state_path, state)
+        workflow_registry._manager_update_workflow_run(
+            canonical_run.run_id,
+            facets=("needs_human",),
+            gate_status="running",
+            needs_human_reason=diagnostic_reason(
+                reason,
+                (
+                    "preflight 完成後無法重新取得 confirmed WorkAuthority；"
+                    f"交付已 fail-closed。{safe_exception_summary(exc)}"
+                ),
+                source="work_actions._ship_action:authority-refresh",
+                run_id=canonical_run.run_id,
+                work_id=canonical_run.work_id,
+                head=str(getattr(preflight, "head", "")),
+            ),
+        )
+        return {"action": "needs_human", "reason": reason}
+
+    identity_fields = (
+        "repo",
+        "work_id",
+        "mapped_prs",
+        "mapped_issues",
+        "mapped_openspec",
+        "mapped_todo_paths",
+        "confirmed_todo",
+        "source_revisions",
+    )
+    changed_fields = [
+        field
+        for field in identity_fields
+        if getattr(refreshed, field) != getattr(authority, field)
+    ]
+    if (
+        _authority_delivery_identity(refreshed)
+        != _authority_delivery_identity(authority)
+        or work_authority_digest(refreshed) != work_authority_digest(authority)
+    ):
+        reason = "work-authority-changed-during-preflight"
+        detail_fields = ", ".join(changed_fields) or "authority identity"
+        active["ship"] = {
+            **(active.get("ship") or {}),
+            "phase": "needs_human",
+            "reason": reason,
+            "head": getattr(preflight, "head", None),
+            "tree_hash": getattr(preflight, "tree_hash", None),
+        }
+        _save_runs(state_path, state)
+        workflow_registry._manager_update_workflow_run(
+            canonical_run.run_id,
+            facets=("needs_human",),
+            gate_status="running",
+            needs_human_reason=diagnostic_reason(
+                reason,
+                f"preflight 期間 WorkAuthority 交付身分改變（{detail_fields}）；交付已 fail-closed。",
+                source="work_actions._ship_action:authority-refresh",
+                run_id=canonical_run.run_id,
+                work_id=canonical_run.work_id,
+                head=str(getattr(preflight, "head", "")),
+            ),
+        )
+        return {"action": "needs_human", "reason": reason}
+
+    _validate_current_run_authority(active, refreshed, canonical_run)
+    if (
+        active.get("snapshot_hash") != refreshed.snapshot_hash
+        or active.get("provider_revision") != refreshed.github_provider_revision
+    ):
+        active["snapshot_hash"] = refreshed.snapshot_hash
+        active["provider_revision"] = refreshed.github_provider_revision
+        _save_runs(state_path, state)
+    return refreshed
+
+
+def _provider_stale_retry_wait(
+    ship: dict[str, Any], *, now_epoch: object
+) -> dict[str, Any] | None:
+    if (
+        not isinstance(now_epoch, (int, float))
+        or isinstance(now_epoch, bool)
+        or not math.isfinite(float(now_epoch))
+    ):
+        raise ValueError("ship clock must be finite")
+    deadline = ship.get("provider_stale_retry_after_epoch")
+    if deadline is None:
+        return None
+    if (
+        not isinstance(deadline, (int, float))
+        or isinstance(deadline, bool)
+        or not math.isfinite(float(deadline))
+    ):
+        raise ValueError("ship provider-stale retry deadline malformed")
+    if float(now_epoch) < float(deadline):
+        return {
+            "action": "provider-stale-retry",
+            "reason": "provider-stale-retry-wait",
+            "retry_after_epoch": float(deadline),
+            "attempt": ship.get("provider_stale_retry_attempts", 0),
+        }
+    return None
+
+
+def _record_provider_stale_retry(
+    *,
+    error: RuntimeError,
+    active: dict[str, Any],
+    state: dict[str, Any],
+    state_path: Path,
+    canonical_run,
+    authority,
+    workflow_registry,
+    now: Callable[[], float],
+    head: str,
+    tree_hash: str,
+) -> dict[str, Any] | None:
+    if str(error) != "provider degraded or stale":
+        return None
+    now_epoch = now()
+    if (
+        not isinstance(now_epoch, (int, float))
+        or isinstance(now_epoch, bool)
+        or not math.isfinite(float(now_epoch))
+    ):
+        raise ValueError("ship clock must be finite")
+    ship = active.get("ship")
+    if not isinstance(ship, dict) or ship.get("phase") != "merge-authorized":
+        raise RuntimeError("provider stale retry requires persisted merge authorization")
+    previous = ship.get("provider_stale_retry_attempts", 0)
+    if not isinstance(previous, int) or isinstance(previous, bool) or previous < 0:
+        raise ValueError("ship provider-stale retry count malformed")
+    attempt = previous + 1
+    updated = {
+        **ship,
+        "head": head,
+        "tree_hash": tree_hash,
+        "provider_stale_retry_attempts": attempt,
+        "provider_stale_retry_last_reason": "provider degraded or stale",
+    }
+    if attempt >= SHIP_PROVIDER_STALE_MAX_ATTEMPTS:
+        reason = "provider-stale-retry-exhausted"
+        updated.update({"phase": "needs_human", "reason": reason})
+        updated.pop("provider_stale_retry_after_epoch", None)
+        active["ship"] = updated
+        _save_runs(state_path, state)
+        workflow_registry._manager_update_workflow_run(
+            canonical_run.run_id,
+            facets=("needs_human",),
+            gate_status="running",
+            needs_human_reason=diagnostic_reason(
+                reason,
+                f"WorkAuthority 在 preflight 後仍 stale；已依 backoff 重試 {attempt} 次仍未恢復。",
+                source="work_actions._ship_action:provider-stale-retry",
+                run_id=canonical_run.run_id,
+                work_id=canonical_run.work_id,
+                head=head,
+                attempts=str(attempt),
+            ),
+        )
+        return {"action": "needs_human", "reason": reason}
+    delay = min(
+        SHIP_PROVIDER_STALE_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)),
+        SHIP_PROVIDER_STALE_BACKOFF_MAX_SECONDS,
+    )
+    deadline = float(now_epoch) + delay
+    updated["provider_stale_retry_after_epoch"] = deadline
+    active["ship"] = updated
+    _save_runs(state_path, state)
+    return {
+        "action": "provider-stale-retry",
+        "reason": "provider-stale-retry",
+        "retry_after_epoch": deadline,
+        "attempt": attempt,
+    }
+
+
+def _retry_merge_authorized_ship(
+    *,
+    ship: dict[str, Any],
+    active: dict[str, Any],
+    state: dict[str, Any],
+    state_path: Path,
+    authority,
+    canonical_run,
+    workflow_registry,
+    binding: dict[str, Any],
+    preflight: object,
+    remote: object,
+    orchestrator: ShipOrchestrator,
+    github: GitHubDeliveryClient,
+    now: Callable[[], float],
+    max_fix_rounds: int,
+) -> dict[str, Any]:
+    authorization = ship.get("merge_authorization")
+    if not _authorization_matches(
+        authorization,
+        active=active,
+        authority=authority,
+        binding=binding,
+        preflight=preflight,
+        remote=remote,
+    ):
+        raise RuntimeError("persisted merge authorization differs from current gate evidence")
+    body = authorization["payload"]
+    foreign_review = ForeignReviewEvidence(
+        path=body["foreign_review_path"],
+        expected_hash=body["foreign_review_hash"],
+    )
+    _validate_foreign_review(foreign_review, expected_head=preflight.head)
+
+    copilot = None
+    maintainer_review = None
+    if body["schema"] == "cortex-merge-authorization/v1":
+        review = next(
+            (
+                item
+                for item in remote.copilot_reviews
+                if item.review_id == body["copilot_review_id"]
+                and item.commit_id == preflight.head
+                and item.author == COPILOT_REVIEWER_LOGIN
+            ),
+            None,
+        )
+        if review is None:
+            raise RuntimeError("authorized exact-HEAD Copilot review is no longer visible")
+        requested_at = float(body["copilot_requested_at_epoch"])
+        adopted_at = ship.get("adopted_at_epoch")
+        epoch_started_at = ship.get("epoch_started_at", requested_at)
+        fix_rounds = ship.get("fix_rounds", 0)
+        if (
+            not isinstance(fix_rounds, int)
+            or isinstance(fix_rounds, bool)
+            or fix_rounds < 0
+            or not isinstance(epoch_started_at, (int, float))
+            or isinstance(epoch_started_at, bool)
+            or not math.isfinite(float(epoch_started_at))
+        ):
+            raise RuntimeError("persisted Copilot review epoch is malformed")
+        loop = ReviewLoop(
+            head=preflight.head,
+            fix_rounds=fix_rounds,
+            epoch_started_at=float(epoch_started_at),
+            requested_at=requested_at,
+            max_fix_rounds=max_fix_rounds,
+            adopted_at=adopted_at,
+        )
+        copilot = loop.record_review(
+            head=review.commit_id,
+            now_epoch=now(),
+            finding_count=sum(1 for thread in remote.review_threads if thread.blocks_merge),
+            review_id=review.review_id,
+            submitted_at_epoch=review.submitted_at_epoch,
+            error=review.is_error,
+        )
+        if copilot.action != "passed":
+            raise RuntimeError("authorized exact-HEAD Copilot review is no longer passing")
+    elif body["schema"] == "cortex-merge-authorization/v2":
+        maintainer_review = MaintainerReviewEvidence(
+            path=body["review_ref"],
+            expected_hash=body["review_hash"],
+        )
+        _validate_maintainer_review(
+            path=maintainer_review.path,
+            expected_hash=maintainer_review.expected_hash,
+            run=canonical_run,
+            authority=authority,
+            pr_number=binding["pr_number"],
+            candidate=preflight.head,
+        )
+    else:
+        raise RuntimeError("persisted merge authorization schema is unsupported")
+
+    try:
+        merged = orchestrator.merge_if_ready(
+            repo=authority.repo,
+            pr_number=binding["pr_number"],
+            change=binding["change"],
+            expected_head=preflight.head,
+            expected_tree_hash=preflight.tree_hash,
+            authority=authority,
+            preflight=preflight,
+            copilot=copilot,
+            foreign_review=foreign_review,
+            maintainer_review=maintainer_review,
+        )
+    except RuntimeError as exc:
+        post_merge = github.fetch_merge_status(
+            repo=authority.repo,
+            pr_number=binding["pr_number"],
+        )
+        if (
+            not post_merge.merged
+            or post_merge.pr_head != preflight.head
+            or not _authorization_matches(
+                authorization,
+                active=active,
+                authority=authority,
+                binding=binding,
+                preflight=preflight,
+                remote=remote,
+            )
+        ):
+            retry = _record_provider_stale_retry(
+                error=exc,
+                active=active,
+                state=state,
+                state_path=state_path,
+                canonical_run=canonical_run,
+                authority=authority,
+                workflow_registry=workflow_registry,
+                now=now,
+                head=preflight.head,
+                tree_hash=preflight.tree_hash,
+            )
+            if retry is not None:
+                return retry
+            raise
+        merged = SimpleNamespace(
+            expected_head=preflight.head,
+            expected_tree_hash=preflight.tree_hash,
+        )
+    else:
+        post_merge = github.fetch_merge_status(
+            repo=authority.repo,
+            pr_number=binding["pr_number"],
+        )
+        if not post_merge.merged or post_merge.pr_head != preflight.head:
+            raise RuntimeError("merge side effect is not visible on exact PR HEAD")
+
+    merged_ship = {
+        **ship,
+        "phase": "merged",
+        "head": merged.expected_head,
+        "tree_hash": merged.expected_tree_hash,
+        "merge_commit": post_merge.merge_commit,
+    }
+    for field in (
+        "provider_stale_retry_attempts",
+        "provider_stale_retry_after_epoch",
+        "provider_stale_retry_last_reason",
+    ):
+        merged_ship.pop(field, None)
+    active["ship"] = merged_ship
+    _save_runs(state_path, state)
+    return {"action": "merged-awaiting-closure", "head": merged.expected_head}
+
+
 def _ship_with_maintainer_review(
     *,
     args: dict[str, Any],
@@ -3302,6 +3832,7 @@ def _ship_with_maintainer_review(
     ship: dict[str, Any] | None,
     fix_rounds: int,
     now_epoch: float,
+    now: Callable[[], float] = time.time,
 ) -> dict[str, Any]:
     path = args.get("maintainer_review_path")
     expected_hash = args.get("maintainer_review_hash")
@@ -3413,6 +3944,7 @@ def _ship_with_maintainer_review(
         "change": binding["change"],
         "todo_paths": list(binding["todo_paths"]),
         "merge_authorization": authorization,
+        "preflight_result": _preflight_cache_record(preflight),
     }
     if superseded_authorization is not None:
         next_ship["superseded_merge_authorization"] = superseded_authorization
@@ -3433,7 +3965,7 @@ def _ship_with_maintainer_review(
             foreign_review=foreign_review,
             maintainer_review=maintainer,
         )
-    except RuntimeError:
+    except RuntimeError as exc:
         post_merge = github.fetch_merge_status(
             repo=authority.repo, pr_number=binding["pr_number"]
         )
@@ -3449,6 +3981,20 @@ def _ship_with_maintainer_review(
                 remote=remote,
             )
         ):
+            retry = _record_provider_stale_retry(
+                error=exc,
+                active=active,
+                state=state,
+                state_path=state_path,
+                canonical_run=canonical_run,
+                authority=authority,
+                workflow_registry=workflow_registry,
+                now=now,
+                head=preflight.head,
+                tree_hash=preflight.tree_hash,
+            )
+            if retry is not None:
+                return retry
             raise
         merged = SimpleNamespace(
             expected_head=preflight.head,
@@ -3460,13 +4006,20 @@ def _ship_with_maintainer_review(
         )
         if not post_merge.merged or post_merge.pr_head != preflight.head:
             raise RuntimeError("merge side effect is not visible on exact PR HEAD")
-    active["ship"] = {
+    merged_ship = {
         **active["ship"],
         "phase": "merged",
         "head": merged.expected_head,
         "tree_hash": merged.expected_tree_hash,
         "merge_commit": post_merge.merge_commit,
     }
+    for field in (
+        "provider_stale_retry_attempts",
+        "provider_stale_retry_after_epoch",
+        "provider_stale_retry_last_reason",
+    ):
+        merged_ship.pop(field, None)
+    active["ship"] = merged_ship
     _save_runs(state_path, state)
     return {
         "action": "merged-awaiting-closure",
@@ -5490,7 +6043,11 @@ def _phase_recovery_actions(
         )
     ):
         actions.append("review-attest")
-    if reason_code in {"review-disposition-required", "review-threads-unresolved"}:
+    if reason_code in {
+        "review-disposition-required",
+        "review-threads-unresolved",
+        "copilot-finding-budget-exhausted",
+    }:
         actions.append("review-disposition")
     try:
         from . import manager as workflow_manager
@@ -9603,10 +10160,10 @@ SEMANTIC_RECLAIM_LIMIT = 3
 
 
 # #218 AC3: needs_human 停止時揭露剩餘 repair scope、已重複 stage、合法下一步
-# 與預估 invalidation 範圍。legal_next_steps 只列出真正已由
-# _recoverable_maintainer_ship_stop 承認的重入路徑（maintainer-review）；
-# invalidation_scope 是若人工仍要求再開一輪會需要重新走的 phase 範圍——ship 階
-# 段的 repair 迴圈只影響 ship 本身，不會回頭讓 build/verify 失效。
+# 與預估 invalidation 範圍。budget-exhausted 的 ship 已停在 needs-fix，operator
+# 的有效出口是針對 exact HEAD 提交 review-disposition；invalidation_scope 是若人工
+# 仍要求再開一輪會需要重新走的 phase 範圍——ship 階段的 repair 迴圈只影響 ship
+# 本身，不會回頭讓 build/verify 失效。
 def _repair_budget_status(
     *, fix_rounds: int, max_fix_rounds: int, current_phase: str
 ) -> dict[str, Any]:
@@ -9615,8 +10172,91 @@ def _repair_budget_status(
         "repair_rounds_budget": max_fix_rounds,
         "repair_rounds_remaining": max(max_fix_rounds - fix_rounds, 0),
         "repeated_stage": current_phase,
-        "legal_next_steps": ("maintainer-review",),
+        "legal_next_steps": ("review-disposition",),
         "invalidation_scope": (current_phase,),
+    }
+
+
+def _main_sync_only_candidate_transition(
+    *,
+    run: Any,
+    previous_head: str,
+    candidate_head: str,
+    state_path: Path,
+    repo_root: str | Path,
+    runner: Runner,
+) -> bool:
+    """Whether this exact HEAD movement consists only of a recorded main sync.
+
+    Autosync evidence is manager-owned and content-addressed. A retry-build main
+    sync is recognized only when the current HEAD is the pinned main commit or
+    the exact merge commit joining the previous Candidate and pinned main. A
+    later Candidate commit therefore remains countable as a repair.
+    """
+
+    from . import work_bridge
+
+    events = work_bridge._read_main_sync_autosync_events(
+        state_root=state_path.resolve().parent,
+        run_id=str(getattr(run, "run_id", "")),
+        evidence_refs=getattr(run, "evidence_refs", ()),
+    )
+    previous = previous_head.lower()
+    cursor = candidate_head.lower()
+    moved = False
+    for event in reversed(events):
+        if event.get("outcome") != "merged":
+            continue
+        if str(event.get("candidate_after", "")).lower() != cursor:
+            if moved:
+                break
+            continue
+        cursor = str(event.get("candidate_before", "")).lower()
+        moved = True
+        if cursor == previous:
+            return True
+
+    binding = getattr(run, "main_sync_repair", None)
+    if not isinstance(binding, dict):
+        return False
+    main_head = binding.get("main_head")
+    if (
+        binding.get("candidate") != previous
+        or not isinstance(main_head, str)
+        or re.fullmatch(r"[0-9a-f]{40,64}", main_head) is None
+    ):
+        return False
+    main_head = main_head.lower()
+    if candidate_head.lower() == main_head:
+        ancestry = runner(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "merge-base",
+                "--is-ancestor",
+                previous_head,
+                candidate_head,
+            ],
+            shell=False,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return getattr(ancestry, "returncode", 1) == 0
+    parents = runner(
+        ["git", "-C", str(repo_root), "show", "-s", "--format=%P", candidate_head],
+        shell=False,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if getattr(parents, "returncode", 1) != 0:
+        return False
+    parent_ids = (getattr(parents, "stdout", "") or "").strip().lower().split()
+    return len(parent_ids) == 2 and set(parent_ids) == {
+        previous_head.lower(),
+        main_head,
     }
 
 
@@ -9628,6 +10268,7 @@ def _ship_action(
     now: Callable[[], float],
     state_path: Path,
     workflow_registry,
+    snapshot_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Advance one fail-closed delivery stage for the exact durable work item.
 
@@ -9990,6 +10631,9 @@ def _ship_action(
             )
         ):
             raise ValueError("ship merge-authorized state malformed")
+        retry_wait = _provider_stale_retry_wait(ship, now_epoch=now())
+        if retry_wait is not None:
+            return retry_wait
         merge_status = github.fetch_merge_status(
             repo=authority.repo,
             pr_number=pr_number,
@@ -10041,27 +10685,72 @@ def _ship_action(
             "next_action": "commit and push the archive diff, then enqueue ship again",
         }
 
-    github.ensure_pr_metadata(
-        repo=authority.repo,
-        pr_number=pr_number,
-        title=metadata.title,
-        body=metadata.body,
-        labels=metadata.labels,
-    )
-    command = load_preflight_command()
-    preflight = run_preflight(
-        repo_root=repo_root,
-        command=command,
-        request=PreflightRequest(
+    preflight = None
+    resumed_authorized_preflight = False
+    if isinstance(ship, dict):
+        cached_head = ship.get("head")
+        cached_tree = ship.get("tree_hash")
+        if isinstance(cached_head, str) and isinstance(cached_tree, str):
+            preflight = _authorized_preflight(
+                ship,
+                active=active,
+                authority=authority,
+                binding=binding,
+                head=cached_head,
+                tree_hash=cached_tree,
+            )
+            if preflight is not None:
+                try:
+                    checkout_head, checkout_tree = current_clean_identity(
+                        repo_root=repo_root,
+                        runner=runner,
+                    )
+                except (OSError, RuntimeError, ValueError):
+                    preflight = None
+                else:
+                    if (
+                        checkout_head.lower() != preflight.head.lower()
+                        or checkout_tree.lower() != preflight.tree_hash.lower()
+                    ):
+                        preflight = None
+                    else:
+                        resumed_authorized_preflight = True
+    if preflight is None:
+        github.ensure_pr_metadata(
+            repo=authority.repo,
             pr_number=pr_number,
-            skip_tests=skip_tests,
-            tree_hash=args.get("tree_hash"),
-        ),
-        runner=runner,
-        now=now,
+            title=metadata.title,
+            body=metadata.body,
+            labels=metadata.labels,
+        )
+        command = load_preflight_command()
+        preflight = run_preflight(
+            repo_root=repo_root,
+            command=command,
+            request=PreflightRequest(
+                pr_number=pr_number,
+                skip_tests=skip_tests,
+                tree_hash=args.get("tree_hash"),
+            ),
+            runner=runner,
+            now=now,
+        )
+        if not preflight.passed:
+            raise RuntimeError(f"ship preflight failed: {preflight.failed_stage}")
+
+    refreshed_authority = _refresh_ship_authority_after_preflight(
+        authority=authority,
+        snapshot_path=snapshot_path,
+        active=active,
+        state=state,
+        state_path=state_path,
+        canonical_run=canonical_run,
+        workflow_registry=workflow_registry,
+        preflight=preflight,
     )
-    if not preflight.passed:
-        raise RuntimeError(f"ship preflight failed: {preflight.failed_stage}")
+    if isinstance(refreshed_authority, dict):
+        return refreshed_authority
+    authority = refreshed_authority
 
     remote = github.fetch_delivery_facts(
         repo=authority.repo,
@@ -10135,6 +10824,24 @@ def _ship_action(
         _save_runs(state_path, state)
         return {"action": "merged-awaiting-closure", "head": preflight.head}
 
+    if resumed_authorized_preflight and isinstance(ship, dict):
+        return _retry_merge_authorized_ship(
+            ship=ship,
+            active=active,
+            state=state,
+            state_path=state_path,
+            authority=authority,
+            canonical_run=canonical_run,
+            workflow_registry=workflow_registry,
+            binding=binding,
+            preflight=preflight,
+            remote=remote,
+            orchestrator=orchestrator,
+            github=github,
+            now=now,
+            max_fix_rounds=max_fix_rounds,
+        )
+
     now_epoch = now()
     if (
         not isinstance(now_epoch, (int, float))
@@ -10175,6 +10882,7 @@ def _ship_action(
             ship=ship,
             fix_rounds=fix_rounds,
             now_epoch=float(now_epoch),
+            now=now,
         )
     if rearm_permit is not None and preflight.head != rearm_permit["candidate_head"]:
         _invalidate_copilot_rearm_permit(
@@ -10303,45 +11011,26 @@ def _ship_action(
             disposition=disposition,
         )
         _save_runs(state_path, state)
-    if previous_head is not None and previous_head != preflight.head:
+    if (
+        previous_head is not None
+        and previous_head != preflight.head
+        and ship is not None
+        and ship.get("phase") == "needs-fix"
+        and not _main_sync_only_candidate_transition(
+            run=canonical_run,
+            previous_head=previous_head,
+            candidate_head=preflight.head,
+            state_path=state_path,
+            repo_root=repo_root,
+            runner=runner,
+        )
+        and fix_rounds < max_fix_rounds
+    ):
+        # Count a new Candidate only after an exact-HEAD Copilot finding. Main
+        # sync movements are not repairs, and a Candidate at the exhausted
+        # budget still gets a fresh Copilot review for operator disposition.
         fix_rounds += 1
         active["repair_rounds"] = fix_rounds
-        if fix_rounds > max_fix_rounds:
-            active.pop("copilot_review_rearm_permit", None)
-            active["ship"] = {
-                **ship,
-                "phase": "needs_human",
-                "reason": "copilot-finding-budget-exhausted",
-                "head": preflight.head,
-                "fix_rounds": fix_rounds,
-            }
-            _save_runs(state_path, state)
-            workflow_registry._manager_update_workflow_run(
-                canonical_run.run_id,
-                facets=("needs_human",),
-                gate_status="running",
-                needs_human_reason=diagnostic_reason(
-                    "copilot-finding-budget-exhausted",
-                    f"Copilot review 修復輪次已達上限（{fix_rounds}/{max_fix_rounds}），"
-                    "不再自動重跑",
-                    source="work_actions._ship_action:copilot-budget",
-                    run_id=canonical_run.run_id,
-                    work_id=canonical_run.work_id,
-                    head=preflight.head,
-                    fix_rounds=str(fix_rounds),
-                ),
-            )
-            return _copilot_ship_needs_human_response(
-                reason="copilot-finding-budget-exhausted",
-                run=canonical_run,
-                authority=authority,
-                workflow_registry=workflow_registry,
-                extra=_repair_budget_status(
-                    fix_rounds=fix_rounds,
-                    max_fix_rounds=max_fix_rounds,
-                    current_phase=canonical_run.current_phase,
-                ),
-            )
     if (
         not ship
         or previous_head != preflight.head
@@ -10565,7 +11254,21 @@ def _ship_action(
         _save_runs(state_path, state)
         return {"action": "fix-required", "reason": copilot.reason, "findings": finding_count}
     if copilot.action != "passed":
-        active["ship"] = {**ship, "phase": "needs_human", "reason": copilot.reason}
+        if copilot.reason == "copilot-finding-budget-exhausted":
+            # Keep the exact review findings in the disposition-compatible
+            # state. The operator can resolve the threads and record an
+            # exact-HEAD review-disposition; no further repair round is opened.
+            active["ship"] = {
+                **ship,
+                "phase": "needs-fix",
+                "head": preflight.head,
+                "review_id": review.review_id,
+                "finding_count": finding_count,
+                "findings": findings,
+                "fix_rounds": fix_rounds,
+            }
+        else:
+            active["ship"] = {**ship, "phase": "needs_human", "reason": copilot.reason}
         _save_runs(state_path, state)
         workflow_registry._manager_update_workflow_run(
             canonical_run.run_id,
@@ -10591,6 +11294,19 @@ def _ship_action(
             if copilot.reason == "copilot-finding-budget-exhausted"
             else {}
         )
+        if copilot.reason == "copilot-finding-budget-exhausted":
+            return {
+                "action": "needs_human",
+                "reason": copilot.reason,
+                **extra,
+                "head": preflight.head,
+                "next_actions": list(extra["legal_next_steps"]),
+                "next_step_hint": (
+                    "先確認 PR review threads 全部 resolved，再由 operator 提交 exact-HEAD 裁決："
+                    f"cortex work review-disposition {canonical_run.work_id} "
+                    f"--repo {authority.repo} --actor <operator> --reason '<理由>'"
+                ),
+            }
         res = {"action": "needs_human", "reason": copilot.reason, **extra}
         if str(copilot.reason or "").startswith("copilot-"):
             return _copilot_ship_needs_human_response(
@@ -10675,6 +11391,7 @@ def _ship_action(
         "change": change,
         "todo_paths": list(todo_paths_value),
         "merge_authorization": authorization,
+        "preflight_result": _preflight_cache_record(preflight),
     }
     _save_runs(state_path, state)
     ship = active["ship"]
@@ -10690,7 +11407,7 @@ def _ship_action(
             copilot=copilot,
             foreign_review=foreign_review,
         )
-    except RuntimeError:
+    except RuntimeError as exc:
         post_merge = github.fetch_merge_status(repo=authority.repo, pr_number=pr_number)
         if (
             not post_merge.merged
@@ -10704,6 +11421,20 @@ def _ship_action(
                 remote=remote,
             )
         ):
+            retry = _record_provider_stale_retry(
+                error=exc,
+                active=active,
+                state=state,
+                state_path=state_path,
+                canonical_run=canonical_run,
+                authority=authority,
+                workflow_registry=workflow_registry,
+                now=now,
+                head=preflight.head,
+                tree_hash=preflight.tree_hash,
+            )
+            if retry is not None:
+                return retry
             raise
         merged = SimpleNamespace(
             expected_head=preflight.head,
@@ -10713,7 +11444,7 @@ def _ship_action(
         post_merge = github.fetch_merge_status(repo=authority.repo, pr_number=pr_number)
         if not post_merge.merged or post_merge.pr_head != preflight.head:
             raise RuntimeError("merge side effect is not visible on exact PR HEAD")
-    active["ship"] = {
+    merged_ship = {
         **ship,
         "phase": "merged",
         "head": merged.expected_head,
@@ -10725,6 +11456,13 @@ def _ship_action(
         "todo_paths": list(todo_paths_value),
         "merge_authorization": authorization,
     }
+    for field in (
+        "provider_stale_retry_attempts",
+        "provider_stale_retry_after_epoch",
+        "provider_stale_retry_last_reason",
+    ):
+        merged_ship.pop(field, None)
+    active["ship"] = merged_ship
     _save_runs(state_path, state)
     return {"action": "merged-awaiting-closure", "head": merged.expected_head}
 
@@ -11013,6 +11751,7 @@ def execute_work_action(
                 now=now,
                 state_path=resolved_state_path,
                 workflow_registry=workflow_registry,
+                snapshot_path=snapshot_path,
             )
         )
     return {

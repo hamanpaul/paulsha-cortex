@@ -117,6 +117,52 @@ class ConsumerPredicateTests(unittest.TestCase):
             )
         )
 
+    def test_full_suite_age_is_checked_at_preflight_start(self) -> None:
+        """A slow policy gate must not expire evidence after skip-tests is admitted."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            root.mkdir()
+            candidate = _make_repo(root)
+            tree_hash = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", f"{candidate}^{{tree}}"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip().lower()
+            preflight.record_external_full_suite_evidence(
+                tree_hash=tree_hash,
+                command=("python3", "-m", "pytest", "-q"),
+                completed_at_epoch=100.0,
+                state_root=Path(tmp) / "state",
+            )
+            now = {"epoch": 1000.0}
+            calls: list[tuple[str, ...]] = []
+
+            def delayed_runner(argv, **kwargs):
+                calls.append(tuple(argv))
+                if tuple(argv[:3]) == ("python3", "-m", "policy_check"):
+                    now["epoch"] = 2001.0
+                    return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+                if argv[0] == "pytest":
+                    self.assertIn("--skip-tests", argv)
+                    return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+                return subprocess.run(argv, **kwargs)
+
+            result = preflight.run_preflight(
+                repo_root=root,
+                command=("pytest",),
+                request=preflight.PreflightRequest(pr_number=8, skip_tests=True),
+                runner=delayed_runner,
+                now=lambda: now["epoch"],
+                evidence_state_root=Path(tmp) / "state",
+            )
+
+            self.assertTrue(result.passed)
+            self.assertEqual(result.head, candidate)
+            self.assertGreater(now["epoch"] - 100.0, preflight.DEFAULT_FULL_SUITE_MAX_AGE_SECONDS)
+            self.assertTrue(any(argv[0] == "pytest" and "--skip-tests" in argv for argv in calls))
+
 
 class ProducerTests(unittest.TestCase):
     def _job(self, log="/l/x.jsonl"):

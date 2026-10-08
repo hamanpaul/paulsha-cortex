@@ -337,6 +337,7 @@ def _ship_lane(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, copilot_revie
             now=lambda: now,
             state_path=journal,
             workflow_registry=registry,
+            snapshot_path=snapshot,
         )
 
     def ship_validator(*, run, candidate):

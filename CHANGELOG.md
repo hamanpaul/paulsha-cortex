@@ -10,6 +10,8 @@
 ### Fixed
 
 - **cortex 進件：序列模式穩定版實測的四張票**：登記 work item `ship-preflight-evidence`（#1366，ship 階段 preflight 失敗留下 evidence）、`status-work-id-label`（#1367，`cortex inspect status` 摘要行以 work_id 標示）、`readme-dangling-refs`（#1368，清除 README 的 R-22 懸空引用）、`release-user-level-profile`（#1371，release workflow 新增使用者層級發版模式），各附 accepted 的 spec、design 與 todo。owner 2026-10-08 裁決以這批票逐張實測，平均每張人工介入不超過 1 次才發使用者層級的 0.1.14。
+- **#1365 retry-review 涵蓋所有 review 卡**：重設 review phase 時解除所有非 active 舊 attempt 的 evidence 綁定；持久化的 handoff 分類讓 periodic tick 也能逐張重派，原始 evidence 檔保留供稽核（見 `changelog.d/retry-review-all-review-cards.md`）。
+- **#1363 autosync 後恢復既有 PR 的 retry-build**：Builder admission 在精確綁定本 run 的 delivery journal 缺少 legacy `delivery_binding` 時，改從唯一 `WorkflowRun.pr_refs` 取得 PR 編號；Manager push 的 run／claim 綁定、候選 ancestry 與目前唯一 open PR 仍須吻合，PR 改綁、issue 關閉或 Todo path 改綁仍會拒絕（見 `changelog.d/builder-admission-after-autosync.md`）。
 - **cortex 進件：#1363 PR 已存在的 run 的 Builder admission、#1365 retry-review 涵蓋所有 review 卡**：登記 work item `builder-admission-after-autosync`、`retry-review-all-review-cards` 與 accepted todo（見 `changelog.d/cortex-intake-1363.md`）。
 - **#1360 authority-restart 後恢復既有 PR run**：claim era 經 WorkAuthority 驗證後，resume 同步 delivery journal active row 的 `claim_key`；retry-review 後的 explicit resume 也會派出替代 review job，交付目標變更仍 fail closed（見 `changelog.d/pr-authority-rebind-v2.md`）。
 - **cortex 進件：#1360 PR 已存在的 run 的 resume（#1339 重做）**：登記 work item `pr-authority-rebind-v2` 與 accepted todo（見 `changelog.d/cortex-intake-1360.md`）。
@@ -17,11 +19,13 @@
 - **cortex 進件：#1345 自動同步後 review 收割與 repair build 不認 autosync job**：登記 work item `autosync-source-job-unify` 與 accepted todo（見 `changelog.d/cortex-intake-1345.md`）。
 - **#1345 自動同步 candidate source 統一**：成功的 `main-sync-autosync` Manager ship job 與 `openspec-archive` 同為 review binding、verification context 及 retry-build branch/base 的合法來源；保留 exact run/repo/Candidate、成功狀態與 typed ship evidence 檢查（見 `changelog.d/autosync-source-job-unify.md`）。
 - **cortex 進件：#1339、#1340、#1342**：PR 變動後 resume 失效、依賴牆鐘的測試、Copilot 修正輪數把同步 main 算進去；登記三個 work item 與 accepted todo（見 `changelog.d/cortex-intake-batch-20261007.md`）。
+- **#1342 Copilot 修正輪數與裁決出口**：只將回應 finding 的修正計入 repair budget；main autosync 與 retry-build 純 main merge 不計入。budget 用完後仍要求新 HEAD 的 Copilot review，若仍有 findings 則提供 exact-HEAD `review-disposition`（見 `changelog.d/copilot-fix-round-accounting.md`）。
 - **#1336 clean-behind 自動同步後派出 verification**：成功的 `main-sync-autosync` Manager job 可作為 exact Candidate 的 reviewer 來源，verify tick 會沿用其 branch 並把新 Candidate 當作後續 build base；同步前 build ledger 綁定舊 Candidate，不會傳給 verifier，verification 對合併後 Candidate 自行執行檢查（見 `changelog.d/main-sync-reverify-builder-context.md`）。
 - **#1334 clean-behind 自動同步的 Git 身分**：merge 以 `-c user.name`／`-c user.email` 明確帶入設定的 `PSC_MAIN_SYNC_GIT_IDENTITY`（`Name <email>`）或來源 checkout 的有效身分；ship clone 複製來源 checkout 實際生效的身分；上限只計成功建立新 Candidate 的同步。
 - **cortex 進件：#1336 自動同步後 verification 找不到來源 job、#1338 被終止的 repair build 無法恢復**：登記 work item `main-sync-reverify-builder-context`、`retry-build-killed-repair` 與 accepted todo，交給 cortex 派工（見 `changelog.d/cortex-intake-1336.md`）。
 - **cortex 進件：#1334 clean-behind 自動同步的 committer 身分**：登記 work item `main-sync-committer-identity` 與 accepted todo，交給 cortex 派工（見 `changelog.d/cortex-intake-1334.md`）。
 - **cortex 進件：#1322 ship 在 preflight 後重新取得 WorkAuthority**：登記 work item `delivery-authority-refresh` 與 accepted todo，交給 cortex 派工（見 `changelog.d/cortex-intake-1322.md`）。
+- **#1322 ship preflight 後刷新 WorkAuthority 並重用 merge 授權**：preflight 完成後重新載入 authority，確認 PR／issue／todo／source revision、HEAD 與 tree 一致後才繼續；同一候選已有 immutable merge authorization 時跳過重跑 preflight，provider stale 以遞增 backoff 重試，五次仍未恢復才轉 needs_human。新增耗時 preflight、full-suite evidence 時間邊界與 snapshot 損毀時 fail-closed 的回歸測試；修正此分支建立診斷時重複傳入 `detail` 導致 workflow run 未更新（見 `changelog.d/delivery-authority-refresh.md`）。
 - **#1311 ship clean-behind 自動同步**：Manager 在受控 ship clone 合入已 probe 的 exact `origin/main`，只重跑 verify 與 ship probe 並沿用原 foreign review；每 run 預設上限 3 次（`PSC_MAIN_SYNC_AUTOSYNC_MAX` 可設 0–10），main SHA、次數、新 Candidate 與停止原因寫入 evidence，`cortex work show` 可檢視。
 - **cortex 進件：派工穩定性第二批 #1311–#1314、#1319–#1321**：登記七個 work item 與 accepted todo，交給 cortex 平行派工（見 `changelog.d/cortex-intake-batch-20261006c.md`）。
 - **#1297 copilot 健康檢查程序逾時後連同子程序一起回收**：`paulsha_cortex/coordinator/executor_auth.py` 與 `paulsha_cortex/porcelain/bootstrap.py` 的 probe 改共用 `run_probe` runner；一律在獨立 session／process group 執行（`start_new_session=True`），逾時或發生例外時對整個 process group 先送 SIGTERM、短暫等待後送 SIGKILL 並等待回收，防止 node wrapper 終止後 native `copilot-linux-x64` 子程序殘留（見 `changelog.d/copilot-probe-reap.md`）（#1297）。
@@ -47,6 +51,7 @@
 
 ### Added
 
+- **#1309 task-memory 逐則處置收據**：實際送出記憶時，terminal 逐 note 回報 verdict 與原因；Manager 驗證 note 集合並只保存 reason SHA-256，漏報或格式錯誤只記 `unreported`、不改卡片結果。收據加入送出區塊 SHA-256；verify／review 的 applied 證據可引用已採信 finding key；新增填寫率、verdict 與漏報原因查詢文件；已補上 `finding:<key>` 路徑的整合測試與反例（見 `changelog.d/task-memory-disposition.md`）。
 - **v0.1.13 發版**：`VERSION` 升為 0.1.13，收錄 #1263 一鍵升級 `cortex upgrade` 與 #716 deployment canary 端到端修正（見 `changelog.d/release-0-1-13.md`）。
 - **#1263 一鍵升級 `cortex upgrade <版本>`**：root 一個指令完成 ingress → plan → apply → 憑證繼承 → activate → verify → loaded↔installed 核對，失敗自動回到前一版；新增 `--recover`／`--status`、`credentials inherit`、`effective_receipt` 與 RC 升級演練；`--release-source`／`--allow-same-version`／`--prior-receipt` 僅供 qualification（`PSC_UPGRADE_QUALIFICATION=1`）使用、無 `--repository` 參數（官方來源固定 `hamanpaul/paulsha-cortex`）；maintenance window 內 SIGHUP 與 INT／TERM 一樣觸發 rollback、`--status` 也偵測 stale lease marker（見 `changelog.d/one-command-upgrade.md`）（#1263）。
 - **#716 post-archive reviewer 不再補入過期的 active OpenSpec 檔**：archive 之後 reviewer 的 OpenSpec planning authority 輸入改讀候選自己的 archive 副本（tasks.md 只容忍 checkbox 差異，entry 不唯一／symlink／缺檔 fail-closed），不再從來源樹 seed claim 當下未勾選的 active 檔（#716）。
