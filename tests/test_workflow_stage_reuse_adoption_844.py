@@ -1000,6 +1000,13 @@ class TestS05RejectedSources:
         code_evidence_bytes = code_evidence_path.read_bytes()
         adversarial_evidence_path = harness.root / adversarial_evidence["path"]
         adversarial_evidence_bytes = adversarial_evidence_path.read_bytes()
+        # Existing stuck runs can already have a failed job whose evidence pointer
+        # survived an earlier retry-review implementation.
+        legacy_failed_job = harness.registry._find_job(adversarial_job)
+        legacy_failed_job["status"] = "failed"
+        harness.registry._persist()
+        assert harness.registry.get_job(adversarial_job)["status"] == "failed"
+        assert harness.registry.get_job(adversarial_job)["workflow_evidence"] is not None
 
         snapshot = tmp_path / "retry-review-snapshot.json"
         snapshot.write_text(
@@ -1076,12 +1083,20 @@ class TestS05RejectedSources:
         assert replacement_code["job_id"] != code_review_job
         harness.finish(replacement_code["job_id"])
 
-        resumed = harness.resume(operator_resume=True)
+        # The periodic tick that harvests code-review completion is not an
+        # operator resume, but the persisted retry classification must still
+        # force a fresh adversarial-review attempt.
+        resumed = harness.resume()
         assert isinstance(resumed.get("job_id"), str), resumed
         replacement_adversarial = harness.registry.get_job(resumed["job_id"])
         assert replacement_adversarial["workflow_card"] == "adversarial-review"
         assert replacement_adversarial["job_id"] != adversarial_job, resumed
 
+        # The remaining assertions exercise explicit retry-card/supersede paths
+        # after this handoff retry has been consumed.
+        harness.registry._manager_update_workflow_run(
+            harness.run_id, retry_classification="orchestrator_retry"
+        )
         failed_adversarial_job_id = replacement_adversarial["job_id"]
         harness.registry.update_headless_result(
             failed_adversarial_job_id, status="failed", exit_code=1

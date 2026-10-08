@@ -1,1 +1,1 @@
-- #1365：`retry-review` 會解除所有被撤換 review attempt 的 evidence 綁定；operator resume 將 retry 狀態帶過整個 review phase，逐張派出新 attempt。舊 evidence 檔仍保留供稽核。
+- #1365：`retry-review` 會解除所有非 active 舊 review attempt 的 evidence 綁定；持久化的 handoff 分類讓 periodic tick 也能逐張派出新 attempt。舊 evidence 檔仍保留供稽核。

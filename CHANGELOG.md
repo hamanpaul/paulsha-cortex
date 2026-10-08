@@ -9,7 +9,7 @@
 
 ### Fixed
 
-- **#1365 retry-review 涵蓋所有 review 卡**：重設 review phase 時解除被撤換 attempt 的 evidence 綁定，並讓 operator resume 逐張重派；原始 evidence 檔保留供稽核（見 `changelog.d/retry-review-all-review-cards.md`）。
+- **#1365 retry-review 涵蓋所有 review 卡**：重設 review phase 時解除所有非 active 舊 attempt 的 evidence 綁定；持久化的 handoff 分類讓 periodic tick 也能逐張重派，原始 evidence 檔保留供稽核（見 `changelog.d/retry-review-all-review-cards.md`）。
 - **cortex 進件：#1363 PR 已存在的 run 的 Builder admission、#1365 retry-review 涵蓋所有 review 卡**：登記 work item `builder-admission-after-autosync`、`retry-review-all-review-cards` 與 accepted todo（見 `changelog.d/cortex-intake-1363.md`）。
 - **#1360 authority-restart 後恢復既有 PR run**：claim era 經 WorkAuthority 驗證後，resume 同步 delivery journal active row 的 `claim_key`；retry-review 後的 explicit resume 也會派出替代 review job，交付目標變更仍 fail closed（見 `changelog.d/pr-authority-rebind-v2.md`）。
 - **cortex 進件：#1360 PR 已存在的 run 的 resume（#1339 重做）**：登記 work item `pr-authority-rebind-v2` 與 accepted todo（見 `changelog.d/cortex-intake-1360.md`）。

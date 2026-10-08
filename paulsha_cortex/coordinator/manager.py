@@ -17937,9 +17937,11 @@ def resume_workflow_run(
                 "retry_after_epoch": active.deadline_epoch,
             }
     pre_resume_gate_status = run.gate_status
+    # #1365：retry-review persists this classification across the entire review
+    # phase. Periodic ticks must keep forcing replacement attempts after an
+    # earlier card completes; they do not carry operator_resume=True.
     retry_failed = bool(
-        operator_resume
-        and run.current_phase == "review"
+        run.current_phase == "review"
         and run.retry_classification == "review_handoff_failure"
     )
     recovery_job_id: str | None = None
