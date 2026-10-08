@@ -10,6 +10,9 @@
 ### Fixed
 
 - **#1340 qualification lifecycle 測試固定時鐘**：receipt 核可與撤銷測試以固定時鐘驗證 `reviewed_at` 邊界，避免讀取牆鐘造成偶發 future timestamp（見 `changelog.d/qualification-test-fixed-clock.md`）。
+- **#1360 authority-restart 後恢復既有 PR run**：claim era 經 WorkAuthority 驗證後，resume 同步 delivery journal active row 的 `claim_key`；retry-review 後的 explicit resume 也會派出替代 review job，交付目標變更仍 fail closed（見 `changelog.d/pr-authority-rebind-v2.md`）。
+- **cortex 進件：#1360 PR 已存在的 run 的 resume（#1339 重做）**：登記 work item `pr-authority-rebind-v2` 與 accepted todo（見 `changelog.d/cortex-intake-1360.md`）。
+- **#1356 autosync 後以新 Candidate 重跑 review**：自動同步會同時重開 verify 與 code-review、清除舊 foreign-review，再以新 Candidate 進入 ship probe；Candidate 來源分類改用 #1345 共用 helper，保留 exact-run／Candidate／成功狀態與 evidence 驗證（見 `changelog.d/autosync-carry-forward-review.md`）。
 - **cortex 進件：#1345 自動同步後 review 收割與 repair build 不認 autosync job**：登記 work item `autosync-source-job-unify` 與 accepted todo（見 `changelog.d/cortex-intake-1345.md`）。
 - **#1345 自動同步 candidate source 統一**：成功的 `main-sync-autosync` Manager ship job 與 `openspec-archive` 同為 review binding、verification context 及 retry-build branch/base 的合法來源；保留 exact run/repo/Candidate、成功狀態與 typed ship evidence 檢查（見 `changelog.d/autosync-source-job-unify.md`）。
 - **cortex 進件：#1339、#1340、#1342**：PR 變動後 resume 失效、依賴牆鐘的測試、Copilot 修正輪數把同步 main 算進去；登記三個 work item 與 accepted todo（見 `changelog.d/cortex-intake-batch-20261007.md`）。
