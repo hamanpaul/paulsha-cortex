@@ -146,6 +146,11 @@ def _claude_review_json_schema(kind: str) -> str:
     # 為 false，不開就交不出來）；是否採用、note 是否已交付、evidence 是否在審查對象
     # 內且 hash 相符，全由 manager harvest 端驗證，結果不影響 verdict。
     schema["properties"]["task_memory_applied"] = task_memory.task_memory_applied_json_schema()
+    # Disposition is required by the per-attempt Manager prompt only when a note was
+    # delivered; keep the structured-output schema able to carry that conditional field.
+    schema["properties"]["task_memory_disposition"] = (
+        task_memory.task_memory_disposition_json_schema()
+    )
     return json.dumps(schema, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
 
 

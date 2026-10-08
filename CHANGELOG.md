@@ -10,6 +10,7 @@
 ### Fixed
 
 - **#1365 retry-review 涵蓋所有 review 卡**：重設 review phase 時解除所有非 active 舊 attempt 的 evidence 綁定；持久化的 handoff 分類讓 periodic tick 也能逐張重派，原始 evidence 檔保留供稽核（見 `changelog.d/retry-review-all-review-cards.md`）。
+- **#1363 autosync 後恢復既有 PR 的 retry-build**：Builder admission 在精確綁定本 run 的 delivery journal 缺少 legacy `delivery_binding` 時，改從唯一 `WorkflowRun.pr_refs` 取得 PR 編號；Manager push 的 run／claim 綁定、候選 ancestry 與目前唯一 open PR 仍須吻合，PR 改綁、issue 關閉或 Todo path 改綁仍會拒絕（見 `changelog.d/builder-admission-after-autosync.md`）。
 - **cortex 進件：#1363 PR 已存在的 run 的 Builder admission、#1365 retry-review 涵蓋所有 review 卡**：登記 work item `builder-admission-after-autosync`、`retry-review-all-review-cards` 與 accepted todo（見 `changelog.d/cortex-intake-1363.md`）。
 - **#1360 authority-restart 後恢復既有 PR run**：claim era 經 WorkAuthority 驗證後，resume 同步 delivery journal active row 的 `claim_key`；retry-review 後的 explicit resume 也會派出替代 review job，交付目標變更仍 fail closed（見 `changelog.d/pr-authority-rebind-v2.md`）。
 - **cortex 進件：#1360 PR 已存在的 run 的 resume（#1339 重做）**：登記 work item `pr-authority-rebind-v2` 與 accepted todo（見 `changelog.d/cortex-intake-1360.md`）。
@@ -48,6 +49,7 @@
 
 ### Added
 
+- **#1309 task-memory 逐則處置收據**：實際送出記憶時，terminal 逐 note 回報 verdict 與原因；Manager 驗證 note 集合並只保存 reason SHA-256，漏報或格式錯誤只記 `unreported`、不改卡片結果。收據加入送出區塊 SHA-256；verify／review 的 applied 證據可引用已採信 finding key；新增填寫率、verdict 與漏報原因查詢文件；已補上 `finding:<key>` 路徑的整合測試與反例（見 `changelog.d/task-memory-disposition.md`）。
 - **v0.1.13 發版**：`VERSION` 升為 0.1.13，收錄 #1263 一鍵升級 `cortex upgrade` 與 #716 deployment canary 端到端修正（見 `changelog.d/release-0-1-13.md`）。
 - **#1263 一鍵升級 `cortex upgrade <版本>`**：root 一個指令完成 ingress → plan → apply → 憑證繼承 → activate → verify → loaded↔installed 核對，失敗自動回到前一版；新增 `--recover`／`--status`、`credentials inherit`、`effective_receipt` 與 RC 升級演練；`--release-source`／`--allow-same-version`／`--prior-receipt` 僅供 qualification（`PSC_UPGRADE_QUALIFICATION=1`）使用、無 `--repository` 參數（官方來源固定 `hamanpaul/paulsha-cortex`）；maintenance window 內 SIGHUP 與 INT／TERM 一樣觸發 rollback、`--status` 也偵測 stale lease marker（見 `changelog.d/one-command-upgrade.md`）（#1263）。
 - **#716 post-archive reviewer 不再補入過期的 active OpenSpec 檔**：archive 之後 reviewer 的 OpenSpec planning authority 輸入改讀候選自己的 archive 副本（tasks.md 只容忍 checkbox 差異，entry 不唯一／symlink／缺檔 fail-closed），不再從來源樹 seed claim 當下未勾選的 active 檔（#716）。
