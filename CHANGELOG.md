@@ -9,7 +9,7 @@
 
 ### Fixed
 
-- **cortex 進件：序列模式穩定版實測的三張票**：登記 work item `ship-preflight-evidence`（#1366，ship 階段 preflight 失敗留下 evidence）、`status-work-id-label`（#1367，`cortex inspect status` 摘要行以 work_id 標示）、`readme-dangling-refs`（#1368，清除 README 的 R-22 懸空引用），各附 accepted 的 spec、design 與 todo。owner 2026-10-08 裁決以這批票逐張實測，平均每張人工介入不超過 1 次才發 release。
+- **cortex 進件：序列模式穩定版實測的四張票**：登記 work item `ship-preflight-evidence`（#1366，ship 階段 preflight 失敗留下 evidence）、`status-work-id-label`（#1367，`cortex inspect status` 摘要行以 work_id 標示）、`readme-dangling-refs`（#1368，清除 README 的 R-22 懸空引用）、`release-user-level-profile`（#1371，release workflow 新增使用者層級發版模式），各附 accepted 的 spec、design 與 todo。owner 2026-10-08 裁決以這批票逐張實測，平均每張人工介入不超過 1 次才發使用者層級的 0.1.14。
 - **cortex 進件：#1363 PR 已存在的 run 的 Builder admission、#1365 retry-review 涵蓋所有 review 卡**：登記 work item `builder-admission-after-autosync`、`retry-review-all-review-cards` 與 accepted todo（見 `changelog.d/cortex-intake-1363.md`）。
 - **#1360 authority-restart 後恢復既有 PR run**：claim era 經 WorkAuthority 驗證後，resume 同步 delivery journal active row 的 `claim_key`；retry-review 後的 explicit resume 也會派出替代 review job，交付目標變更仍 fail closed（見 `changelog.d/pr-authority-rebind-v2.md`）。
 - **cortex 進件：#1360 PR 已存在的 run 的 resume（#1339 重做）**：登記 work item `pr-authority-rebind-v2` 與 accepted todo（見 `changelog.d/cortex-intake-1360.md`）。

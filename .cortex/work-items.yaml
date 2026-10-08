@@ -1869,3 +1869,15 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/specs/readme-dangling-refs-design.md'
     excludes: []
+  release-user-level-profile:
+    title: 'release-user-level-profile'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1371'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/release-user-level-profile/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/release-user-level-profile-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/release-user-level-profile-design.md'
+    excludes: []
