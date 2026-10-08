@@ -6583,13 +6583,16 @@ class JobRegistry:
             if (
                 job.get("workflow_run_id") == current.run_id
                 and job.get("workflow_phase") == "review"
-                and job.get("status") == "exited"
+                and job.get("status") in {"exited", "failed"}
             ):
-                if reviewer_recovery_checker is not None and reviewer_recovery_checker(
-                    job, current
-                ):
-                    continue
-                job["status"] = "failed"
+                preserve_recovery = (
+                    job.get("status") == "exited"
+                    and reviewer_recovery_checker is not None
+                    and reviewer_recovery_checker(job, current)
+                )
+                job["workflow_evidence"] = None
+                if not preserve_recovery:
+                    job["status"] = "failed"
         steps = tuple(
             replace(step, gate_result="pending") if step.phase == "review" else step
             for step in current.steps
