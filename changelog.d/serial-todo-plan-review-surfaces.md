@@ -1,0 +1,1 @@
+- **cortex 進件修正：序列實測四張票的 todo 通過 Yellow plan review**：#1366、#1367、#1368、#1371 的 todo 在 task 文字中補上 `artifact_classes` 對應的 acceptance surface（source／tests／documentation），以及 R-16（cli）、R-19（測試）的契約檢查 task。原本 Yellow 機械 plan review 判定 `plan-review-retry-completeness`，run 停在 plan 階段無限重試、不派 job，也不轉 needs_human。

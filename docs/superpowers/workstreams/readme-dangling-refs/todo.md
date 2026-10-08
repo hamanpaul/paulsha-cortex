@@ -18,8 +18,9 @@ artifact_classes:
 
 ## Tasks
 
-- [ ] **T1 盤點**：在候選 worktree 執行 `env -u PYTHONPATH python3 -m policy_check --repo .`，在候選的 base 與目前 head 各記下 R-22 的總數，以及 README 每一個引用屬於 spec R1 或 R2 哪一類。
+- [ ] **T1 盤點（documentation）**：在候選 worktree 執行 `env -u PYTHONPATH python3 -m policy_check --repo .`，在候選的 base 與目前 head 各記下 R-22 的總數，以及 README 每一個引用屬於 spec R1 或 R2 哪一類。
 - [ ] **T2 改寫 repo 內路徑**：依 spec R1 把 README 中 repo 內檔案的引用改成完整路徑；`model-identities.yaml` 逐處判斷。
 - [ ] **T3 標示 runtime 檔名**：依 spec R2 在指向 runtime 檔案的行尾加 `<!-- doc-drift-ignore -->`；同一行兩類並存時依 design D3 處理。
 - [ ] **T4 驗收**：重跑 policy_check，R-22 輸出沒有 `README.md ->`，總數比 base 少了 base 上 README 的筆數；把兩邊的總數寫進 terminal reason。
-- [ ] **T5 文件**：新增 `changelog.d/readme-dangling-refs.md`，並同步 `CHANGELOG.md [Unreleased]`。
+- [ ] **T5 文件（documentation）**：新增 `changelog.d/readme-dangling-refs.md`，並同步 `CHANGELOG.md [Unreleased]`。
+- [ ] **T6 CLI 契約與測試（R-16 cli、R-19 測試）**：確認本票沒有修改任何 CLI 參數與 help；並執行完整 `pytest`（`env -u PYTHONPATH`），確認文件修改沒有讓任何 test 失敗。
