@@ -1,0 +1,2 @@
+- 進件：`builder-admission-after-autosync`（#1363），PR 已存在且經過 autosync 的 run 能 retry-build。
+- 進件：`retry-review-all-review-cards`（#1365），retry-review 涵蓋所有 review 卡，舊 attempt 帶 evidence 時要能重派。

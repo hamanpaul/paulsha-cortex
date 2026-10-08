@@ -1,0 +1,3 @@
+### Fixed
+
+- **#1295 `cortex upgrade` 不再因 operator `umask 077` 產生不可執行的新 venv**：candidate installer 建立或重用 `/opt/cortex/venvs/<wheel sha>/` 時，會明確把 root 持有的目錄與 executable 修成 `0755`、其他一般檔修成 `0644`，並在重用既有同 sha slot 時就地修正先前留下的過窄權限後再 cutover；`cortex upgrade` 的 candidate 子程序改帶明確 `umask 0022`，敏感 receipt／evidence／credential 檔仍維持 writer 自設的 `0600`。`trust-root verify` 對 `activating`／`203/EXEC` 類型的 service 啟動失敗，現在會把最新 journal reason 一併寫進 FAIL JSON 與 upgrade report。RC qualification 改先安裝不同 wheel SHA 的同版 synthetic prior、在呼叫端 `umask 077` 下暖機一次 fresh-create candidate slot，再把暖機後的 candidate receipt 當 same-artifact prior 執行 rollback/full-upgrade pair；`install-semantic-checks.json` 另寫 `prior_receipt_id` 當獨立 anchor，避免 rollback evidence 接受 foreign prior receipt（#1295）。
