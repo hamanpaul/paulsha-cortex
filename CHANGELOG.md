@@ -9,6 +9,7 @@
 
 ### Fixed
 
+- **#1366 ship preflight 失敗證據**：policy、ci-parity、tree-race 失敗時沿用 pr-preflight 格式寫入 evidence，並在原有錯誤訊息附上路徑；evidence 寫入失敗時仍保留 preflight failure。
 - **cortex 進件修正：序列實測四張票的 todo 通過 Yellow plan review**：#1366、#1367、#1368、#1371 的 todo 在 task 文字中補上 `artifact_classes` 對應的 acceptance surface（source／tests／documentation），以及 R-16（cli）、R-19（測試）的契約檢查 task。原本 Yellow 機械 plan review 判定 `plan-review-retry-completeness`，run 停在 plan 階段無限重試、不派 job，也不轉 needs_human。
 - **cortex 進件：序列模式穩定版實測的四張票**：登記 work item `ship-preflight-evidence`（#1366，ship 階段 preflight 失敗留下 evidence）、`status-work-id-label`（#1367，`cortex inspect status` 摘要行以 work_id 標示）、`readme-dangling-refs`（#1368，清除 README 的 R-22 懸空引用）、`release-user-level-profile`（#1371，release workflow 新增使用者層級發版模式），各附 accepted 的 spec、design 與 todo。owner 2026-10-08 裁決以這批票逐張實測，平均每張人工介入不超過 1 次才發使用者層級的 0.1.14。
 - **#1365 retry-review 涵蓋所有 review 卡**：重設 review phase 時解除所有非 active 舊 attempt 的 evidence 綁定；持久化的 handoff 分類讓 periodic tick 也能逐張重派，原始 evidence 檔保留供稽核（見 `changelog.d/retry-review-all-review-cards.md`）。

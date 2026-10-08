@@ -93,6 +93,7 @@ from .preflight import (
     run_preflight,
 )
 from .work_bridge import (
+    _preflight_result_evidence,
     current_sizing_snapshot,
     extract_model_chain_override,
     resolve_trusted_repo_root,
@@ -10736,7 +10737,26 @@ def _ship_action(
             now=now,
         )
         if not preflight.passed:
-            raise RuntimeError(f"ship preflight failed: {preflight.failed_stage}")
+            try:
+                evidence = _preflight_result_evidence(
+                    state_root=state_path.resolve().parent,
+                    run=canonical_run,
+                    candidate=preflight.head,
+                    stage="ship",
+                    preflight=preflight,
+                    status="needs_human",
+                    reason="ship-preflight-failed",
+                )
+                evidence_path = evidence["ref"]
+            except Exception as exc:
+                raise RuntimeError(
+                    f"ship preflight failed: {preflight.failed_stage} "
+                    f"(evidence write failed: {type(exc).__name__})"
+                ) from None
+            raise RuntimeError(
+                f"ship preflight failed: {preflight.failed_stage} "
+                f"(evidence: {evidence_path})"
+            )
 
     refreshed_authority = _refresh_ship_authority_after_preflight(
         authority=authority,
