@@ -918,11 +918,11 @@ def test_copilot_request_outcome_unknown_actions_pass_formal_admission(
     )
 
 
-def test_copilot_finding_budget_exhausted_returns_list_shaped_next_actions(
+def test_exhausted_repair_budget_still_requests_review_for_a_new_head(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Copilot 修復預算耗盡分支回傳的 next_actions 維持 list[str]。"""
+    """上限用完後，新 exact HEAD 仍先取得 Copilot review。"""
     github, orch_holder, snapshot, state, registry, run_id, authority = _setup_ship_env(
         tmp_path, monkeypatch, reviews=(), threads=()
     )
@@ -974,29 +974,232 @@ def test_copilot_finding_budget_exhausted_returns_list_shaped_next_actions(
         now=1000.0,
     )
 
-    assert github.request_copilot_calls == 0
-    assert result.get("action") == "needs_human"
-    assert result.get("reason") == "copilot-finding-budget-exhausted"
-    next_actions = result.get("next_actions", ())
-    assert isinstance(next_actions, list)
-    assert next_actions == ["ship"]
-    _assert_next_actions_admitted(
-        tmp_path,
-        response=result,
-        snapshot=snapshot,
-        state=state,
-        registry=registry,
-        now=1001.0,
-    )
-    assert result.get("repair_rounds_used") == 3
-    assert result.get("repair_rounds_budget") == 2
-    assert result.get("repair_rounds_remaining") == 0
+    assert github.request_copilot_calls == 1
+    assert result == {"action": "awaiting-copilot", "head": next_head}
 
     updated = _journal_row(state, run_id)
-    assert updated["repair_rounds"] == 3
-    assert updated["ship"]["phase"] == "needs_human"
-    assert updated["ship"]["reason"] == "copilot-finding-budget-exhausted"
+    assert updated["repair_rounds"] == 2
+    assert updated["ship"]["phase"] == "review-requested"
     assert updated["ship"]["head"] == next_head
+
+
+def test_exhausted_repair_budget_routes_new_review_findings_to_disposition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    next_head = "c" * 40
+    review = CopilotReview(
+        review_id=43,
+        commit_id=next_head,
+        state="COMMENTED",
+        body="Found an issue.",
+        author=COPILOT_REVIEWER_LOGIN,
+        submitted_at_epoch=900.0,
+    )
+    thread = ReviewThread(
+        thread_id="thread-budget",
+        resolved=False,
+        outdated=False,
+        path="src/app.py",
+        line=42,
+        body_excerpt="Possible NoneType dereference.",
+    )
+    github, _orch_holder, _snapshot_path, state, registry, run_id, authority = _setup_ship_env(
+        tmp_path, monkeypatch, reviews=(review,), threads=(thread,)
+    )
+    work_actions._load_work_run(
+        state_path=state,
+        workflow_registry=registry,
+        authority=authority,
+    )
+    row = _journal_row(state, run_id)
+    row["repair_rounds"] = 2
+    row["ship"] = {"phase": "needs-fix", "head": HEAD}
+    _write_journal_row(state, run_id, row)
+    monkeypatch.setattr(
+        work_actions,
+        "run_preflight",
+        lambda **kwargs: PreflightResult(
+            passed=True,
+            failed_stage=None,
+            policy=CommandResult(("policy",), 0, "", ""),
+            ci_parity=CommandResult(("preflight",), 0, "", ""),
+            head=next_head,
+            tree_hash="d" * 40,
+        ),
+    )
+    github.fetch_delivery_facts = lambda **kwargs: DeliveryFacts(
+        head=next_head,
+        mergeable=True,
+        mergeable_state="clean",
+        checks=(GitHubCheck("pytest", "completed", "success"),),
+        copilot_reviews=(review,),
+        review_threads=(thread,),
+        closing_issues=(12,),
+        active_openspec_absent=True,
+        archive_present=True,
+        openspec_required=False,
+    )
+
+    result = _invoke_ship(
+        tmp_path,
+        authority=authority,
+        state=state,
+        registry=registry,
+        now=1000.0,
+    )
+
+    assert github.request_copilot_calls == 0
+    assert result["action"] == "needs_human"
+    assert result["reason"] == "copilot-finding-budget-exhausted"
+    assert result["repair_rounds_used"] == 2
+    assert result["next_actions"] == ["review-disposition"]
+    assert result["next_step_hint"].startswith("先確認 PR review threads 全部 resolved")
+    updated = _journal_row(state, run_id)
+    assert updated["repair_rounds"] == 2
+    assert updated["ship"]["phase"] == "needs-fix"
+    assert updated["ship"]["head"] == next_head
+    assert updated["ship"]["review_id"] == review.review_id
+    assert updated["ship"]["findings"] == [
+        {
+            "path": "src/app.py",
+            "line": 42,
+            "body": "Possible NoneType dereference.",
+        }
+    ]
+    assert "review-disposition" in work_actions._phase_recovery_actions(
+        registry.get_workflow_run(run_id), registry, authority
+    )
+
+
+def test_one_repair_and_three_autosyncs_count_one_repair_round(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    github, _orch_holder, _snapshot_path, state, registry, run_id, authority = _setup_ship_env(
+        tmp_path, monkeypatch, reviews=(), threads=()
+    )
+    work_actions._load_work_run(
+        state_path=state,
+        workflow_registry=registry,
+        authority=authority,
+    )
+    repaired_head = "b" * 40
+    row = _journal_row(state, run_id)
+    row["repair_rounds"] = 1
+    row["ship"] = {"phase": "needs-fix", "head": repaired_head}
+    _write_journal_row(state, run_id, row)
+
+    current_head = repaired_head
+    refs: list[str] = []
+    for sync_number, candidate_head in enumerate(
+        ("c" * 40, "d" * 40, "e" * 40), start=1
+    ):
+        if sync_number > 1:
+            row = _journal_row(state, run_id)
+            row["ship"] = {**row["ship"], "phase": "needs-fix", "head": current_head}
+            _write_journal_row(state, run_id, row)
+        payload = {
+            "schema": work_bridge.MAIN_SYNC_AUTOSYNC_EVIDENCE_SCHEMA,
+            "run_id": run_id,
+            "outcome": "merged",
+            "sync_number": sync_number,
+            "candidate_before": current_head,
+            "main_head": f"{sync_number + 5:x}" * 40,
+            "candidate_after": candidate_head,
+            "review_candidate": current_head,
+            "review_evidence_ref": f"/evidence/review/{sync_number}.json",
+            "review_evidence_hash": f"{sync_number + 1:x}" * 64,
+        }
+        digest = work_actions.verification.canonical_json_hash(payload)
+        evidence = state.parent / "evidence" / "main-sync-autosync" / f"{digest}.json"
+        evidence.parent.mkdir(parents=True, exist_ok=True)
+        evidence.write_text(
+            json.dumps({"payload": payload, "hash": digest}, sort_keys=True),
+            encoding="utf-8",
+        )
+        refs.append(str(evidence))
+        registry._manager_update_workflow_run(
+            run_id,
+            evidence_refs=tuple(refs),
+        )
+        current_head = candidate_head
+        monkeypatch.setattr(
+            work_actions,
+            "run_preflight",
+            lambda **kwargs: PreflightResult(
+                passed=True,
+                failed_stage=None,
+                policy=CommandResult(("policy",), 0, "", ""),
+                ci_parity=CommandResult(("preflight",), 0, "", ""),
+                head=current_head,
+                tree_hash="f" * 40,
+            ),
+        )
+        github.fetch_delivery_facts = lambda **kwargs: DeliveryFacts(
+            head=current_head,
+            mergeable=True,
+            mergeable_state="clean",
+            checks=(GitHubCheck("pytest", "completed", "success"),),
+            copilot_reviews=(),
+            review_threads=(),
+            closing_issues=(12,),
+            active_openspec_absent=True,
+            archive_present=True,
+            openspec_required=False,
+        )
+        result = _invoke_ship(
+            tmp_path,
+            authority=authority,
+            state=state,
+            registry=registry,
+            now=1000.0 + sync_number,
+        )
+        assert result == {"action": "awaiting-copilot", "head": candidate_head}
+        assert _journal_row(state, run_id)["repair_rounds"] == 1
+
+    assert github.request_copilot_calls == 3
+    final = _journal_row(state, run_id)
+    assert final["repair_rounds"] == 1
+    assert final["ship"]["head"] == current_head
+
+
+def test_retry_build_main_merge_head_is_not_a_repair_round(tmp_path: Path) -> None:
+    previous_head = "a" * 40
+    main_head = "b" * 40
+    merge_head = "c" * 40
+    repair_head = "d" * 40
+    run = SimpleNamespace(
+        run_id="run-main-sync",
+        evidence_refs=(),
+        main_sync_repair={"candidate": previous_head, "main_head": main_head},
+    )
+
+    def runner(argv, **kwargs):
+        candidate = argv[-1]
+        parents = (
+            f"{previous_head} {main_head}"
+            if candidate == merge_head
+            else merge_head
+        )
+        return SimpleNamespace(returncode=0, stdout=parents, stderr="")
+
+    assert work_actions._main_sync_only_candidate_transition(
+        run=run,
+        previous_head=previous_head,
+        candidate_head=merge_head,
+        state_path=tmp_path / "runs.json",
+        repo_root=tmp_path,
+        runner=runner,
+    )
+    assert not work_actions._main_sync_only_candidate_transition(
+        run=run,
+        previous_head=previous_head,
+        candidate_head=repair_head,
+        state_path=tmp_path / "runs.json",
+        repo_root=tmp_path,
+        runner=runner,
+    )
 
 
 def test_adopt_existing_copilot_review_selects_latest_by_epoch_and_id(
