@@ -1,1 +1,1 @@
-- **#1307 async-long-requests**：Manager daemon 將耗時 work-action 背景執行，status 會持續回報 busy 與 `started_at`；porcelain `run` 入口對 degraded daemon 改為先拒絕，與 coordinator CLI 的 busy/stalled gate 對齊。
+- **#1307 async-long-requests**：Manager daemon 將耗時 work-action 背景執行，status 會持續回報 busy 與 `started_at`；porcelain `run` 與 `recover` 入口對 degraded daemon 改為先拒絕，與 coordinator CLI 的 busy/stalled gate 對齊。

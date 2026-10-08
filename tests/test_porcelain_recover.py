@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -38,6 +40,16 @@ def control_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     control_root = tmp_path / "control"
     monkeypatch.setenv("PSC_CONTROL_ROOT", str(control_root))
     monkeypatch.setattr(contract, "generate_req_id", lambda: REQUEST_ID)
+    contract.atomic_write_json(
+        constants.status_path(),
+        contract.build_status(
+            ready=[],
+            in_flight=[],
+            recent_done=[],
+            daemon={"pid": os.getpid()},
+            updated_at=datetime.now(timezone.utc).isoformat(),
+        ),
+    )
     return control_root
 
 
@@ -370,3 +382,84 @@ def test_recover_does_not_expose_unsafe_bypass_flags(
 
     assert contract.read_json(constants.requests_dir() / f"{REQUEST_ID}.json") is None
     assert "--allow-unsafe" in capsys.readouterr().err
+
+
+def test_recover_slice_mutation_rejects_degraded_daemon_before_submission(
+    monkeypatch: pytest.MonkeyPatch,
+    control_runtime: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    control_client = importlib.import_module("paulsha_cortex.control.client")
+    submitted: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def fake_submit_request(*args, **kwargs):
+        submitted.append((args, kwargs))
+        return REQUEST_ID
+
+    monkeypatch.setattr(
+        control_client,
+        "read_status",
+        lambda: {"degraded": True, "degraded_reason": "stale"},
+    )
+    monkeypatch.setattr(control_client, "submit_request", fake_submit_request)
+    assert (
+        _run_cli(
+            [
+                "recover",
+                "slice",
+                "slice-92",
+                "retry-review",
+                "--actor",
+                "operator@example",
+            ]
+        )
+        == 1
+    )
+
+    assert submitted == []
+    assert "manager daemon 未就緒（stale）；無法處理 slice retry-review，請先啟動 daemon。" in capsys.readouterr().err
+    assert not list((control_runtime / "requests").glob("*.json"))
+
+
+def test_recover_work_mutation_rejects_degraded_daemon_before_submission(
+    monkeypatch: pytest.MonkeyPatch,
+    control_runtime: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    control_client = importlib.import_module("paulsha_cortex.control.client")
+    submitted: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def fake_submit_request(*args, **kwargs):
+        submitted.append((args, kwargs))
+        return REQUEST_ID
+
+    monkeypatch.setattr(
+        control_client,
+        "read_status",
+        lambda: {"degraded": True, "degraded_reason": "stalled"},
+    )
+    monkeypatch.setattr(control_client, "submit_request", fake_submit_request)
+    assert (
+        _run_cli(
+            [
+                "recover",
+                "work",
+                "porcelain-run-recover",
+                "abandon",
+                "--repo",
+                "hamanpaul/paulsha-cortex",
+                "--actor",
+                "operator@example",
+                "--expected-run-id",
+                "workflow-" + "c" * 20,
+                "--reason",
+                "Superseded by operator recovery.",
+            ]
+        )
+        == 1
+    )
+
+    assert submitted == []
+    assert "manager daemon 未就緒（stalled）；無法處理 work abandon，請先啟動 daemon。" in capsys.readouterr().err
+    assert not list((control_runtime / "requests").glob("*.json"))
+

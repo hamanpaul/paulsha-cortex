@@ -257,6 +257,11 @@ def test_recover_work_formal_cli_submits_the_same_registered_action(
     submitted: list[tuple[str, dict[str, object], str]] = []
     monkeypatch.setattr(
         porcelain_recover.control_client,
+        "read_status",
+        lambda: {"degraded": False},
+    )
+    monkeypatch.setattr(
+        porcelain_recover.control_client,
         "submit_request",
         lambda kind, args, actor: submitted.append((kind, args, actor)) or "req-843",
     )
@@ -327,6 +332,11 @@ def test_recover_slice_formal_cli_submits_the_same_registered_namespace_action(
     monkeypatch: pytest.MonkeyPatch, action: str
 ) -> None:
     submitted: list[tuple[str, dict[str, object], str]] = []
+    monkeypatch.setattr(
+        porcelain_recover.control_client,
+        "read_status",
+        lambda: {"degraded": False},
+    )
     monkeypatch.setattr(
         porcelain_recover.control_client,
         "submit_request",

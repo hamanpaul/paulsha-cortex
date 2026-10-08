@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -196,13 +197,21 @@ def main(argv: Sequence[str]) -> int:
 
     request_type, build_args = RECOVER_REQUESTS[args.command]
     action = f"{args.command} {args.action}"
+    status = control_client.read_status()
+    if isinstance(status, dict) and status.get("degraded"):
+        reason = status.get("degraded_reason") or "unknown"
+        print(
+            f"錯誤: manager daemon 未就緒（{reason}）；無法處理 {action}，請先啟動 daemon。",
+            file=sys.stderr,
+        )
+        return 1
     try:
         request_id = control_client.submit_request(
             request_type,
             build_args(args),
             REQUESTED_BY,
         )
-    except (OSError, UnicodeError, ValueError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
         parser.error(str(exc))
     return track_submitted_request(
         request_id,

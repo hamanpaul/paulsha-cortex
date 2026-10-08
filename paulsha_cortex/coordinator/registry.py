@@ -19,7 +19,15 @@ from typing import Any, Callable, Mapping
 
 
 def _synchronized(func: Callable) -> Callable:
-    """Acquire the JobRegistry thread lock during execution to protect in-memory structures."""
+    """Acquire the JobRegistry thread lock during execution to protect in-memory structures.
+
+    Scope:
+    - Protects in-memory data structures (_jobs, _slices, _workflows) against concurrent
+      access between the manager daemon main loop and background request worker threads.
+    - Applies to standard callables. Generator/contextmanager methods like
+      `_hold_state_transaction_lock` manage cross-process filesystem locks (fcntl.flock)
+      and are explicitly excluded from this wrapper.
+    """
 
     @functools.wraps(func)
     def wrapper(self, *args, **kwargs):
