@@ -1,0 +1,1 @@
+- **cortex 進件：序列模式穩定版實測的三張票**：登記 work item `ship-preflight-evidence`（#1366，ship 階段 preflight 失敗留下 evidence）、`status-work-id-label`（#1367，`cortex inspect status` 摘要行以 work_id 標示）、`readme-dangling-refs`（#1368，清除 README 的 R-22 懸空引用），各附 accepted 的 spec、design 與 todo。owner 2026-10-08 裁決以這批票逐張實測，平均每張人工介入不超過 1 次才發 release。
