@@ -1007,7 +1007,7 @@ def test_producer_to_snapshot_to_status_cli_end_to_end(tmp_path: Path, capsys) -
 
     assert cli.main(["inspect", "status"]) == 0
     human = capsys.readouterr().out
-    assert f"quota_decision[{run.run_id}/builder]" in human
+    assert f"quota_decision[{run.work_id} ({run.run_id})/builder]" in human
     assert "mode=shadow" in human
 
 
