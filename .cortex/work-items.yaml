@@ -1833,3 +1833,51 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/workstreams/retry-review-all-review-cards/todo.md'
     excludes: []
+  ship-preflight-evidence:
+    title: 'ship-preflight-evidence'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1366'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/ship-preflight-evidence/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/ship-preflight-evidence-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/ship-preflight-evidence-design.md'
+    excludes: []
+  status-work-id-label:
+    title: 'status-work-id-label'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1367'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/status-work-id-label/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/status-work-id-label-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/status-work-id-label-design.md'
+    excludes: []
+  readme-dangling-refs:
+    title: 'readme-dangling-refs'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1368'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/readme-dangling-refs/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/readme-dangling-refs-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/readme-dangling-refs-design.md'
+    excludes: []
+  release-user-level-profile:
+    title: 'release-user-level-profile'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1371'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/release-user-level-profile/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/release-user-level-profile-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/release-user-level-profile-design.md'
+    excludes: []

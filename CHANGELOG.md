@@ -9,6 +9,7 @@
 
 ### Fixed
 
+- **cortex 進件：序列模式穩定版實測的四張票**：登記 work item `ship-preflight-evidence`（#1366，ship 階段 preflight 失敗留下 evidence）、`status-work-id-label`（#1367，`cortex inspect status` 摘要行以 work_id 標示）、`readme-dangling-refs`（#1368，清除 README 的 R-22 懸空引用）、`release-user-level-profile`（#1371，release workflow 新增使用者層級發版模式），各附 accepted 的 spec、design 與 todo。owner 2026-10-08 裁決以這批票逐張實測，平均每張人工介入不超過 1 次才發使用者層級的 0.1.14。
 - **#1365 retry-review 涵蓋所有 review 卡**：重設 review phase 時解除所有非 active 舊 attempt 的 evidence 綁定；持久化的 handoff 分類讓 periodic tick 也能逐張重派，原始 evidence 檔保留供稽核（見 `changelog.d/retry-review-all-review-cards.md`）。
 - **#1363 autosync 後恢復既有 PR 的 retry-build**：Builder admission 在精確綁定本 run 的 delivery journal 缺少 legacy `delivery_binding` 時，改從唯一 `WorkflowRun.pr_refs` 取得 PR 編號；Manager push 的 run／claim 綁定、候選 ancestry 與目前唯一 open PR 仍須吻合，PR 改綁、issue 關閉或 Todo path 改綁仍會拒絕（見 `changelog.d/builder-admission-after-autosync.md`）。
 - **cortex 進件：#1363 PR 已存在的 run 的 Builder admission、#1365 retry-review 涵蓋所有 review 卡**：登記 work item `builder-admission-after-autosync`、`retry-review-all-review-cards` 與 accepted todo（見 `changelog.d/cortex-intake-1363.md`）。
