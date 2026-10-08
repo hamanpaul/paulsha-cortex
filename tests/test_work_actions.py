@@ -3177,6 +3177,43 @@ def test_explicit_resume_fails_closed_when_existing_pr_head_differs(
     assert len(reads) == 2
 
 
+def test_explicit_resume_reports_readback_failure_for_same_candidate(
+    tmp_path: Path,
+) -> None:
+    snapshot, state, registry, before = _prepare_existing_candidate_recovery(tmp_path)
+    journal_before = work_actions._load_runs(state)
+    upstream_runner, reads = _candidate_pr_read_runner(head=_EXISTING_CANDIDATE_HEAD)
+
+    def fail_first_readback(argv, **kwargs):
+        if len(reads) == 2:
+            reads.append(list(argv))
+            return SimpleNamespace(
+                returncode=1, stdout="", stderr="temporary readback failure"
+            )
+        return upstream_runner(argv, **kwargs)
+
+    result = work_actions.execute_work_action(
+        args={"action": "resume", "repo": _EXISTING_CANDIDATE_REPO, "work_id": "demo"},
+        requested_by="operator",
+        runner=fail_first_readback,
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 210,
+        workflow_registry=registry,
+    )
+
+    after = registry.get_workflow_run(before.run_id)
+    assert result["result"]["action"] == "blocked"
+    assert result["result"]["reason"] == "existing-candidate-readback-failed"
+    assert after.current_phase == "verify"
+    assert after.candidate_head == before.candidate_head
+    assert after.verified_head is None
+    journal_after = work_actions._load_runs(state)
+    assert journal_after["revision"] == journal_before["revision"]
+    assert journal_after["runs"][before.run_id] == journal_before["runs"][before.run_id]
+    assert len(reads) == 3
+
+
 def test_explicit_resume_does_not_reset_existing_candidate_with_active_job(
     tmp_path: Path,
 ) -> None:
@@ -5010,7 +5047,8 @@ def test_review_findings_persist_across_heads_and_third_round_needs_human_defaul
     assert final["repair_rounds_used"] == 2
     assert final["repair_rounds_budget"] == 2
     assert final["repair_rounds_remaining"] == 0
-    assert final["legal_next_steps"] == ("maintainer-review",)
+    assert final["legal_next_steps"] == ("review-disposition",)
+    assert final["next_actions"] == list(final["legal_next_steps"])
     # #218 AC3：已重複 stage 與預估 invalidation 範圍（ship 階段 repair 迴圈
     # 不回頭讓 build/verify 失效，範圍即當前 phase）。
     assert final["repeated_stage"]

@@ -681,6 +681,214 @@ def test_venv_step_verifies_locked_wheels_and_atomically_switches_link(
     assert Path(step["path"]).is_dir(), "rollback retains the verified candidate slot"
 
 
+def test_venv_step_normalizes_permissions_under_strict_umask(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wheelhouse = tmp_path / "wheelhouse"
+    wheelhouse.mkdir()
+    wheel = wheelhouse / "candidate.whl"
+    wheel.write_bytes(b"candidate")
+    wheel_sha = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    deploy = tmp_path / "opt/cortex"
+    old_slot = deploy / "venvs/old"
+    old_slot.mkdir(parents=True)
+    active = deploy / "venv"
+    active.symlink_to("venvs/old")
+
+    def run(argv, **_kwargs):
+        command = tuple(argv)
+        if command[:3] == ("python3", "-m", "venv"):
+            temporary = Path(command[3])
+            (temporary / "bin").mkdir(parents=True)
+            (temporary / "lib").mkdir()
+            python = temporary / "bin/python"
+            python.write_text("verified interpreter", encoding="utf-8")
+            python.chmod(0o700)
+        elif "pip" in argv:
+            temporary = Path(argv[0]).parent.parent
+            cli = temporary / "bin/cortex"
+            cli.write_text(
+                f"#!{temporary}/bin/python\nprint('cortex')\n", encoding="utf-8"
+            )
+            cli.chmod(0o700)
+            (temporary / "lib/site.py").write_text("# site\n", encoding="utf-8")
+        return _completed(command)
+
+    monkeypatch.setattr(backend_module, "_run", run)
+    step = {
+        "step_id": "candidate-venv",
+        "kind": "venv",
+        "path": str(deploy / "venvs" / wheel_sha),
+        "active_link": str(active),
+        "wheel_source": str(wheel),
+        "wheel_sha256": wheel_sha,
+        "wheelhouse": [{"source": str(wheel), "sha256": wheel_sha}],
+        "wheelhouse_locked": True,
+        "desired_sha256": wheel_sha,
+    }
+    previous_umask = os.umask(0o077)
+    try:
+        LocalInstallBackend(require_root=False).apply_step(step)
+    finally:
+        os.umask(previous_umask)
+
+    slot = Path(step["path"])
+    assert stat.S_IMODE(slot.stat().st_mode) == 0o755
+    assert stat.S_IMODE((slot / "bin").stat().st_mode) == 0o755
+    assert stat.S_IMODE((slot / "bin/python").stat().st_mode) == 0o755
+    assert stat.S_IMODE((slot / "bin/cortex").stat().st_mode) == 0o755
+    assert stat.S_IMODE((slot / "lib/site.py").stat().st_mode) == 0o644
+    assert stat.S_IMODE((slot / ".cortex-wheel.sha256").stat().st_mode) == 0o644
+    assert stat.S_IMODE((slot / ".cortex-tree.sha256").stat().st_mode) == 0o644
+
+
+def test_venv_step_repairs_a_reused_slot_built_under_umask_077(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wheel = tmp_path / "candidate.whl"
+    wheel.write_bytes(b"candidate")
+    wheel_sha = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    slot = tmp_path / "opt/cortex/venvs" / wheel_sha
+    (slot / "bin").mkdir(parents=True)
+    (slot / "lib").mkdir()
+    (slot / "bin/python").write_text("verified interpreter", encoding="utf-8")
+    (slot / "bin/python").chmod(0o700)
+    (slot / "bin/cortex").write_text("#!/bin/sh\n", encoding="utf-8")
+    (slot / "bin/cortex").chmod(0o700)
+    (slot / "lib/site.py").write_text("# site\n", encoding="utf-8")
+    slot.chmod(0o700)
+    (slot / "bin").chmod(0o700)
+    (slot / "lib").chmod(0o700)
+    (slot / ".cortex-wheel.sha256").write_text(wheel_sha + "\n", encoding="ascii")
+    prior_tree = backend_module._tree_sha256(slot)
+    (slot / ".cortex-tree.sha256").write_text(prior_tree + "\n", encoding="ascii")
+    active = tmp_path / "opt/cortex/venv"
+    active.parent.mkdir(parents=True, exist_ok=True)
+    active.symlink_to(os.path.relpath(slot, active.parent))
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        backend_module,
+        "_run",
+        lambda argv, **_kwargs: calls.append(tuple(argv)) or _completed(argv),
+    )
+    step = {
+        "step_id": "candidate-venv",
+        "kind": "venv",
+        "path": str(slot),
+        "active_link": str(active),
+        "wheel_source": str(wheel),
+        "wheel_sha256": wheel_sha,
+        "wheelhouse": [{"source": str(wheel), "sha256": wheel_sha}],
+        "wheelhouse_locked": True,
+        "desired_sha256": wheel_sha,
+    }
+
+    result = LocalInstallBackend(require_root=False).apply_step(step)
+
+    assert result["installed_sha256"] == wheel_sha
+    assert active.resolve() == slot
+    assert calls == []
+    assert stat.S_IMODE(slot.stat().st_mode) == 0o755
+    assert stat.S_IMODE((slot / "bin").stat().st_mode) == 0o755
+    assert stat.S_IMODE((slot / "bin/python").stat().st_mode) == 0o755
+    assert stat.S_IMODE((slot / "bin/cortex").stat().st_mode) == 0o755
+    assert stat.S_IMODE((slot / "lib/site.py").stat().st_mode) == 0o644
+    assert (slot / ".cortex-tree.sha256").read_text(encoding="ascii").strip() != prior_tree
+
+
+def test_venv_step_replays_an_interrupted_permission_repair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wheel = tmp_path / "candidate.whl"
+    wheel.write_bytes(b"candidate")
+    wheel_sha = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    slot = tmp_path / "opt/cortex/venvs" / wheel_sha
+    (slot / "bin").mkdir(parents=True)
+    (slot / "lib").mkdir()
+    (slot / "bin/python").write_text("verified interpreter", encoding="utf-8")
+    (slot / "bin/python").chmod(0o700)
+    (slot / "bin/cortex").write_text("#!/bin/sh\n", encoding="utf-8")
+    (slot / "bin/cortex").chmod(0o700)
+    (slot / "lib/site.py").write_text("# site\n", encoding="utf-8")
+    slot.chmod(0o700)
+    (slot / "bin").chmod(0o700)
+    (slot / "lib").chmod(0o700)
+    (slot / ".cortex-wheel.sha256").write_text(wheel_sha + "\n", encoding="ascii")
+    (slot / ".cortex-tree.sha256").write_text(
+        backend_module._tree_sha256(slot) + "\n", encoding="ascii"
+    )
+    active = tmp_path / "opt/cortex/venv"
+    active.parent.mkdir(parents=True, exist_ok=True)
+    active.symlink_to(os.path.relpath(slot, active.parent))
+    monkeypatch.setattr(
+        backend_module,
+        "_run",
+        lambda argv, **_kwargs: _completed(argv),
+    )
+    step = {
+        "step_id": "candidate-venv",
+        "kind": "venv",
+        "path": str(slot),
+        "active_link": str(active),
+        "wheel_source": str(wheel),
+        "wheel_sha256": wheel_sha,
+        "wheelhouse": [{"source": str(wheel), "sha256": wheel_sha}],
+        "wheelhouse_locked": True,
+        "desired_sha256": wheel_sha,
+    }
+    repair_marker = backend_module._venv_repair_marker_path(slot)
+    real_normalize = backend_module._normalize_venv_permissions
+
+    def normalize_then_interrupt(path: Path, *, uid: int, gid: int) -> None:
+        path.chmod(0o755)
+        (path / "bin").chmod(0o755)
+        raise SystemExit("simulated interruption during permission repair")
+
+    monkeypatch.setattr(
+        backend_module, "_normalize_venv_permissions", normalize_then_interrupt
+    )
+    with pytest.raises(SystemExit, match="during permission repair"):
+        LocalInstallBackend(require_root=False).apply_step(step)
+
+    assert repair_marker.is_file()
+    assert slot.stat().st_mode & 0o777 == 0o755
+    assert backend_module._venv_slot_matches(slot, wheel_sha) is False
+
+    monkeypatch.setattr(backend_module, "_normalize_venv_permissions", real_normalize)
+    result = LocalInstallBackend(require_root=False).apply_step(step)
+
+    assert result["installed_sha256"] == wheel_sha
+    assert repair_marker.exists() is False
+    assert stat.S_IMODE(slot.stat().st_mode) == 0o755
+    assert stat.S_IMODE((slot / "bin").stat().st_mode) == 0o755
+    assert stat.S_IMODE((slot / "bin/python").stat().st_mode) == 0o755
+    assert stat.S_IMODE((slot / "bin/cortex").stat().st_mode) == 0o755
+    assert stat.S_IMODE((slot / "lib/site.py").stat().st_mode) == 0o644
+
+
+def test_venv_repair_marker_publish_is_atomic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    slot = tmp_path / "opt/cortex/venvs/slot-a"
+    slot.parent.mkdir(parents=True)
+    marker = backend_module._venv_repair_marker_path(slot)
+
+    def replace_then_interrupt(source, destination):
+        assert Path(source).is_file()
+        assert Path(destination) == marker
+        raise SystemExit("simulated interruption publishing repair marker")
+
+    monkeypatch.setattr(backend_module.os, "replace", replace_then_interrupt)
+
+    with pytest.raises(SystemExit, match="publishing repair marker"):
+        backend_module._write_venv_repair_marker(
+            slot, "a" * 64, uid=os.geteuid(), gid=os.getegid()
+        )
+
+    assert marker.exists() is False
+    assert list(marker.parent.glob(f".{marker.name}.*")) == []
+
+
 def test_venv_step_rejects_a_wheelhouse_hash_mismatch_before_running_commands(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1845,6 +2053,43 @@ def test_service_identity_includes_live_systemd_active_state(
     assert identities
     assert all(row["active_state"] == "active" for row in identities.values())
     assert all("--property=ActiveState" in command for command in calls)
+
+
+def test_service_identity_includes_the_latest_journal_reason_for_inactive_units(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def run(argv, **_kwargs):
+        command = tuple(argv)
+        if command[0] == "journalctl":
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                "Starting Cortex Manager...\n"
+                "Failed to execute /opt/cortex/venv/bin/cortex: Permission denied\n",
+                "",
+            )
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            "User=cortex-manager\n"
+            "ExecStart={ path=/opt/cortex/venv/bin/cortex ; argv[]=/opt/cortex/venv/bin/cortex ; }\n"
+            "ActiveState=activating\n"
+            "SubState=auto-restart\n"
+            "Result=exit-code\n"
+            "ExecMainCode=1\n"
+            "ExecMainStatus=203\n",
+            "",
+        )
+
+    monkeypatch.setattr(backend_module, "_run", run)
+
+    identities = LocalInstallBackend(require_root=False).service_identities()
+
+    assert (
+        identities["cortex-manager.service"]["failure_detail"]
+        == "sub_state=auto-restart; result=exit-code; exec_main_code=1; "
+        "exec_main_status=203; journal=Failed to execute /opt/cortex/venv/bin/cortex: Permission denied"
+    )
 
 
 def test_directory_acl_apply_keeps_external_target_safe_during_symlink_swap(

@@ -1801,3 +1801,35 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/workstreams/autosync-source-job-unify/todo.md'
     excludes: []
+  autosync-carry-forward-review:
+    title: 'autosync-carry-forward-review'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1356'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/autosync-carry-forward-review/todo.md'
+    excludes: []
+  pr-authority-rebind-v2:
+    title: 'pr-authority-rebind-v2'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1360'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/pr-authority-rebind-v2/todo.md'
+    excludes: []
+  builder-admission-after-autosync:
+    title: 'builder-admission-after-autosync'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1363'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/builder-admission-after-autosync/todo.md'
+    excludes: []
+  retry-review-all-review-cards:
+    title: 'retry-review-all-review-cards'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1365'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/retry-review-all-review-cards/todo.md'
+    excludes: []

@@ -5909,7 +5909,7 @@ class JobRegistry:
         gate_refs: tuple[GateEvidenceRef, ...],
         evidence_refs: tuple[str, ...],
     ) -> WorkflowRun:
-        """Reopen only verify after Manager merged the probed exact main commit."""
+        """Reopen verify and review after Manager merged the probed exact main commit."""
 
         index = self._find_workflow_run_index(run_id)
         current = self._workflows[index]
@@ -5939,17 +5939,17 @@ class JobRegistry:
         ):
             raise ValueError("main-sync Candidate reset compare-and-set failed")
         next_steps = tuple(
-            replace(step, gate_result="pending") if step.phase == "verify" else step
+            replace(step, gate_result="pending")
+            if step.phase in {"verify", "review"}
+            else step
             for step in steps
         )
-        refs_by_kind = {
-            ref.kind: ref for ref in gate_refs if ref.kind in {"brainstorm", "foreign-review"}
-        }
-        if "foreign-review" not in refs_by_kind:
+        refs_by_kind = {ref.kind: ref for ref in gate_refs if ref.kind == "brainstorm"}
+        if not any(ref.kind == "foreign-review" for ref in gate_refs):
             raise ValueError("main-sync Candidate reset requires foreign review evidence")
         receipts = dict(current.stage_reuse_receipts or {})
         for step in current.steps:
-            if step.phase != "verify":
+            if step.phase not in {"verify", "review"}:
                 continue
             prior = receipts.get(step.card)
             if prior is None and step.gate_result == "pending":
@@ -5972,7 +5972,11 @@ class JobRegistry:
             current,
             current_phase="verify",
             steps=next_steps,
-            attempts={**current.attempts, "verify": current.attempts.get("verify", 0) + 1},
+            attempts={
+                **current.attempts,
+                "verify": current.attempts.get("verify", 0) + 1,
+                "review": current.attempts.get("review", 0) + 1,
+            },
             stage_reuse_receipts=receipts if receipts else current.stage_reuse_receipts,
             gate_refs=tuple(refs_by_kind[kind] for kind in ("brainstorm", "foreign-review") if kind in refs_by_kind),
             evidence_refs=tuple(dict.fromkeys((*current.evidence_refs, *evidence_refs))),

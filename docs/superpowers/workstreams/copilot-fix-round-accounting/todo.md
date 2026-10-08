@@ -14,8 +14,8 @@ work_item: copilot-fix-round-accounting
 
 ## Tasks
 
-- [ ] **T1 RED**：修正 1 次、同步 main 3 次之後，現行 ship 判 `copilot-finding-budget-exhausted`。
-- [ ] **T2 只計算修正**：`repair_rounds` 只計算回應 Copilot finding 的修正；能辨識 autosync 與 retry-build main merge 產生的 head，不計入。
-- [ ] **T3 用完後的出路**：上限用完時，仍對新 head 要求一次 Copilot review，讓 operator 能以 `review-disposition` 裁決；或讓 `review-disposition` 接受「最後一次 review 之後只有已確認的修正與 main 同步」的 head。
-- [ ] **T4 next_actions**：此狀態下列出實際可行的動作。
-- [ ] **T5 文件**：新增 changelog fragment，並同步 `CHANGELOG.md [Unreleased]`。
+- [x] **T1 RED**：修正 1 次、同步 main 3 次之後，現行 ship 判 `copilot-finding-budget-exhausted`。
+- [x] **T2 只計算修正**：`repair_rounds` 只計算回應 Copilot finding 的修正；能辨識 autosync 與 retry-build main merge 產生的 head，不計入。
+- [x] **T3 用完後的出路**：上限用完時，仍對新 head 要求一次 Copilot review，讓 operator 能以 `review-disposition` 裁決；或讓 `review-disposition` 接受「最後一次 review 之後只有已確認的修正與 main 同步」的 head。
+- [x] **T4 next_actions**：此狀態下列出實際可行的動作。
+- [x] **T5 文件**：新增 changelog fragment，並同步 `CHANGELOG.md [Unreleased]`。
