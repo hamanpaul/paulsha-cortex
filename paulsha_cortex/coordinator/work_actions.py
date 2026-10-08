@@ -9607,10 +9607,10 @@ SEMANTIC_RECLAIM_LIMIT = 3
 
 
 # #218 AC3: needs_human 停止時揭露剩餘 repair scope、已重複 stage、合法下一步
-# 與預估 invalidation 範圍。legal_next_steps 只列出真正已由
-# _recoverable_maintainer_ship_stop 承認的重入路徑（maintainer-review）；
-# invalidation_scope 是若人工仍要求再開一輪會需要重新走的 phase 範圍——ship 階
-# 段的 repair 迴圈只影響 ship 本身，不會回頭讓 build/verify 失效。
+# 與預估 invalidation 範圍。budget-exhausted 的 ship 已停在 needs-fix，operator
+# 的有效出口是針對 exact HEAD 提交 review-disposition；invalidation_scope 是若人工
+# 仍要求再開一輪會需要重新走的 phase 範圍——ship 階段的 repair 迴圈只影響 ship
+# 本身，不會回頭讓 build/verify 失效。
 def _repair_budget_status(
     *, fix_rounds: int, max_fix_rounds: int, current_phase: str
 ) -> dict[str, Any]:
@@ -9619,7 +9619,7 @@ def _repair_budget_status(
         "repair_rounds_budget": max_fix_rounds,
         "repair_rounds_remaining": max(max_fix_rounds - fix_rounds, 0),
         "repeated_stage": current_phase,
-        "legal_next_steps": ("maintainer-review",),
+        "legal_next_steps": ("review-disposition",),
         "invalidation_scope": (current_phase,),
     }
 
@@ -10679,7 +10679,7 @@ def _ship_action(
                 "reason": copilot.reason,
                 **extra,
                 "head": preflight.head,
-                "next_actions": ["review-disposition"],
+                "next_actions": list(extra["legal_next_steps"]),
                 "next_step_hint": (
                     "先確認 PR review threads 全部 resolved，再由 operator 提交 exact-HEAD 裁決："
                     f"cortex work review-disposition {canonical_run.work_id} "
