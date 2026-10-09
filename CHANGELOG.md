@@ -9,6 +9,7 @@
 
 ### Fixed
 
+- **v0.1.14（使用者層級發版）**：`VERSION` 由 0.1.13 升為 0.1.14。本版以 release workflow 的 `profile=user-level` 發布：只附 wheel，不含 Trust Root 安裝輸入，也不封存 agent 執行檔，**不支援 Trust Root system 部署**（owner 2026-10-08 裁決，#1371）。重點是讓使用者層級的 cortex 能穩定交付：收錄 v0.1.13 以來的派工穩定性修正（autosync 鏈 #1311／#1334／#1336／#1345／#1356／#1363、authority 與 claim era #1360／#1365、ship 前刷新 authority #1322、修正輪數 #1342），以及 #1295、#1297、#1282、#1309、#1286、#1270、#1271、#1275、#1366、#1367、#1368。
 - **#1368 README 懸空引用**：repo 內檔案引用改為完整路徑；runtime、operator config 與 receipt 引用加上行內忽略標記，清除 README 的既有 R-22 懸空引用。
 
 - **#1367 inspect status 摘要標示 work item**：`needs_human`、`quota_wait`、`quota_decision` 與 `provider_failure` 文字摘要改以 `work_id` 為主並保留 `run_id`；無 `work_id` 與 `--json` 輸出維持不變。
